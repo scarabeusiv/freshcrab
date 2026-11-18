@@ -1,0 +1,38 @@
+# freshcrab configuration.
+#
+# Broad defaults: watch all Factory packages except the exclusions.
+# A package is watched unless it is listed in `exclusions`.
+# To watch only a specific set, list packages under `packages` (empty
+# means: all of Factory except the exclusions).
+
+# Packages to monitor. Empty = all of Factory except the exclusions.
+packages:
+
+# Packages that are never auto-updated (hand-maintained or special).
+exclusions:
+  - gcc
+  - qemu
+  - kernel
+  - glibc
+  - systemd
+  - rpm
+  - python3
+  - perl
+
+# How many workers run at once (later phase; the watcher ignores it).
+concurrency: 4
+
+# Maximum submit requests filed per day (later phase).
+daily_sr_cap: 20
+
+# Kill switch: when true, the pipeline pauses entirely.
+kill_switch: false
+
+# Report-only mode: queue and report what would be updated; file nothing.
+report_only: true
+
+# Dry-run mode: when true, nothing is written or filed anywhere — the
+# watcher, queue and (later) worker only print what they WOULD do.
+# Default true in this phase. Overridable by --dry-run / --live on the
+# command line and by the FRESHCRAB_DRY_RUN env var.
+dry_run: true

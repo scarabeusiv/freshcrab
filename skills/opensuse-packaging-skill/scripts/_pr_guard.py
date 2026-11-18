@@ -1,0 +1,6073 @@
+"""_pr_guard.py -- the rules of pr-guard.py, which compiles this file only once
+a call has matched its prefilter. Not a command: see pr-guard.py --help."""
+
+import json
+import os
+import posixpath
+import re
+import urllib.parse
+
+GITEA = "https://src.opensuse.org/api/v1"
+PIN_REF = "refs/remotes/origin/main"
+CLEAN_ENV = {"TMPDIR", "LC_ALL", "LANG", "NO_COLOR", "CHANGES_AUTHOR"}
+MAX_DEPTH = 4
+MAX_BYTES = 8 << 20
+EXPANDED = 64 << 10  # characters a variable's expansions may reach
+NET_BUDGET = 40  # seconds all of a call's open-PR lookups may take: the hook's is 60
+
+
+class Rx:
+    """A pattern compiled on first use, so a call the prefilter lets through
+    never pays for the rules."""
+
+    def __init__(self, pattern):
+        self.pattern, self.rx = pattern, None
+
+    def __getattr__(self, name):
+        if self.rx is None:
+            self.rx = re.compile(self.pattern)
+        return getattr(self.rx, name)
+
+
+# The stamp directory as a path component, in program text or a path.
+STAMP = Rx(r"(?<![\w.-])target-gate(?![\w.-])")
+# In one shell word a path component ends at a slash, a glob or the word's end:
+# a quoted "[ -d …/target-gate ]" that a command only carries names no path.
+STAMP_WORD = Rx(r"(?<![\w.-])target-gate(?=[/*?\[]|$)")
+# The path a component hangs from: the text back to a quote, space or operator.
+PARENT = Rx(r"(?:\$\{\w+\}|[^\s\"'=<>|;&(),`{}])*$")
+# Commands that write no file: they may look at the stamps.
+READ_ONLY = {"ls", "cat", "jq", "grep", "head", "tail", "less", "stat", "find"}
+READ_ONLY |= {"echo", "printf", "rg", "wc"}
+FIND_ACTS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint"}
+FIND_ACTS |= {"-fprint0", "-fprintf"}
+# sed and awk read too, unless sed -i, or their program or options name a stamp
+# (sed w, awk print >): their valued options, and the ones that give the program.
+SED_OPTS = ("efl", ("--expression", "--file", "--line-length"))
+SED_PROGRAM = {"-e", "-f", "--expression", "--file"}
+AWK_OPTS = (
+    "fFvEile",
+    ("--file", "--field-separator", "--assign", "--source", "--exec", "--include"),
+)
+AWK_PROGRAM = {"-f", "-e", "-E", "--file", "--source", "--exec"}
+# Separators and interleaved options, so a subprocess argument list reads like
+# the command line it becomes.
+SEP = r"[\s\"',]+"
+OPTS = rf"(?:{SEP}-[^\s\"',]+(?:{SEP}[^-\s\"',][^\s\"',]*)?)*"
+# Owners a URL names: API paths and clone URLs. On a tea or git-obs command line
+# its repository options and git-obs "owner/repo#N" ids name owners too. A
+# value may be a Python f/b/r string, and hold {placeholders}: an owner that
+# holds one is no literal owner.
+URL_OWNER = (
+    r"repos/([^/\s\"'`]+)/|src\.opensuse\.org(?::\d+)?[:/]+(?!api/)([^/\s\"'`]+)/"
+)
+API_OWNER = Rx(URL_OWNER)
+PREFIX = r"(?:[bBrRuUfF]{1,2}(?=[\"']))?"
+CMD_OWNER = Rx(
+    URL_OWNER
+    + rf"|(?<![\w-])(?:--repo|-r|--target)(?:={PREFIX}[\"']?|{SEP}{PREFIX}[\"']?)"
+    r"([^/\s\"'`]+)/"
+    rf"|(?<![\w-])--target-owner(?:={PREFIX}[\"']?|{SEP}{PREFIX}[\"']?)([^\s\"'`]+)"
+    r"|(?<![\w/.~$-])([A-Za-z0-9{][\w.{}-]*)/(?:[\w.+-]|\{[^}\s]*\})+#(?:\d|\{)"
+)
+# A repository only the shell or the program knows is an unknown one.
+VAR_REPOS = Rx(r"repos/(?:[\"'`$({]|\s*\+)")
+VAR_OPT = Rx(
+    r"(?<![\w-])(?:--repo|-r|--target|--target-owner|--target-repo)(?:=|\s+)"
+    r"[\"']?[^\s\"']*[$`]"
+)
+VAR_WORD = Rx(r"(?:^|\s)(?!-)\S*[$`]")
+VARIABLE = Rx(r"[$`]")
+BARE_REPO = Rx(r"(?<![\w/.~$:-])([A-Za-z0-9][\w.-]*)/[\w.+-]+(?![\w/])")
+LITERAL = Rx(r"[A-Za-z0-9][\w.-]*")
+FORGE = Rx(r"(?i:src\.opensuse\.org)(?::\d+)?[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
+
+
+# Program text splits an argument list any way (['tea'] + ['pr', 'merge']).
+WSEP = r"[\s\"',\[\]()+]+"
+WOPTS = rf"(?:{WSEP}-[^\s\"',\[\]()+]+(?:{WSEP}[^-\s\"',\[\]()+][^\s\"',\[\]()+]*)?)*"
+
+
+def tea(sub):
+    """Patterns of tea's pr/pulls subcommand sub: for program text, anywhere
+    after tea; for a command line, matched from its start over options only,
+    so a description or comment that quotes one is text."""
+    return (
+        Rx(rf"\btea\b.*?(?<![-\w])(?:pr|pulls?)[\"']?{WOPTS}{WSEP}(?:{sub})(?![-\w])"),
+        Rx(
+            rf"\btea\b[\"']?{OPTS}{SEP}(?:pr|pulls?)[\"']?{OPTS}{SEP}(?:{sub})(?![-\w])"
+        ),
+    )
+
+
+TEA_MERGE, TEA_MERGE_ARGV = tea("merge|m")
+TEA_CREATE, TEA_CREATE_ARGV = tea("create|c")
+# tea's flags parse Go-style: a long option may take a single dash.
+TEA_LONG = Rx(r"^-(?=[A-Za-z][\w-]+(?:=|$))")
+TEA_API = Rx(r"\btea\b.*?(?<![-\w])api(?![-\w])")
+# A method that is not a literal GET or HEAD: a write, or one the text hides.
+METHOD = (
+    r"(?:[=\s\"',]+)[\"']?(?!(?i:get|head)\b)[^\s\"',-]"
+    r"|-X(?!(?i:get|head)\b)[A-Za-z$]"
+)
+TEA_WRITE = Rx(
+    rf"(?<![\w-])(?:-[fFd](?![\w-])|--(?:field|Field|data)\b|(?:-X|--method){METHOD})"
+)
+# git-obs, also spelled "git obs" (git runs it as a subcommand).
+GIT_OBS = Rx(
+    rf"\bgit(?:-obs|[\"']?{OPTS}{SEP}obs)(?![-\w]).*?(?<![-\w])pr[\"']?{SEP}"
+    r"(merge|create|forward)(?![-\w])"
+)
+GIT_OBS_TARGET = Rx(r"(?<![\w-])--(?:target|target-owner|self)\b")
+MERGE_URL = Rx(r"/pulls/[^/\s\"']+/merge(?![-\w])")
+DO_MERGE = Rx(
+    r"(?i)[\"']Do[\"']\s*:|\bDo\s*=\s*[\"']"
+)  # Go reads JSON keys in any case
+# OBS's request creation, which osc sr and friends wrap with the devel-project
+# check and a message.
+REQUEST_CREATE = Rx(r"/request/?\?(?:[^\s\"'#]*&)?cmd=create(?![\w-])")
+# The API's pulls path, or one built from a variable. A web link to a PR
+# (src.opensuse.org/pool/x/pulls/3) quoted in a comment is not an endpoint.
+PULLS_REF = Rx(r"(?:repos/[^/\s\"'`]+/[^/\s\"'`]+|[})\"'`]|\$\w+)/pulls(?![-\w])")
+# A write anywhere in the text: a write method, list-form short options, and
+# the request calls of Python and JavaScript.
+WRITE = Rx(
+    r"(?:-X|--request|--method)[\s=\"',]*(?i:post|patch|put)\b"
+    r"|[\"']-[dFT][\"']"
+    r"|[(,]\s*data\s*=(?!=)|\.(?:post|patch|put)\s*\("
+    r"|\bmethod\s*[=:]\s*[\"'](?i:post|patch|put)"
+    r"|\bmethod\s*[=:]\s*(?!None\b)[A-Za-z_$({\[]"
+)
+# curl or wget on one line: a method that is not a literal GET, a form or file
+# upload, or a body without -G (which turns the body into the query).
+CURL = Rx(r"\b(?:curl|wget)\b")
+CURL_METHOD = Rx(rf"(?<![\w-])(?:(?:-X|--request|--method){METHOD})")
+CURL_FILE = Rx(r"(?<![\w-])-[a-zA-Z]*[FT](?=[\s\"'@{$]|$)")
+CURL_BODY = Rx(r"(?<![\w-])-[a-zA-Z]*d(?=[\s\"'@{$]|$)")
+CURL_GET = Rx(r"(?<![\w-])(?:-[a-zA-Z]*G[a-zA-Z]*|--get)(?![\w-])")
+# Body options count on a curl, wget or tea api command only: elsewhere
+# ("--json" of an argparse parser) they are a program's own flags.
+BODY_LONG = Rx(
+    r"(?<![\w-])--(?:data(?:-[a-z]+)?|json|form|upload-file|post-data|post-file)\b"
+)
+# The tool as one quoted element of an argument list, which may span lines.
+ARGV_TOOL = Rx(r"[\"'](curl|wget|tea)[\"']")
+# urllib's Request and urlopen take the body as the second argument; the
+# request() of requests, httpx, urllib3 and http.client the method as the first.
+CALL = Rx(r"(?:(?<!\w)(Request|urlopen)|\.(request))\(")
+KWARG = Rx(r"\w+\s*=(?!=)")
+QUOTED = Rx(r"[bruf]*([\"'])(.*)\1")
+HTTPIE = {"http", "https", "xh", "xhs"}
+HTTP_TOOLS = HTTPIE | {"curl", "wget"}
+GUARDED = HTTP_TOOLS | {"tea", "git-obs", "git", "osc", "gh", "secret-tool"}
+HTTPIE_VALUED = {
+    "-a", "--auth", "-A", "--auth-type", "-o", "--output", "--session",
+    "--session-read-only", "--cert", "--cert-key", "--cert-key-pass", "--proxy",
+    "--timeout", "--max-redirects", "-p", "--print", "-P", "--history-print",
+    "--pretty", "-s", "--style", "--verify", "--ssl", "--ciphers", "--boundary",
+    "--default-scheme", "--format-options", "--response-charset", "--response-mime",
+}  # fmt: skip
+# A request item that sends data: field=value, field:=json, field@file.
+HTTPIE_DATA = Rx(r"[^=:@\s]+(?::=|=(?!=)|@)")
+# What a call to curl, tea api or git-obs api may carry and still provably
+# only read: its short flags, the short options that take a value, its long
+# flags and the long options that take a value. Anything else may send a body
+# or another method; the method option itself must say GET or HEAD, a header
+# must not override it.
+READ_OPTS = {
+    "curl": (
+        "sSfLiIvkqG0O46ngNR#",
+        "owmHuAexrYyE",
+        "silent show-error fail fail-with-body location include head verbose "
+        "insecure compressed get no-progress-meter progress-bar http1.1 http2 "
+        "create-dirs remote-name ipv4 ipv6 netrc globoff no-buffer remote-time",
+        "output write-out max-time header user user-agent referer proxy "
+        "connect-timeout retry retry-delay retry-max-time cacert capath cert key "
+        "output-dir url dump-header netrc-file noproxy",
+    ),
+    "tea": ("ih", "HloRr", "include debug vvv help", "header output login repo remote"),
+    "git-obs": ("qh", "G", "quiet help", "gitea-config gitea-login"),
+}
+METHOD_OPT = {"curl": "--request", "tea": "--method", "git-obs": "--method"}
+# git-obs is argparse: a long option may be any unique prefix of its name.
+GIT_OBS_LONG = ("--quiet", "--help", "--gitea-config", "--gitea-login", "--method")
+GIT_OBS_LONG += ("--data",)
+# wget's options that send a body, set the method, or run wgetrc commands that
+# may; getopt takes any unique prefix of them.
+WGET_WRITES = ("post-data", "post-file", "body-data", "body-file", "method")
+WGET_WRITES += ("execute", "config")
+WGET_VALUED = "oaOtTwUPQBDiARlIX"  # its short options that take a value
+GET = ("GET", "HEAD")
+# In program text, anything that may make a request send a body or another
+# method: a merge URL near none of them is a GET.
+MAY_WRITE = Rx(
+    r"(?i:\b(?:data|json|body|form|files|fields?|method|post|put|patch|delete"
+    r"|upload)\b)|(?<![\w-])-[a-zA-Z]*[XdFTf]|--(?:request|method|data|json|form"
+    r"|upload|post|body|field)|\b(?:urlopen|open|Request|request|fetch|send)\s*\([^()]*,"
+)
+PUSH = Rx(r"(?<![-\w])push(?![-\w])")
+STASH_PUSH = Rx(r"\bstash\s+push\b")
+PUSH_POOL = Rx(r"src\.opensuse\.org(?::\d+)?[:/]+pool/|refs\/for\/")
+HTTPS = Rx(r"(?i)https?://")
+# git push spelled inside program text: judged only by a literal remote.
+CODE_PUSH = Rx(
+    r"[\"']git[\"']?[\s,]+(?:[\"']?-[Cc][\"']?[\s,]+[\"']?[^\"',\s]+[\"']?[\s,]+)*[\"']?push\b"
+)
+CODE_DIR = Rx(r"(?<![\w-])-C(?![\w-])|\bcwd\s*=|\bchdir\b")
+CODE_ARG = Rx(r"[\s,]*([\"'])([^\"'\n]*)\1")
+# The simple references a path word may carry: $NAME and ${NAME}.
+VAR_REF = Rx(r"\$(?:\{(\w+)\}|(\w+))")
+GLOB = Rx(r"[*?\[]")
+# Short options of curl that take a value.
+CURL_VALUED = set("EKCbcdDFPHhmoxUQreXYytzTuAw")
+COPY_VALUED = {"cp": "tS", "mv": "tS", "install": "mogSt"}
+COPY_LONG = {"--suffix", "--no-preserve", "--sparse", "--mode", "--owner", "--group"}
+COPY_LONG |= {"--strip-program", "--target-directory"}
+OSC_BUILD = Rx(r"\bosc\b.*?(?<![-\w.:/])(?:build|shell|chroot)(?![-\w.])(.*)")
+ARCH = Rx(
+    r"(?<![-\w./:])(x86_64|i[3-6]86|aarch64|armv[67][a-z]*l|ppc64(?:le)?|ppc|s390x"
+    r"|riscv64|loong(?:arch)?64)(?![-\w./:])"
+)
+NATIVE = {"x86_64": {"x86_64", "i386", "i486", "i586", "i686"}}
+OSC_REQUEST = Rx(
+    r"\bosc\b.*?(?<![-\w])(?:sr|submitreq|submitrequest|submitpac|mr|maintenancerequest"
+    r"|creq|createrequest)(?![-\w]).*?openSUSE:Backports:SLE-16"
+)
+# --nodevelproject, or a prefix argparse expands to it, on a submit request.
+NODEVEL = "|".join("--nodevelproject"[:n] for n in range(5, 17))
+OSC_NODEVEL = Rx(
+    r"\bosc\b.*?(?<![-\w])(?:sr|submitreq|submitrequest|submitpac|creq|createrequest)"
+    rf"(?![-\w]).*?(?<![-\w])(?:{NODEVEL})(?![-\w])"
+)
+# --yes, or a prefix of it, on a submit request: it answers osc's questions.
+OSC_YES = Rx(
+    r"\bosc\b.*?(?<![-\w])(?:sr|submitreq|submitrequest|submitpac|creq|createrequest)"
+    r"(?![-\w]).*?(?<![-\w])--y(?:es?)?(?![-\w])"
+)
+# A maintenance or update project, which takes no direct write; one under
+# home: is the user's own branch, whatever its name ends in.
+MAINT_PRJ = Rx(r"(?!home:)\S+:(?:Update|Maintenance(?::\S*)?)")
+# The project an API path writes into: its sources, or its builds.
+SOURCE_PRJ = Rx(r"(?:^|/)(?:source|build)/([^/?#\s]+)")
+# POST cmds that write nothing into the project named: osc diffs, lists links
+# and branches (into home:, unless target_project says otherwise) by them.
+READ_CMDS = {"diff", "showlinked", "branch"}
+# osc 1.27.3's long options: global ones, and those of the subcommands whose
+# operands the guard reads (with the short ones that take a value) -- the ones
+# that take a value, then ";" and the rest; argparse takes any unique prefix.
+OSC_GLOBAL = "apiurl config setopt; debug debugger help http-debug http-full-debug "
+OSC_GLOBAL += "no-keyring no-pager post-mortem quiet traceback verbose"
+OSC_OPTS = {
+    "commit": (
+        "mF",
+        "message file; no-message force skip-local-service-run noservice no-service",
+    ),
+    "api": ("XmdTfa", "method data file add-header; edit"),
+    "copypac": (
+        "rtm",
+        "revision to-apiurl message; client-side-copy keep-maintainers keep-link "
+        "keep-develproject expand",
+    ),
+    "linkpac": (
+        "Cr",
+        "cicount revision; current force disable-build disable-publish new-package",
+    ),
+    "aggregatepac": ("m", "map-repo; nosources disable-publish"),
+    "rdelete": ("m", "message; recursive force"),
+    "undelete": ("m", "message;"),
+    "meta": (
+        "aFrms",
+        "attribute file revision message set add; attribute-defaults "
+        "attribute-project blame force edit create remove-linking-repositories delete",
+    ),
+}
+OSC_OPTS.update(
+    {
+        "branch": (
+            "mr",
+            "message revision linkrev add-repositories-block add-repositories-rebuild; "
+            "nodevelproject checkout force add-repositories extend-package-names "
+            "noaccess maintenance new-package disable-build",
+        ),
+        "rremove": ("", "; force"),
+        "setdevelproject": ("", "; unset"),
+        "setlinkrev": ("r", "revision vrev; use-plain-revision unset"),
+        "detachbranch": ("m", "message;"),
+        "linktobranch": ("", ";"),
+        "lock": ("m", "message;"),
+        "release": (
+            "ar",
+            "arch repo target-project target-repository set-release; no-delay",
+        ),
+        "wipebinaries": (
+            "aMr",
+            "arch multibuild-package repo; build-disabled build-failed broken "
+            "unresolvable all",
+        ),
+        "rmkpac": ("", "scmsync; force"),
+        "repo": ("", "repo arch path; disable-publish yes"),
+        "updatepacmetafromspec": ("", "specfile;"),
+        "unlock": ("m", "message;"),
+        "mbranch": (
+            "au",
+            "attribute update-project-attribute; checkout dryrun noaccess "
+            "nodevelproject version",
+        ),
+        "addchannels": ("", "; skip-disabled enable-all"),
+        "addcontainers": ("", "; extend-package-names"),
+        "maintainer": (
+            "DaUGsSdrm",
+            "devel-project add user group set-bugowner set-bugowner-request delete "
+            "role message; bugowner-only bugowner email nodevelproject all",
+        ),
+    }
+)
+OSC_ALIAS = {"ci": "commit", "checkin": "commit", "bco": "branch", "branchco": "branch"}
+OSC_ALIAS.update(
+    {"getpac": "branch", "sdp": "setdevelproject", "unpublish": "wipebinaries"}
+)
+OSC_ALIAS["bugowner"] = "maintainer"
+# osc maintainer options that write into the meta of what they name: a role, or
+# (-D) the devel project
+ROLE_WRITES = {"-a", "--add", "-d", "--delete", "-s", "--set-bugowner"}
+ROLE_WRITES |= {"-D", "--devel-project"}
+OSC_ALIAS.update(
+    {
+        "metafromspec": "updatepacmetafromspec",
+        "updatepkgmetafromspec": "updatepacmetafromspec",
+    }
+)
+REQUESTS = {"sr", "submitreq", "submitrequest", "submitpac", "creq", "createrequest"}
+REQUESTS |= {"mr", "maintenancerequest", "deletereq", "deleterequest", "dr"}
+REQUESTS |= {"droprequest", "dropreq", "changedevelrequest", "changedevelreq", "cr"}
+# The osc request (rq, review) verbs that open an editor without -m.
+EDITED_VERBS = {"accept", "decline", "reopen", "revoke", "supersede", "wipe", "add"}
+# Their long options that take a value (osc 1.27.3), and the -F files that
+# are stdin.
+REQUEST_VALUED = tuple(
+    "--" + o
+    for o in "message file revision supersede action attribute release-project "
+    "incident incident-project repository accept-in-hours apiurl config setopt".split()
+)
+STDIN = ("-", "/dev/stdin")
+# printf's conversions (with any flags, width or precision), and a brace
+# expansion echo or printf would print expanded.
+PRINTF_CONV = Rx(r"%(?!%)([-+ #0]*)([0-9*]*(?:\.[0-9*]*)?)[a-zA-Z]")
+# A command position that runs its arguments, or expands to several words:
+# "$@", "$*", ${A[@]}.
+ARGS_RUN = Rx(r"\$[@*1]|\$\{[@*1]\}")
+ARRAY_ALL = Rx(r"\$[@*]|\$\{[@*]\}|\$\{(\w+)\[[@*]\]\}")
+BRACES = Rx(r"\{[^{}\s]*(?:,|\.\.)[^{}\s]*\}")
+# The body of a brace sequence: integers, or single letters, with a step.
+BRACE_SEQ = Rx(
+    r"([-+]?\d+)\.\.([-+]?\d+)(?:\.\.([-+]?\d+))?"
+    r"|([A-Za-z])\.\.([A-Za-z])(?:\.\.([-+]?\d+))?"
+)
+# A $ or backtick the shell takes literally (single quotes, $'...', a
+# backslash), as the literal-aware text of substitutions(lit=True) spells it.
+LIT_CHARS = {"$": "\x02", "`": "\x03"}
+UNLITERAL = str.maketrans({v: k for k, v in LIT_CHARS.items()})
+ANSI_C = Rx(
+    r"\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}"
+    r"|c(?:\\\\?|[^\\])|.)"
+)
+ANSI_ESC = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f"}
+ANSI_ESC.update({"v": "\v", "e": "\x1b", "E": "\x1b", "\\": "\\", "'": "'"})
+ANSI_ESC.update({'"': '"', "?": "?"})
+# The word a command substitution leaves, naming its output in ctx.subs.
+SUB_WORD = Rx(r"\$__sub(\d+)")
+
+HEREDOC = Rx(r"(?<!<)<<(-?)[ \t]*(?:\\([A-Za-z_][\w.-]*)|([\"']?)([A-Za-z_][\w.-]*)\3)")
+SH_SHEBANG = Rx(r"#!\s*\S*/(?:env\s+)?(?:ba|z|da|k)?sh\b")
+OPS = set(";&|()<>\n")
+FD_MARK = "\x04"  # before the digits of an fd that a redirection operator follows
+STDOUT = {">", ">>", ">|", "1>", "1>>", "1>|", "&>", "&>>"}
+SEPS = Rx(r"\|\||\|&?|&&|;;&?|;&|[;&()\n]")
+ASSIGN = Rx(r"[A-Za-z_]\w*\+?=")
+URLISH = Rx(r"://|^[\w.-]+@[\w.-]+:|^[/.~]")
+# Environment a canonical script would inherit from a plain assignment.
+SENSITIVE = Rx(
+    r"PATH|HOME|ENV|BASH_ENV|CDPATH|SHELLOPTS|BASHOPTS|IFS|LD_\w+|PYTHON\w*|PERL\w*"
+    r"|NODE_\w+|GIT_\w+|XDG_\w+|OSC\w*|TEA_\w+|CURL_\w+|SSL_\w+|\w*_(?i:proxy)"
+)
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+PYTHON = Rx(r"python[0-9.]*|pypy3?")
+KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"}
+DECLARE = {"export", "declare", "typeset", "local", "readonly"}
+WRAPPERS = {  # each with the options that take a value
+    "command": "",
+    "exec": "-a",
+    "nohup": "",
+    "time": "-f -o",
+    "builtin": "",
+    "setsid": "",
+    "stdbuf": "-i -o -e",
+    "nice": "-n",
+    "ionice": "-c -n -p",
+    "sudo": "-u -g -C -D -h -p -r -t -U",
+    "doas": "-u -C",
+    "xargs": "-I -n -P -d -a -E -L -s",
+    "busybox": "",
+}
+# Per interpreter, the letters of a short-option cluster: code = inline program
+# (attached to the cluster, or the next word), module = runs no file, noexec =
+# runs nothing, stdin = program on stdin, valued = takes the rest of the cluster
+# or the next word, rest = takes the rest of the cluster, digits = takes the
+# digits after it.
+LANGS = {
+    "shell": {"code": "c", "stdin": "s", "valued": "oO", "noexec": "n"},
+    "python": {"code": "c", "attached": True, "module": "m", "valued": "WX"},
+    "perl": {"code": "eE", "attached": True, "rest": "iMmIxFdD", "digits": "l0C"},
+    "node": {"code": "ep", "valued": "r"},
+}
+LONG = {
+    "shell": {"--rcfile": "value", "--init-file": "value"},
+    "node": {
+        "--eval": "code",
+        "--print": "code",
+        "--require": "value",
+        "--import": "value",
+        "--loader": "value",
+        "--experimental-loader": "value",
+    },
+}
+# find's actions that run a command, which ends at ";" or "+" (the -dir ones in
+# each match's directory); GNU parallel's options that take a value, and the
+# placeholders find and parallel fill in.
+FIND_EXEC = {"-exec", "-execdir", "-ok", "-okdir"}
+PARALLEL_VALUED = (
+    "-j", "-N", "-n", "-I", "-S", "-a", "-L", "-l", "-P", "-E", "-d", "-C", "-s",
+    "--jobs", "--colsep", "--arg-file", "--delay", "--timeout", "--joblog",
+    "--results", "--tmpdir", "--workdir", "--sshlogin", "--basefile", "--env",
+    "--tagstring", "--retries", "--memfree", "--load", "--max-args",
+    "--max-replace-args", "--max-lines", "--max-chars",
+)  # fmt: skip
+PLACEHOLDER = Rx(r"\{[\d./#%]*\}")
+UV_RUN_VALUED = (
+    "--with", "--with-requirements", "--with-editable", "--python", "-p", "--project",
+    "--directory", "--package", "--extra", "--group", "--env-file", "--index",
+    "--default-index", "-w",
+)  # fmt: skip
+# env's long options that take a value, and their short letter.
+ENV_LONG = (("chdir", "C"), ("unset", "u"), ("split-string", "S"), ("argv0", "a"))
+DOCS = (".md", ".rst", ".txt", ".json", ".jsonc", ".changes")
+
+ROUTE = (
+    "pool PRs are opened and updated only by {s}/pool-pr.sh DIR, once "
+    "{s}/target-gate.sh DIR is green and reviewed for that tree"
+)
+MESSAGES = {
+    "merge": "{0}: agents never merge a PR, not even their own. Watch it "
+    "instead: {s}/sr-status.py --pr <owner>/<pkg>#<n>.",
+    "create": "{0}: " + ROUTE + ".",
+    "push-pr-head": "{0}; a push moves that PR to a tree nobody built. " + ROUTE + ".",
+    "push-pool": "{0} opens or moves a pool PR; " + ROUTE + ".",
+    "push-unknown": "cannot tell where this push lands ({0}), so it is refused. "
+    "Push from the clone to an explicit fork remote and a literal branch, or: "
+    + ROUTE
+    + ".",
+    "push-https": "{0}: a push over HTTPS needs a token, and an agent never handles "
+    "one or hands one to the user. Push over SSH: git remote set-url <remote> "
+    "gitea@src.opensuse.org:<owner>/<repo>.git (ssh -T gitea@src.opensuse.org "
+    "checks the key).",
+    "stamp": "{0}: only target-gate.sh writes its stamps. Run {s}/target-gate.sh "
+    "DIR --build (or --remote), then {s}/target-gate.sh DIR --review FILE.",
+    "emulated-build": "{0}: that build is emulated, and builds are native only. "
+    "For a foreign-arch proof run {s}/target-gate.sh DIR --remote.",
+    "backports": "{0}: openSUSE:Backports:SLE-16.x is scmsync'd from pool and "
+    "takes no requests; " + ROUTE + ".",
+    "nodevelproject": "{0}: the option overrides osc's devel-project check, and "
+    "factory-auto declines a Factory request whose source is not the devel "
+    "project. Submit from the devel project.",
+    "request-api": "{0}: file requests with osc (osc sr ... -s ID supersedes "
+    "exactly one), which checks the devel project and the message.",
+    "maintenance": "{0}: no direct writes into maintenance/update projects — use "
+    "osc mbranch + osc mr.",
+    "maintenance-unknown": "cannot tell where {0} lands, so it is refused. Run it in "
+    "the checkout, or name the checkout or the project literally.",
+    "request-message": "{0}: one headline of ≤160 characters of prose saying what it "
+    'does; what the reviewer needs may follow as "- " lines of ≤100 characters, 1000 in '
+    'all ("- Stage with sr#N"). Build, sweep and session status go to the user, not here.',
+    "request-unknown": "cannot tell where {0} goes, so it is refused. Name its "
+    "projects literally, or set them in this call.",
+    "command-unknown": "cannot tell which command {0} runs, so it is refused. Name "
+    "the command literally.",
+    "gate-sequence": "{0}. The guard judges the tree before the call runs, so "
+    "this one can commit or file a tree the gate never saw: run {s}/gate.sh (and "
+    "--review) in one call, osc commit alone in the next, and osc sr in the one after.",
+    "request-no-message": "{0}: with no message osc opens an editor, and the call "
+    "hangs until it times out. Pass -m MSG (osc sr also takes -F FILE).",
+    "request-message-unknown": "cannot read {0} now, so it is refused. Pass the "
+    "message inline, or write its file in one call and file the request in the next.",
+    "pr-message": "{0}: a PR's title is one headline of ≤160 characters saying what it "
+    "does, and its description takes a request message's brevity: ≤160 characters of "
+    'prose, "- " lines of ≤100, 1000 in all. Build, gate and review status go to the '
+    'user, not here (references/request-text.md "SR and PR messages").',
+    "pr-message-unknown": "cannot read {0} now, so it is refused. Pass the text "
+    'inline, or write its file in one call and pass "$(cat FILE)" in the next.',
+    "request-target": "{0}: submit to the devel project Factory names for the package "
+    "({s}/devel-packages.sh lists it beside each name), or to the project a link "
+    "points at, never to the project a sweep went through.",
+    "request-target-unknown": "cannot read {0}, so it is refused. Retry, or name the "
+    "source and target literally: osc sr SRC_PRJ PKG DST_PRJ.",
+    "sr-cleanup": "{0} leaves its branch behind once accepted. Pass --cleanup so OBS "
+    "deletes it (and the subproject, if it was the last package there).",
+    "osc-prompt": "{0}: osc asks before it supersedes, forwards or commits past a "
+    "conflict, and an answer through a pipe skips that decision. Name what you "
+    "replace with -s ID, pass -m, run osc with </dev/null, and file a forward by hand.",
+    "osc-yes": "{0}: --yes answers osc's questions unread, superseding whatever "
+    "request it finds. Name what you replace with -s ID, pass -m, run osc with "
+    "</dev/null, and file a forward by hand.",
+    "request-link": "{0}: the branch carries that project's package and history, so "
+    "the request would rewrite the target's .changes with them. Branch from the "
+    "target (osc branch TARGET PKG) and submit from that branch.",
+    "request-link-factory": "{0}: Factory takes a package from its devel project, "
+    "which reviews it first. Submit the branch to the project it links to, and "
+    "forward from there once it is accepted.",
+    "interpreter": "{0}: a .sh file is a shell script and a .py file a Python one; "
+    "the wrong interpreter fails on its first lines, and a pipe hides that. Run "
+    "bash X.sh or python3 X.py, or the script by its path.",
+    "sleep": "{0}: a fixed wait holds the session while nothing is checked. Wait on "
+    "the event: {s}/obs-wait.py build PRJ PKG (or request ID), "
+    "{s}/build-wait.sh PGID LOG for a local build (--no-summary: any other local "
+    "job, such as osc service mr, a vendor or cargo run), or check back in a later call.",
+    "rdelete-pending": "{0}: OBS revokes every request that still comes from what "
+    "it deletes, new, review and declined alike, and a project takes its packages' "
+    "requests with it. Delete one package at a time with plain osc rdelete PRJ PKG "
+    "-m MSG, which refuses while a request involves it, then the emptied project "
+    "with osc rdelete PRJ -m MSG.",
+    "rdelete-unknown": "cannot tell what {0} deletes, so it is refused. Name the "
+    "project, package and options literally, or loop over a literal list.",
+    "exec-unreadable": "cannot read {0} before it runs, so it is refused. Create "
+    "the file in one call and run it in the next.",
+    "exec-written": "{0} is written by this same call, so the guard would judge "
+    "what it held before. Run it in a separate call so it can be read.",
+    "exec-unresolved": "cannot tell which file {0} names, so it is refused. Run "
+    "the script by a literal path.",
+    "canonical-env": "{0}: the skill's scripts run unread only in the environment "
+    "they were given. Drop the change (allowed: TMPDIR, LC_ALL, LANG, NO_COLOR, "
+    "CHANGES_AUTHOR) and pass values as arguments.",
+    "canonical-read": "{0}: the skill's scripts find their siblings from their own "
+    "path, so they are run by path ({s}/NAME ...), never sourced or fed on stdin.",
+    "credential": "{0}: a login is read only by the tool that owns it (osc, tea, "
+    "git-obs, gh). Run that tool or a skill script; ls and stat may look.",
+    "askpass": "{0}: an askpass program hands git or ssh a password. git-obs's "
+    "credential helper and SSH carry the logins.",
+    "secret": "{0}: it prints a secret. Check a login without it: osc whois, "
+    "git-obs -G src.opensuse.org api /user.",
+    "auth": "{0}: a credential on a command line lands in logs and transcripts. "
+    "Let the tool authenticate: osc api, git-obs -G src.opensuse.org api.",
+    "api": "{0} goes past the tools that hold the login. OBS: osc api PATH; "
+    "Gitea: git-obs -G src.opensuse.org api PATH; or the skill's scripts.",
+    "scm-commit": "{0}: a scmsync checkout, whose sources OBS syncs from git. A "
+    "change goes by a pull request to that repository, never osc commit; its "
+    "gate.sh stamp still lets the forward (osc sr) through.",
+}
+# Allowed only on the user's go: the harness asks them. opencode cannot ask, so
+# its plugin refuses: on the agent's own commit or request that names a step to
+# take and retry, never an osc, tea or git-obs command to hand the user.
+ASKS = {
+    "comment": "{0}: a comment is public and speaks for the user. Post only "
+    "what they asked for, as they approved it; a note for them goes in your report.",
+    "accept-forward": "{0}: only {s}/autoforward-gate.sh's ELIGIBLE moves a package "
+    "unattended (no reviewer; your package, or an unowned one in a project you "
+    "maintain; Factory's devel project). Otherwise it needs the user's go.",
+    "rm-checkouts": "{0}, and other work may be using them. Remove one checkout "
+    "per rm (separate rm commands in one call pass), or it needs the user's go.",
+    "eval-dynamic": "{0}: the guard cannot read the commands this runs, so it "
+    "cannot judge them. Write them out literally, or it needs the user's go.",
+    "gate-stamp": "{0}. Run {s}/gate.sh in the checkout, commit in the next "
+    "call, and file once gate.sh --review recorded the change review's PASS.",
+    "build-evidence": "{0}. Record its build first: {s}/gate.sh with --build-log LOG "
+    "(a local build of this tree), or gate.sh DIR --obs-build once OBS built the "
+    "commit (it judges Tumbleweed and Leap 16 on x86_64 and aarch64; --repos and "
+    "--arches REGEX add the target's); then file.",
+    "gate-args": "{0}, so the guard cannot see whether --review is among them. "
+    "Write {s}/gate.sh's arguments out literally (no --review is involved).",
+    "review-self": "{0}: only the changes-review agent that ran the review records "
+    "it (agents/changes-review.md runs {s}/gate.sh --review itself), and a PASS the "
+    "author wrote is no review. Without such an agent, stop at REVIEW-PENDING and "
+    "leave this command to the user.",
+}
+# The read a tea comment with no subcommand and no body may have meant.
+COMMENT_READ = (
+    "To read them: tea comments list --login src.opensuse.org --repo OWNER/NAME N."
+)
+
+
+# Credentials a message may echo from a remote URL or a command: a URL's
+# password (or a token as its user), an Authorization value, a token= value.
+SECRETS = (
+    (Rx(r"(://[^/\s:@]*:)[^/\s@]+@"), r"\1[REDACTED]@"),
+    (Rx(r"(://)[\w-]{20,}@"), r"\1[REDACTED]@"),
+    (
+        Rx(
+            r"(?i)(\b(?:authorization:\s*(?:(?:token|bearer|basic)\s+)?|token\s+"
+            r"|bearer\s+))[^\s\"'`]+"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (Rx(r"(?i)(token=)[^\s&\"'`]+"), r"\1[REDACTED]"),
+)
+
+
+def redact(text):
+    for rx, repl in SECRETS:
+        text = rx.sub(repl, text)
+    return text
+
+
+class Blocked(Exception):
+    def __init__(self, rule, kind, detail):
+        super().__init__(detail)
+        self.rule, self.kind, self.detail = rule, kind, detail
+
+    def __str__(self):
+        return redact(
+            f"pr-guard: BLOCKED [{self.rule}] "
+            + MESSAGES[self.kind].format(self.detail, s=scripts_path())
+        )
+
+
+def block(rule, detail, kind=None):
+    kind = kind or (rule if rule in MESSAGES else rule.split("-", 1)[0])
+    raise Blocked(rule, kind, detail)
+
+
+def unsure(why):
+    block("push-unknown", why, "push-unknown")
+
+
+class Asked(str):
+    """A verdict that asks the user instead of refusing: pr-guard.py turns it
+    into the hook's permission prompt."""
+
+    ask = True
+
+
+def ask(ctx, rule, detail, hint=""):
+    """Record that the call needs the user's go; judging goes on, and a
+    refusal anywhere in the call still wins. hint: a sentence to append."""
+    text = ASKS[rule].format(detail, s=scripts_path())
+    msg = redact(f"ASK [{rule}] " + text + (hint and " " + hint))
+    if msg not in ctx.asks:
+        ctx.asks.append(msg)
+
+
+class Ctx:
+    """Per-event state: the hook's cwd, remotes a command defines before it
+    pushes, heredoc bodies, environment changes, variable values, the files the
+    call writes, and memoised lookups."""
+
+    def __init__(self, cwd, tool=None, background=False):
+        import time
+
+        self.cwd = cwd
+        self.tool = tool  # the harness's tool name
+        self.background = background  # a call that does not hold the session
+        self.slept = 0.0  # the seconds this call's sleeps add up to
+        self.remotes = {}
+        self.prs = {}
+        self.devel = {}  # Factory's devel project per package, "" for none
+        self.deadline = time.monotonic() + NET_BUDGET  # of the open-PR lookups
+        self.owners = {}
+        self.scanned = set()
+        self.canon = {}
+        self.docs = []
+        self.exported = []
+        self.values = {}
+        self.written = set()
+        self.lit_values = {}  # the values, as literal-aware text
+        self.wrappers = set()  # functions that run their arguments ("$@")
+        self.in_function = 0  # inside a function body, where "$@" is its arguments
+        self.subs = []  # what each command substitution writes, as literal-aware text
+        self.sub_bodies = []  # each command substitution's text, as ctx.subs counts them
+        self.asks = []  # what the user must approve: ASKS findings, in order
+        self.users = {}  # the OBS account per instance, looked up once
+        self.apiurl = ""  # the instance the osc command judged names with -A
+        self.writers = []  # what in the call can write (note_write)
+        self.seq = 0  # the commands judged so far, for the writers' order
+        self.command = None  # the Bash call's whole text
+        self.loops = []  # where the loops around this command start
+        self.pipe = 0  # the pipelines judged so far; cur_pipe: this command's
+        self.cur_pipe = 0
+        self.bg = set()  # the commands sent to the background with &
+        self.traps = []  # trap commands, judged when the call has run
+        self.any_bg = False  # the call sends something to the background
+        self.gate_pending = []  # stamped commits and submits, for gate_writers
+        self.agent = None  # the harness's agent type for the call (agent_type)
+
+
+def git(cwd, gargs, *args):
+    """stdout of a local git query, or None when it fails."""
+    import subprocess
+
+    if not cwd:
+        return None
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, *gargs, *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def remote_owners(ctx, cwd):
+    """Owners of the src.opensuse.org remotes of cwd, counting remotes this
+    call adds; tea and git-obs act on those when no repository is named."""
+    if cwd not in ctx.owners:
+        out = git(cwd, (), "remote", "-v")
+        owners = set()
+        for line in (out or "").splitlines():
+            parts = line.split()
+            m = FORGE.search(parts[1]) if len(parts) > 1 else None
+            if m:
+                owners.add(m.group(1).lower())
+        ctx.owners[cwd] = owners
+    added = [FORGE.search(u) for (d, _), u in ctx.remotes.items() if d == cwd]
+    return ctx.owners[cwd] | {m.group(1).lower() for m in added if m}
+
+
+def pool_or_unknown(text, ctx, cwd, cmd=False, extra=None):
+    """False only when every owner the text names -- or, naming none, every
+    remote of cwd -- is a literal owner other than pool. cmd: a tea or git-obs
+    command line, whose repository options name owners too."""
+    if VAR_REPOS.search(text) or (cmd and VAR_OPT.search(text)):
+        return True
+    found = [
+        next(g for g in m.groups() if g)
+        for m in (CMD_OWNER if cmd else API_OWNER).finditer(text)
+    ]
+    if extra is not None:
+        found += extra.findall(text)
+    if not found:
+        owners = remote_owners(ctx, cwd)
+        return not owners or "pool" in owners
+    return any(o.lower() == "pool" or not LITERAL.fullmatch(o) for o in found)
+
+
+def code_lines(text):
+    """A program's lines, a backslash-newline joining two as the shell, Python
+    and Perl do -- not after a comment line, which its newline ends."""
+    out, cur = [], ""
+    for ln in text.split("\n"):
+        if not cur and ln.lstrip().startswith("#"):
+            continue
+        if (len(ln) - len(ln.rstrip("\\"))) % 2:
+            cur += ln[:-1]
+            continue
+        out.append(cur + ln)
+        cur = ""
+    if cur:
+        out.append(cur)
+    return out
+
+
+def tool_rules(ln, ctx, cwd, argv=False):
+    """tea and git-obs, on one command line or one line of a program. argv:
+    a command line, whose tea subcommand is its first word after options."""
+    merge, create = (
+        (TEA_MERGE_ARGV, TEA_CREATE_ARGV) if argv else (TEA_MERGE, TEA_CREATE)
+    )
+    tea = "match" if argv else "search"
+    if getattr(merge, tea)(ln):
+        block("merge-tea", "a tea PR merge")
+    m = GIT_OBS.search(ln)
+    # A PR id or repository held in a variable names no owner.
+    held = bool(m) and bool(VAR_WORD.search(ln[m.end() :]))
+    if m and m.group(1) == "merge":
+        block("merge-git-obs", "a git-obs PR merge")
+    if m and m.group(1) == "create":
+        if not GIT_OBS_TARGET.search(ln) or pool_or_unknown(ln, ctx, cwd, True):
+            block("create-git-obs", "a git-obs PR create towards pool")
+    if m and m.group(1) == "forward":
+        if held or pool_or_unknown(ln, ctx, cwd, True, BARE_REPO):
+            block("create-git-obs", "a git-obs PR forward on pool")
+    if getattr(create, tea)(ln) and pool_or_unknown(ln, ctx, cwd, cmd=True):
+        block("create-tea", "a tea PR create on a pool (or unnamed) repository")
+    if not argv:  # a command line's own call is judged by its options
+        tea_api_merge(ln, ctx, cwd)
+    if TEA_API.search(ln) and "pulls" in ln and TEA_WRITE.search(ln):
+        if pool_or_unknown(ln, ctx, cwd, cmd=True):
+            block("create-tea-api", "a tea api write to pool pulls")
+
+
+def tea_api_merge(ln, ctx, cwd, reads=None):
+    """A tea api call on a merge URL: on a pool (or unknown) repository, or
+    one that does not provably only read."""
+    ln = norm_urls(ln)
+    if TEA_API.search(ln) and MERGE_URL.search(ln):
+        if pool_or_unknown(ln, ctx, cwd, cmd=True) or not (
+            code_reads(ln) if reads is None else reads
+        ):
+            block("merge-api", "an API merge of a PR")
+
+
+def expansions(words, ctx, cwd):
+    """The spellings of the words that hold variables this call set."""
+    return [
+        e for w in words if VARIABLE.search(w) for e in substitute(w, ctx, cwd) or ()
+    ]
+
+
+def osc_rules(seg, request=None):
+    """request: the command line without its request message, which only
+    describes the request."""
+    b = OSC_BUILD.search(seg)
+    if b:
+        import platform
+
+        native = os.environ.get("PR_GUARD_ARCH") or platform.machine()
+        for arch in ARCH.findall(b.group(1)):
+            if arch not in NATIVE.get(native, {native}):
+                block("emulated-build", f"an osc build for {arch} on {native}")
+    if OSC_REQUEST.search(seg if request is None else request):
+        block("backports", "an osc request to openSUSE:Backports:SLE-16.x")
+    if OSC_NODEVEL.search(seg if request is None else request):
+        block("nodevelproject", "an osc request with --nodevelproject")
+    if OSC_YES.search(seg if request is None else request):
+        block("osc-yes", "an osc request with --yes")
+
+
+def long_prefix(a, names):
+    """a with a long option given by an unambiguous prefix, as argparse takes
+    it, written out in full."""
+    k, eq, v = a.partition("=")
+    hits = [n for n in names if n.startswith(k)] if a[:2] == "--" and k[2:] else []
+    return hits[0] + eq + v if len(hits) == 1 else a
+
+
+def without_message(run):
+    """An osc argv without the value of -m/--message."""
+    out, i = [], 0
+    while i < len(run):
+        a = long_prefix(run[i], ("--message",))
+        if a in ("-m", "--message"):
+            i += 2
+            continue
+        if not (a.startswith("--message=") or a.startswith("-m") and len(a) > 2):
+            out.append(a)
+        i += 1
+    return out
+
+
+def request_args(run, ctx, cwd):
+    """osc_rules on an osc command line and on the values its variables hold
+    (a loop's words included); a request whose non-message argument holds a
+    value only the shell knows is refused: where it goes is unknown."""
+    rest = without_message(run)
+    extra, unknown = [], None
+    for k, a in enumerate(rest[1:], 1):
+        if not VARIABLE.search(a) or rest[k - 1] in ("-F", "--file"):
+            continue  # a literal, or the message file request_message() reads
+        spellings = substitute(a, ctx, cwd)
+        if spellings is None:  # unknown, or past 64 spellings: each value then
+            names = [x or y for x, y in VAR_REF.findall(a)]
+            if VARIABLE.search(VAR_REF.sub("", a)) or not all(
+                ctx.values.get(n) for n in names
+            ):
+                unknown = unknown or a
+            spellings = [v for n in names for v in ctx.values.get(n, ())]
+        extra += spellings
+    osc_rules(" ".join([*run, *extra]), " ".join([*rest, *extra]))
+    sub = osc_sub(rest)[0]
+    if sub in REQUESTS and unknown:
+        block("request-unknown", f"osc {sub} {shown(unknown)}")
+
+
+def request_message(run, lit, ctx, cwd):
+    """A request (or an osc request verb that would open an editor) with no
+    message, one too long for its reviewers, or one that cannot be read now. lit: the argv as literal-aware text and the stdin of the call.
+    -m of other subcommands is a commit message, or osc api's method."""
+    sub, args = osc_sub(run)
+    if sub in ("rq", "request", "review"):
+        opts, pos = osc_args("request", args, OSC_OPTS_ASK)
+        verbs = (spellings(pos[0], ctx, cwd, False) or []) if pos else []
+        edited = [v for v in verbs if v in EDITED_VERBS]
+        if edited and not {k for k, _ in opts} & {"-m", "--message"}:
+            block("request-no-message", f"osc {sub} {edited[0]} without -m")
+    if sub not in REQUESTS:
+        return
+    largv, lstdin = lit or (None, None)
+    if largv is not None and len(largv) >= len(args):
+        args = largv[len(largv) - len(args) :]
+    else:  # no literal-aware text: any $ or backtick is unknown
+        args = [literal(a) if not VARIABLE.search(a) else a for a in args]
+    args = [long_prefix(a, ("--message", "--file", "--diff")) for a in args]
+    opts = parse_opts(args, "mFrsaA", REQUEST_VALUED)[0]
+    keys = {k for k, _ in opts}
+    diff = sub in SUBMITS and keys & {"-d", "--diff"}  # shows the diff, files nothing
+    if not diff and not keys & {"-m", "--message", "-F", "--file"}:
+        block("request-no-message", f"osc {sub} without -m")
+    for flag, word in opts:
+        if flag not in ("-m", "--message", "-F", "--file"):
+            continue
+        is_file = flag in ("-F", "--file")
+        texts = message_texts(word, ctx, cwd, is_file, lstdin)
+        if texts is None:
+            what = unread(word, ctx, cwd, is_file)
+            block("request-message-unknown", f"the osc {sub} message ({what})")
+        for fault in filter(None, map(message_fault, texts)):
+            block("request-message", f"an osc {sub} message {fault}")
+
+
+def message_texts(word, ctx, cwd, is_file=False, stdin=None):
+    """Every text a literal-aware message word stands for -- for is_file, what
+    the file it names (or stdin) holds -- or None when one cannot be read now."""
+    texts = [word]
+    if is_file:
+        names = lit_texts(word, ctx, cwd) or [None]
+        outs = [stdin if f in STDIN else f and ("files", [f]) for f in names]
+        texts = [t for o in outs for t in piped(o, ctx, cwd) or [None]]
+    texts = [lit_texts(t, ctx, cwd) if t is not None else None for t in texts]
+    texts = None if None in texts else [t for ts in texts for t in ts]
+    if texts is None and not is_file:  # too many spellings: fine if all short
+        top = lit_texts(word, ctx, cwd, longest=True)
+        texts = top if top and len(top[0].strip()) <= 100 else None
+    return texts
+
+
+def unread(word, ctx, cwd, is_file=False):
+    """A message word message_texts() cannot read, as a refusal names it."""
+    what = "a command substitution" if SUB_WORD.search(word) else word
+    what = ("stdin" if word in STDIN else f"-F {word}") if is_file else what
+    what = what.translate(UNLITERAL)
+    fresh = written_by_call(word.translate(UNLITERAL), ctx, cwd)
+    if fresh:
+        what += f": {fresh} is written by this same call"
+    elif ctx.written:  # a substitution hides its file: name what the call writes
+        what += "; this call also writes " + ", ".join(sorted(ctx.written)[:2])
+    return what
+
+
+# The options of tea pulls create that carry the PR's text, and its others that
+# take a value; git-obs pr create's long options, which argparse takes by prefix.
+PR_TEXT = {"--title": "title", "-t": "title", "--description": "description"}
+PR_TEXT["-d"] = "description"
+TEA_CREATES = {(p, c) for p in ("pr", "pulls", "pull") for c in ("create", "c")}
+TEA_CREATE_VALUED = {"--head", "--base", "-b", "--topic", "--assignees", "-a"}
+TEA_CREATE_VALUED |= {"--labels", "-L", "--referenced-version", "-v", "--milestone"}
+TEA_CREATE_VALUED |= {"-m", "--deadline", "-D", "--output", "-o"}
+GIT_OBS_FLAGS = ("--self", "--separate-requests", "--dry-run", "--allow-empty")
+GIT_OBS_CREATE = GIT_OBS_FLAGS + ("--title", "--description", "--source", "--target")
+GIT_OBS_CREATE += ("--source-owner", "--source-repo", "--source-branch")
+GIT_OBS_CREATE += ("--target-owner", "--target-repo", "--target-branch")
+GIT_OBS_CREATE += ("--allow-maintainer-edit",)
+
+
+def pr_message(tool, args, largs, ctx, cwd):
+    """A PR title or description that message_fault() faults, or one that
+    cannot be read now, towards any repository. tool: "tea", whose pulls
+    create (pr c) carries them, args with its long options as --, or
+    "git-obs" (pr create). largs: args as literal-aware text, or None."""
+    if tool == "tea":
+        words = tea_words(args)
+        if tuple(words[:2]) not in TEA_CREATES:
+            return
+        start, cmd = 0, " ".join(["tea", *words[:2]])
+    else:
+        rest = git_obs_rest(args)
+        if [a for a in rest if a[:1] != "-"][:2] != ["pr", "create"]:
+            return
+        start, cmd = len(args) - len(rest), "git-obs pr create"
+    if largs is None or len(largs) != len(args):  # any $ or backtick is unknown
+        largs = [literal(a) if not VARIABLE.search(a) else a for a in args]
+    i = start
+    while i < len(args):
+        a = args[i] if tool == "tea" else long_prefix(args[i], GIT_OBS_CREATE)
+        k, eq, _ = a.partition("=")
+        i += 1
+        if a == "--":
+            break
+        if k in PR_TEXT and (tool == "tea" or k in GIT_OBS_CREATE):
+            word = largs[i - 1].partition("=")[2] if eq else "".join(largs[i : i + 1])
+            i += 0 if eq else 1
+            named = f"the {cmd} {PR_TEXT[k]}"
+            texts = message_texts(word, ctx, cwd)
+            if texts is None:
+                block("pr-message-unknown", f"{named} ({unread(word, ctx, cwd)})")
+            for fault in filter(None, map(message_fault, texts)):
+                block("pr-message", f"{named} {fault}")
+        elif not eq and (
+            k in TEA_VALUED | TEA_CREATE_VALUED
+            if tool == "tea"
+            else k in GIT_OBS_CREATE and k not in GIT_OBS_FLAGS
+        ):
+            i += 1
+
+
+def written_by_call(word, ctx, cwd):
+    """A path named in word that this call writes, as written, or None."""
+    base = cwd if isinstance(cwd, str) and not isinstance(cwd, Dirs) else "/"
+    for tok in re.findall(r"[\w./~+@-]+", word):
+        if "/" not in tok and "." not in tok:
+            continue
+        path = os.path.realpath(os.path.join(base, os.path.expanduser(tok)))
+        if path in ctx.written:
+            return tok
+    return None
+
+
+# Status meant for the user that keeps landing in requests and PRs: never a
+# reviewer's business. GREEN and PASS are verdict words, so only in capitals.
+WORK_NOTE = re.compile(
+    r"\b(?:not done|bugwarden|vul[- ](?:sweep|bug cross-check)|(?:builds?|built) green"
+    r"|still building|this env(?:ironment)?|sub-?agents?|no (?:bugzilla )?access"
+    r"|gate\.sh|adversarial review|review (?-i:PASS)|(?-i:GREEN))\b",
+    re.I,
+)
+BARE_FORWARD = re.compile(
+    r"forward\s+\S+(?:\s+update)?\s+to (?:openSUSE:)?Factory\.?", re.I
+)
+
+
+def message_fault(text):
+    """Why a request message is wrong for its reviewers, or None: over 160
+    characters of prose (every line that is not a "- " list item, wherever it
+    sits), a list item over 100, over 1000 characters in all, a work note for
+    the user (build or sweep status, the session's tools), or a forward that
+    says only that it forwards."""
+    lines = text.strip().split("\n")
+    prose = "\n".join(ln for ln in lines if not ln.startswith("- ")).strip()
+    if len(prose) > 160:
+        return f"with {len(prose)} characters of prose"
+    item = max((len(ln) for ln in lines if ln.startswith("- ")), default=0)
+    if item > 100:
+        return f"with a {item}-character list line"
+    if len(text.strip()) > 1000:
+        return f"of {len(text.strip())} characters"
+    note = WORK_NOTE.search(text)
+    if note:
+        return f'with a work note ("{note.group(0)}")'
+    if BARE_FORWARD.fullmatch(prose):
+        return "that only says it forwards"
+    return None
+
+
+def literal(text):
+    """text with every $ and backtick literal."""
+    return text.translate(str.maketrans(LIT_CHARS))
+
+
+def lit_texts(text, ctx, cwd, seen=frozenset(), longest=False, memo=None):
+    """Every text a literal-aware word or text stands for, its $NAME, ${NAME}
+    and command substitutions expanded from what this call set; None when
+    anything it expands is not known, past 64 spellings or EXPANDED
+    characters. longest: only the longest spelling."""
+    memo = {} if memo is None else memo
+    if (text, seen, longest) not in memo:
+        got = _lit_texts(text, ctx, cwd, seen, longest, memo)
+        memo[text, seen, longest] = capped(got)
+    return memo[text, seen, longest]
+
+
+def _lit_texts(text, ctx, cwd, seen, longest, memo):
+    m = VAR_REF.search(text)
+    if not m or VARIABLE.search(text[: m.start()]):
+        return None if VARIABLE.search(text) else [text.translate(UNLITERAL)]
+    name = m.group(1) or m.group(2)
+    sub = re.fullmatch(r"__sub(\d+)", name)
+    if name in seen:
+        return None
+    if sub and int(sub.group(1)) < len(ctx.subs):
+        vals = sub_texts(ctx.subs[int(sub.group(1))], ctx, cwd)
+    elif name in ctx.lit_values:
+        vals = ctx.lit_values[name]
+    elif name in ("PWD", "TMPDIR", "HOME"):
+        vals = substitute("$" + name, ctx, cwd)
+        vals = vals and [literal(v) for v in vals]
+    else:
+        vals = None
+    tails = lit_texts(text[m.end() :], ctx, cwd, seen, longest, memo)
+    if not vals or None in vals or tails is None:
+        return None
+    out = []
+    for v in vals:
+        heads = lit_texts(v, ctx, cwd, seen | {name}, longest, memo)
+        if heads is None:
+            return None
+        out += [
+            text[: m.start()].translate(UNLITERAL) + h + t for h in heads for t in tails
+        ]
+    if longest:
+        return [max(out, key=len)]
+    return out if len(out) <= 64 else None
+
+
+def sub_texts(writers, ctx, cwd):
+    """The literal-aware texts a command substitution's writers put out,
+    joined in order; None when one of them cannot be read now."""
+    texts = [""]
+    for out in writers or ():
+        got = piped(out, ctx, cwd)
+        if got is None or len(texts) * len(got) > 64:
+            return None
+        texts = [t + g for t in texts for g in got]
+    return [t.rstrip("\n") for t in texts] if writers else None
+
+
+def piped(out, ctx, cwd):
+    """The literal-aware texts a command writes to a pipe (what output() says
+    it writes), read now; None when they cannot be."""
+    how, what = out or (None, None)
+    if how == "text":
+        return [what]
+    if how != "files":
+        return None
+    text = ""
+    for raw in what:
+        for path in locate(raw, ctx, cwd)[0] or [None]:
+            real = path and os.path.realpath(path)
+            if not real or written(real, ctx) or not regular(real):
+                return None
+            try:
+                with open(real, "rb") as fh:
+                    text += literal(fh.read(MAX_BYTES).decode("utf-8", "replace"))
+            except OSError:
+                return None
+    return [text]
+
+
+def osc_projects(raw, what, ctx, cwd):
+    """The projects an osc checkout path (a checkout, or a file in one) names
+    in its .osc/_project -- in each directory a loop's cd may leave. Refused
+    when a path cannot be placed, or holds no .osc/_project (one the call
+    checks out itself, or no checkout): unless its own components name a
+    maintenance project, it is unknown."""
+    dirs = cwd.dirs if isinstance(cwd, Dirs) else [cwd]
+    got = [locate(raw, ctx, d) for d in dirs]
+    why = next((w for p, w in got if p is None), False)
+    if why is not False:
+        block(
+            "maintenance-unknown", f"{what} {shown(raw)}" + (f" ({why})" if why else "")
+        )
+    prjs = []
+    for path in (p for paths, _ in got for p in paths):
+        d = path if os.path.isdir(path) else os.path.dirname(path)
+        try:
+            with open(os.path.join(d, ".osc", "_project"), encoding="utf-8") as fh:
+                prjs.append(fh.read().strip())
+        except OSError:
+            prjs += list(filter(MAINT_PRJ.fullmatch, path.split(os.sep)))[:1] or [None]
+    if None in prjs and not any(p and MAINT_PRJ.fullmatch(p) for p in prjs):
+        block(
+            "maintenance-unknown",
+            f"{what} {shown(raw)} (no .osc/_project there: check out in one call, "
+            "commit in the next)",
+        )
+    return prjs
+
+
+def long_names(spec):
+    """(long options that take a value, all long options) of an OSC_* spec."""
+    valued, _, flags = spec.partition(";")
+    valued = ["--" + o for o in valued.split()]
+    return valued, valued + ["--" + o for o in flags.split()]
+
+
+def osc_sub(run):
+    """(subcommand, its arguments) of an osc argv."""
+    valued, names = long_names(OSC_GLOBAL)
+    i = 1
+    while i < len(run) and run[i].startswith("-"):
+        i += 2 if long_prefix(run[i], names) in ("-A", *valued) else 1
+    return (run[i], run[i + 1 :]) if i < len(run) else (None, [])
+
+
+def osc_args(sub, args, table=None):
+    """(options as (flag, value), operands) of the arguments of an OSC_OPTS
+    (or table) subcommand, which may carry osc's global options too."""
+    short, spec = (table or OSC_OPTS)[sub]
+    valued, names = long_names(spec)
+    gvalued, gnames = long_names(OSC_GLOBAL)
+    args = [long_prefix(a, names + gnames) for a in args]
+    return parse_opts(args, short + "A", valued + gvalued)
+
+
+def shown(word):
+    return SUB_WORD.sub("$(...)", word)
+
+
+def osc_writes(run, ctx, cwd):
+    """osc writes into a maintenance or update project, or into one the guard
+    cannot place: commit, api, and the project arguments of osc_target()."""
+    sub, args = osc_sub(run)
+    sub = OSC_ALIAS.get(sub, sub)
+    if sub not in OSC_OPTS:
+        return
+    opts, pos = osc_args(sub, args)
+    if sub in ("commit", "updatepacmetafromspec"):  # checkouts, by their paths
+        rule = "maintenance-commit" if sub == "commit" else "maintenance-write"
+        for raw in pos or ["."]:
+            for prj in osc_projects(raw, f"osc {sub}", ctx, cwd):
+                if prj and MAINT_PRJ.fullmatch(prj):
+                    block(rule, f"an osc {sub} into {prj}")
+        return
+    if sub == "maintainer" and {k for k, _ in opts} & ROLE_WRITES:
+        # one name is an owner search, -U/-G a user's or group's: the role
+        # lands wherever the search points
+        keys = {k for k, _ in opts}
+        words = [w for p in pos for w in p.strip("/").split("/")]
+        if len(words) == 1 or keys & {"-U", "--user", "-G", "--group"}:
+            block(
+                "maintenance-unknown", f"a role an osc {sub} search (not PRJ PKG) finds"
+            )
+    if sub != "api":
+        for target in filter(None, osc_targets(sub, pos, opts)):
+            if target == ".":
+                prjs = [p for p in osc_projects(".", f"osc {sub} to", ctx, cwd) if p]
+            else:
+                prjs = substitute(target, ctx, cwd)
+                if prjs is None:
+                    block("maintenance-unknown", f"osc {sub} to {shown(target)}")
+            for prj in filter(MAINT_PRJ.fullmatch, prjs):
+                block("maintenance-write", f"an osc {sub} into {prj}")
+        return
+    keys = {k for k, _ in opts}
+    method = ([v for k, v in opts if k in ("-X", "-m", "--method")] or ["GET"])[-1]
+    # As osc: a file uploads by PUT, and --edit PUTs what it fetched.
+    if method == "GET" and keys & {"-T", "-f", "--file"} or keys & {"-e", "--edit"}:
+        method = "PUT"
+    if method.upper() in ("GET", "HEAD"):
+        return
+    for a in pos:
+        urls = substitute(a, ctx, cwd)
+        if urls is None and api_segment(a) is None:
+            block("maintenance-unknown", f"osc api {method} {shown(a)}")
+        for url in urls or [a]:
+            for prj in api_targets(method, url):
+                if VARIABLE.search(prj):
+                    block("maintenance-unknown", f"osc api {method} {shown(a)}")
+                if MAINT_PRJ.fullmatch(prj):
+                    block("maintenance-api", f"an osc api {method} into {prj}")
+
+
+SUBMITS = {"sr", "submitreq", "submitrequest", "submitpac"}
+# Targets the devel-project rule leaves to the others: Factory and the products,
+# SUSE's, and home: branches.
+OWN_RULES = re.compile(r"(?:openSUSE|SUSE|home)(?::|$)")
+PKG_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*")
+
+
+def submit_operands(run):
+    """The operands of each submit a command files, slash-split as osc does:
+    osc sr's, or each `osc creq -a submit ...` group's (-a takes every word up
+    to the next option). Empty when it files none."""
+    sub, args = osc_sub(run)
+    args = [long_prefix(a, ("--message", "--file", "--action")) for a in args]
+    if sub in SUBMITS:
+        groups = [parse_opts(args, "mFrsaA", REQUEST_VALUED)[1]]
+    elif sub in ("creq", "createrequest"):
+        groups, cur, i = [], None, 0
+        while i < len(args):
+            a = args[i]
+            if a in ("-a", "--action"):
+                cur = []
+                groups.append(cur)
+            elif a.startswith("-") and a != "-":
+                cur = None
+                i += a in REQUEST_VALUED or len(a) == 2 and a[1] in "mFrs"
+            elif cur is not None:
+                cur.append(a)
+            i += 1
+        groups = [g[1:] for g in groups if g[:1] == ["submit"]]
+    else:
+        return []
+    return [[w for p in g for w in p.strip("/").split("/")] for g in groups]
+
+
+def spellings(w, ctx, cwd, project=True):
+    """A request operand's values, as the call sets them; a project "." is the
+    checkout's, as osc reads it."""
+    vals = (substitute(w, ctx, cwd) or []) if VARIABLE.search(w or "") else [w]
+    if not project:
+        return vals
+    if "." in vals and not isinstance(cwd, str):
+        block(
+            "request-target-unknown",
+            "the project '.' names (the working directory is unknown)",
+        )
+    here = cwd.dirs if isinstance(cwd, Dirs) else [cwd]
+    return [
+        p
+        for v in vals
+        for p in (
+            [checkout_package(ctx, d, "_project") for d in here] if v == "." else [v]
+        )
+    ]
+
+
+def request_target(run, ctx, cwd):
+    """A submit request to a project other than the one Factory's _meta names
+    as the package's devel project: a sweep through a project lists its
+    aggregates, links and siblings' packages, and an SR filed to it for one of
+    those goes to the wrong project."""
+    for words in submit_operands(run):
+        if len(words) >= 3:
+            dsts, pkgs = [words[2]], [words[3] if len(words) > 3 else words[1]]
+        elif words:
+            dsts = [words[0]]
+            pkgs = [words[1]] if len(words) == 2 else [checkout_package(ctx, cwd)]
+        else:
+            continue  # osc picks the link's or devel project's target itself
+        target_rules(osc_sub(run)[0], dsts, pkgs, ctx, cwd)
+
+
+def target_rules(sub, dsts, pkgs, ctx, cwd):
+    """request_target's rules on one submit's targets."""
+    for dst in (d for w in dsts for d in spellings(w, ctx, cwd)):
+        if not dst or OWN_RULES.match(dst):
+            continue
+        for pkg in (p for w in pkgs for p in spellings(w, ctx, cwd, False)):
+            if not pkg or not PKG_NAME.fullmatch(pkg):
+                block(
+                    "request-target-unknown",
+                    f"which package osc {sub} to {dst} submits",
+                )
+            devel = factory_devel(pkg, ctx)
+            if devel and devel != dst:
+                block(
+                    "request-target",
+                    f"{pkg}'s devel project is {devel} (Factory _meta), not {dst}",
+                )
+            if not devel:  # not developed for Factory: the target package says where
+                kind, origin = target_kind(dst, pkg, ctx)
+                if kind == "aggregate":
+                    block(
+                        "request-target",
+                        f"{dst}/{pkg} is an _aggregate of another project's binaries",
+                    )
+                if kind == "link":
+                    block("request-target", f"{dst}/{pkg} is a _link to {origin}")
+
+
+def checkout_package(ctx, cwd, what="_package"):
+    """The package (what="_project": the project) of the checkout osc runs in,
+    or None."""
+    if not isinstance(cwd, str) or isinstance(cwd, Dirs):
+        return None
+    try:
+        with open(os.path.join(cwd, ".osc", what), encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+HOME_SUB = re.compile(r"home:[^:]+:.+")
+PROMPTED = REQUESTS | {"rq", "request", "review", "ci", "commit", "checkin"}
+
+
+def osc_prompt(run, stdin):
+    """An osc request or commit fed an answer on stdin (a pipe, here-string or
+    heredoc); < FILE (/dev/null) and a message read with -F - are fine."""
+    sub, args = osc_sub(run)
+    if sub not in PROMPTED or not stdin or stdin[0] == "files":
+        return
+    args = [long_prefix(a, ("--file",)) for a in args]
+    for i, a in enumerate(args):
+        if (
+            a in ("-F-", "--file=-")
+            or a in ("-F", "--file")
+            and args[i + 1 : i + 2] == ["-"]
+        ):
+            return
+    said = stdin[1].strip()[:20] if stdin[0] == "text" else ""
+    block(
+        "osc-prompt",
+        f"osc {sub} with an answer on stdin" + (f" ({said})" if said else ""),
+    )
+
+
+# A project or package itself (not one of its files): /source/PRJ[/PKG]
+SOURCE_PATH = Rx(r"/source/[^/]+(?:/[^/]+)?")
+
+
+def source_itself(p):
+    """Whether an osc api path names a project or package itself, read as OBS
+    reads it: percent-decoded, repeated slashes collapsed, `.` and `..`
+    resolved, query and fragment dropped (`/source/P//` is project P)."""
+    path = re.sub(r"^[a-z][a-z0-9+.-]*://[^/]*", "", p, flags=re.I)
+    path = urllib.parse.unquote(re.split(r"[?#]", path, maxsplit=1)[0])
+    path = posixpath.normpath(re.sub(r"/+", "/", "/" + path))
+    return SOURCE_PATH.fullmatch(path) is not None
+
+
+def osc_deletes(run, ctx, cwd):
+    """osc rdelete with --force or --recursive, or an osc api DELETE of
+    sources. OBS revokes every request (new, review, declined) whose source it
+    deletes; osc checks for them only on a package delete without --force,
+    and a project delete takes all its packages with it."""
+    sub, args = osc_sub(run)
+    if sub not in ("rdelete", "api"):
+        return
+
+    def spell(w, what):
+        if not VARIABLE.search(w):
+            return [w]
+        spellings = substitute(w, ctx, cwd)
+        if not spellings:
+            block("rdelete-unknown", f"{what} with {shown(w)}")
+        return [x for one in spellings for x in one.split()]
+
+    if sub == "rdelete":  # an operand only the shell knows may be an option
+        opts, pos = osc_args(sub, args)
+        held = [x for w in pos if VARIABLE.search(w) for x in spell(w, "osc rdelete")]
+        keys = {k for k, _ in opts + osc_args(sub, held)[0]}
+        if keys & {"-f", "--force"}:
+            block("rdelete-pending", "osc rdelete --force")
+        if keys & {"-r", "--recursive"}:
+            block("rdelete-pending", "osc rdelete --recursive")
+        return
+    opts, pos = osc_args(sub, args)
+    methods = [
+        m for k, v in opts if k in ("-X", "-m", "--method") for m in spell(v, "osc api")
+    ]
+    if any(m.upper() == "DELETE" for m in methods):
+        for p in (x for w in pos for x in spell(w, "an osc api DELETE")):
+            if source_itself(p):
+                block("rdelete-pending", f"an osc api DELETE of {p}")
+
+
+def request_cleanup(run, ctx, cwd):
+    """A submit request from a home subproject (scratch, topic, branches) that
+    keeps its branch once accepted: osc sr deletes it only with --cleanup,
+    submitpac unless told not to."""
+    sub, args = osc_sub(run)
+    if sub not in SUBMITS:
+        return
+    names = ("--message", "--file", "--cleanup", "--no-cleanup", "--no-update")
+    opts, pos = parse_opts(
+        [long_prefix(a, names) for a in args], "mFrsaA", REQUEST_VALUED
+    )
+    keys = {k for k, _ in opts}
+    if not keys & {"--no-cleanup", "--no-update"} and (
+        "--cleanup" in keys or sub == "submitpac"
+    ):
+        return
+    words = [w for p in pos for w in p.strip("/").split("/")]  # osc's slash_split
+    if len(words) >= 3:
+        w = words[0]
+        srcs = (substitute(w, ctx, cwd) or []) if VARIABLE.search(w) else [w]
+    else:
+        srcs = [checkout_package(ctx, cwd, "_project")]
+    for src in srcs:
+        if src and HOME_SUB.fullmatch(src):
+            block("sr-cleanup", f"osc {sub} from {src}")
+
+
+HOME_PRJ = re.compile(r"home:[^:]+(?::.+)?")
+
+
+def request_link(run, ctx, cwd):
+    """A submit request from a home branch whose package links to a third
+    project: the branch holds that project's sources and .changes, so the
+    request rewrites the target's history with them (a branch of a stale
+    copy in another project, filed to the devel project). A link within the
+    branch's own project is its own source."""
+    sub = osc_sub(run)[0]
+    for words in submit_operands(run):
+        if len(words) >= 3:
+            srcs, pkgs, dsts = [words[0]], [words[1]], [words[2]]
+        elif words:
+            srcs = [checkout_package(ctx, cwd, "_project")]
+            pkgs, dsts = [checkout_package(ctx, cwd)], [words[0]]
+        else:
+            continue  # osc submits to the project the link points at
+        link_rules(sub, srcs, pkgs, dsts, ctx, cwd)
+
+
+def link_rules(sub, srcs, pkgs, dsts, ctx, cwd):
+    """request_link's rules on one submit's operands."""
+    for src in (s for w in srcs for s in spellings(w, ctx, cwd)):
+        if not src or not HOME_PRJ.fullmatch(src):
+            continue
+        for pkg in (p for w in pkgs for p in spellings(w, ctx, cwd, False)):
+            if not pkg or not PKG_NAME.fullmatch(pkg):
+                block(
+                    "request-target-unknown",
+                    f"which package osc {sub} from {src} sends",
+                )
+            root = source_listing(src, pkg, ctx)
+            link = root.find("linkinfo") if root is not None else None
+            lp = link.get("project") if link is not None else None
+            if not lp or lp == src:
+                continue
+            for dst in (d for w in dsts for d in spellings(w, ctx, cwd)):
+                if dst and dst != lp:
+                    origin = f"{lp}/{link.get('package') or pkg}"
+                    block(
+                        "request-link",
+                        f"{src}/{pkg} is a _link to {origin}, not to {dst}",
+                        "request-link-factory" if dst == "openSUSE:Factory" else None,
+                    )
+
+
+# One process fetches the GETs a call needs, through osc's library (it holds
+# the login): an osc process per GET costs about a second and a half each.
+BATCH = r"""
+import json, sys
+from urllib.error import HTTPError
+import osc.conf, osc.core
+osc.conf.get_config(override_apiurl=sys.argv[1] or None)
+base, out = osc.conf.config["apiurl"].rstrip("/"), {}
+for p in sys.argv[2:]:
+    try:
+        out[p] = [200, osc.core.http_GET(base + p).read().decode("utf-8", "replace")]
+    except HTTPError as e:
+        out[p] = [e.code, ""]
+    except Exception as e:
+        out[p] = [0, type(e).__name__]
+print(json.dumps(out))
+"""
+
+
+def obs_get(path, ctx):
+    """(True, text) for an OBS API GET of path on the instance osc -A names,
+    (True, None) for a 404, and (False, what failed) for a failed, slow or
+    over-budget lookup."""
+    if ("get", ctx.apiurl, path) not in ctx.devel:
+        obs_batch([path], ctx)
+    return ctx.devel["get", ctx.apiurl, path]
+
+
+def obs_batch(paths, ctx):
+    """Fetch every path not looked up yet, in one process. Offline,
+    PR_GUARD_META_DIR/api/<path, with /?&= as _> answers ("@ERR" fails), and
+    api@<host>/ for an osc -A instance."""
+    import json
+    import subprocess
+    import sys
+    import time
+
+    todo = [p for p in dict.fromkeys(paths) if ("get", ctx.apiurl, p) not in ctx.devel]
+    if not todo:
+        return
+    got, stub, why = {}, os.environ.get("PR_GUARD_META_DIR"), "no answer"
+    if stub:
+        host = urllib.parse.urlparse(ctx.apiurl).netloc or ctx.apiurl
+        base = os.path.join(stub, "api" + (f"@{host}" if host else ""))
+        for p in todo:
+            f = os.path.join(base, p.translate(str.maketrans("/?&=", "____")))
+            text = open(f, encoding="utf-8").read() if os.path.exists(f) else ""
+            got[p] = (
+                [0, "failed"]
+                if text.strip() == "@ERR"
+                else [200 if text else 404, text]
+            )
+    elif ctx.deadline - time.monotonic() > 0:
+        try:
+            r = subprocess.run(
+                [sys.executable, "-P", "-c", BATCH, ctx.apiurl, *todo],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                cwd="/",
+                timeout=ctx.deadline - time.monotonic(),
+            )
+            got = json.loads(r.stdout) if r.returncode == 0 else None
+        except subprocess.TimeoutExpired:
+            why = f"the lookups of this call ran past {NET_BUDGET} s"
+        except (OSError, ValueError):
+            got = None
+        if got is None:  # a python3 without osc's library: one osc api each
+            got = osc_api_each(todo, ctx)
+    else:
+        why = f"the lookups of this call ran past {NET_BUDGET} s"
+    for p in todo:
+        code, text = got.get(p) or [0, why]
+        ctx.devel["get", ctx.apiurl, p] = (
+            (True, text)
+            if code == 200
+            else (True, None)
+            if code == 404
+            else (False, f"{p} ({text or code})")
+        )
+
+
+def osc_api_each(paths, ctx):
+    """obs_batch's answers through one osc api process per path, while the
+    call's budget lasts."""
+    import subprocess
+    import time
+
+    got = {}
+    for p in paths:
+        left = ctx.deadline - time.monotonic()
+        if left <= 0:
+            break
+        try:
+            r = subprocess.run(
+                ["osc", *(["-A", ctx.apiurl] if ctx.apiurl else []), "api", p],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=left,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            got[p] = [0, type(e).__name__]
+            break
+        got[p] = (
+            [200, r.stdout]
+            if r.returncode == 0
+            else [404, ""]
+            if "HTTP Error 404" in r.stderr
+            else [0, f"osc exited {r.returncode}"]
+        )
+    return got
+
+
+def obs_user(ctx):
+    """The OBS account this session acts as: PR_GUARD_OBS_USER, else osc
+    whois, asked once per call and instance and kept in memory only (a file a
+    call can write could name someone else); "" when neither says."""
+    import subprocess
+    import time
+
+    if ctx.apiurl in ctx.users:
+        return ctx.users[ctx.apiurl]
+    user = os.environ.get("PR_GUARD_OBS_USER", "")
+    left = ctx.deadline - time.monotonic()
+    if not user and left > 0:
+        try:
+            r = subprocess.run(
+                ["osc", *(["-A", ctx.apiurl] if ctx.apiurl else []), "whois"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=left,
+            )
+            if r.returncode == 0:
+                user = r.stdout.split(":", 1)[0].strip()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    ctx.users[ctx.apiurl] = user
+    return user
+
+
+def xml_root(text):
+    import xml.etree.ElementTree as ET
+
+    try:
+        return ET.fromstring(text)
+    except ET.ParseError:
+        return None
+
+
+def holders(root, role):
+    """The persons (a maintainer) or persons and groups (a reviewer) that hold
+    role in a _meta."""
+    tags = ("person",) if role == "maintainer" else ("person", "group")
+    return {
+        e.get("userid") or e.get("groupid")
+        for e in root
+        if e.tag in tags and e.get("role") == role
+    } - {None}
+
+
+def maintains(prj, pkg, ctx):
+    """(True, "") when this account maintains prj/pkg, or the package names no
+    maintainer and the account maintains prj; else (False, why). A project
+    whose _meta has <scmsync> is judged by its project git (git_maintained())."""
+    user = obs_user(ctx)
+    if not user:
+        return False, "the account is unknown (osc whois failed)"
+    obs_batch([f"/source/{prj}/{pkg}/_meta", f"/source/{prj}/_meta"], ctx)
+    metas = []
+    for path in (f"/source/{prj}/{pkg}/_meta", f"/source/{prj}/_meta"):
+        ok, text = obs_get(path, ctx)
+        root = xml_root(text) if ok and text else None
+        if root is None:
+            return False, f"cannot read {text if not ok else path}"
+        metas.append(root)
+    git = project_git(metas[1], text)
+    if git:
+        return git_maintained(prj, pkg, git, ctx)
+    maints = holders(metas[0], "maintainer")
+    groups = {
+        e.get("groupid")
+        for e in metas[0]
+        if e.tag == "group" and e.get("role") == "maintainer"
+    } - {None}
+    if user in maints:
+        return True, ""
+    if groups:
+        return (
+            False,
+            f"{prj}/{pkg} is maintained by {', '.join(sorted(maints | groups))}",
+        )
+    if not maints and user in holders(metas[1], "maintainer"):
+        return True, ""
+    if not maints:
+        return (
+            False,
+            f"{prj}/{pkg} has no maintainer and {user} does not maintain {prj}",
+        )
+    return False, f"{prj}/{pkg} is maintained by {', '.join(sorted(maints))}"
+
+
+def eligible(prj, pkg, ctx):
+    """(True, "") when this account may move prj/pkg unattended, decided as
+    autoforward-gate.sh decides ELIGIBLE (the suite runs both on the same
+    fixtures); else (False, why). A project whose _meta has <scmsync> takes
+    its maintainers from its project git's _maintainership.json and adds the
+    Reviewers of its workflow.config."""
+    user = obs_user(ctx)
+    if not user:
+        return False, "the account is unknown (osc whois failed)"
+    obs_batch(
+        [
+            f"/source/{prj}/{pkg}/_meta",
+            f"/source/{prj}/_meta",
+            f"/source/openSUSE:Factory/{pkg}/_meta",
+        ],
+        ctx,
+    )
+    ok, text = obs_get(f"/source/{prj}/{pkg}/_meta", ctx)
+    if not ok or not text:
+        return False, f"cannot read {text if not ok else f'/source/{prj}/{pkg}/_meta'}"
+    meta = xml_root(text)
+    if prj != "openSUSE:Factory":
+        try:
+            devel = factory_devel(pkg, ctx)
+        except Blocked:
+            return False, f"cannot read openSUSE:Factory/{pkg}/_meta"
+        dpkg = ctx.devel.get(("develpkg", pkg)) or pkg
+        if devel and devel != prj:  # the devel package may be a _link to this one
+            ok, link = obs_get(f"/source/{devel}/{dpkg}/_link", ctx)
+            if not ok:
+                return False, f"cannot read {link}"
+            el = xml_root(link) if link else None
+            here = el is not None and el.get("project") == prj
+            if not here or (el.get("package") or dpkg) != pkg:
+                return False, f"openSUSE:Factory develops {pkg} in {devel}"
+    ok, text = obs_get(f"/source/{prj}/_meta", ctx)
+    if not ok or not text:
+        return False, f"cannot read {text if not ok else f'/source/{prj}/_meta'}"
+    pmeta = xml_root(text)
+    if meta is None or pmeta is None:
+        return False, f"{prj}/{pkg}'s or {prj}'s _meta did not parse"
+    revs = holders(meta, "reviewer") | holders(pmeta, "reviewer")
+    # A project kept in git: its OBS _meta are stubs, its roles are in the project git.
+    git = project_git(pmeta, text)
+    if git and not git[0]:
+        return False, f"{prj} is kept in {git[1]}, whose {git[2]} this cannot read"
+    if git:
+        ok, more = git_reviewers(git[0], git[1], ctx, git[2])
+        if not ok:
+            return False, more
+        revs |= more
+    if revs:
+        return False, f"a reviewer role is set ({', '.join(sorted(revs))})"
+    if git:
+        return git_maintained(prj, pkg, git, ctx)
+    maints = holders(meta, "maintainer")
+    if user in maints or not maints and user in holders(pmeta, "maintainer"):
+        return True, ""
+    if not maints:
+        return (
+            False,
+            f"{prj}/{pkg} has no maintainer and {user} does not maintain {prj}",
+        )
+    return False, f"{prj}/{pkg} is maintained by {', '.join(sorted(maints))}"
+
+
+# osc 1.27.3's own options (osc.commandline's parser) of the commands the asks
+# read: request, also spelled rq and review, and comment.
+OSC_OPTS_ASK = {
+    "request": (
+        "SmtsDUGPp",
+        "superseded-request message type state days user group project package "
+        "exclude-target-project target-package-filter; diff unified no-devel all "
+        "force brief mine bugowner edit interactive or-revoke non-interactive "
+        "keep-packages-locked incoming involved-projects source-buildstatus",
+    ),
+    "comment": ("cp", "comment parent;"),
+}
+
+
+def osc_runs(run, ctx, cwd):
+    """The osc argv once per spelling of its subcommand, as the call holds it
+    in a variable; [None] when only the shell knows it."""
+    sub = osc_sub(run)[0]
+    if not sub or not VARIABLE.search(sub):
+        return [run]
+    vals = substitute(sub, ctx, cwd)
+    if not vals:
+        return [None]
+    i = len(run) - 1 - len(osc_sub(run)[1])
+    return [[*run[:i], v, *run[i + 1 :]] for v in vals]
+
+
+def osc_apiurl(run, ctx, cwd):
+    """The instance an osc argv names with -A/--apiurl (osc takes it before or
+    after the subcommand), as the call sets it; "" for osc's default."""
+    _, names = long_names(OSC_GLOBAL)
+    got, i = "", 1
+    while i < len(run):
+        a, i = run[i], i + 1
+        k, eq, v = long_prefix(a, names).partition("=")
+        if k in ("-A", "--apiurl"):
+            v, i = (v, i) if eq else (run[i] if i < len(run) else "", i + 1)
+        elif a[:2] == "-A" and len(a) > 2:
+            v = a[2:]
+        else:
+            continue
+        got = (spellings(v, ctx, cwd, False) or [v])[0]
+    return got
+
+
+def obs_prefetch(run, ctx, cwd):
+    """Fetch, in one process, the GETs the submit rules below make for this
+    osc command: the source's listings and _meta, its project's, Factory's
+    _meta and the target's listing."""
+    sub, args = osc_sub(run)
+    revs = [
+        v
+        for k, v in parse_opts(args, "mFrsaA", REQUEST_VALUED)[0]
+        if k in ("-r", "--revision")
+    ]
+    query = "?expand=1" + (f"&rev={revs[-1]}" if revs else "")
+    paths = []
+    for words in submit_operands(run):
+        dsts = spellings(words[2], ctx, cwd) if len(words) >= 3 else []
+        for src, pkg in sources(words, ctx, cwd):
+            if not src or not pkg or not PKG_NAME.fullmatch(pkg):
+                continue
+            paths += [f"/source/{src}/{pkg}", f"/source/{src}/{pkg}{query}"]
+            paths += [f"/source/{src}/{pkg}/_meta", f"/source/{src}/_meta"]
+            paths += [f"/source/openSUSE:Factory/{pkg}/_meta"]
+            paths += [
+                f"/source/{d}/{words[3] if len(words) > 3 else pkg}" for d in dsts if d
+            ]
+    obs_batch(paths[:256], ctx)
+
+
+def accept_forward(run, ctx, cwd):
+    """An accept, approve or decline of a request (osc request, rq or review,
+    or the API's changestate), or a forward of a devel package to Factory,
+    that autoforward-gate.sh would not call ELIGIBLE: a reviewer set, a
+    package someone else (or a group) maintains. Who filed the request does not
+    matter here; the skill still wants the user's go for someone else's request
+    (core directive 10), and the guard leaves that go to the agent. A decline
+    is always the user's call."""
+    for one in osc_runs(run, ctx, cwd):
+        if one is None:
+            ask(
+                ctx,
+                "accept-forward",
+                f"cannot tell which osc command {shown(osc_sub(run)[0])} is",
+            )
+            continue
+        sub, args = osc_sub(one)
+        if sub in ("rq", "request", "review"):
+            request_verbs(sub, args, ctx, cwd)
+        elif sub == "api":
+            api_changestate(args, ctx, cwd)
+        else:
+            forwards(one, ctx, cwd)
+
+
+def request_verbs(sub, args, ctx, cwd):
+    """accept_forward's rules on osc request: accept and approve per request,
+    decline and approvenew always."""
+    pos = osc_args("request", args, OSC_OPTS_ASK)[1]
+    verbs = spellings(pos[0], ctx, cwd, False) if pos else []
+    if pos and not verbs:
+        ask(ctx, "accept-forward", f"cannot tell what osc {sub} {shown(pos[0])} does")
+    ids = [r for w in pos[1:] for r in spellings(w, ctx, cwd, False) or [""]]
+    for verb in verbs:
+        if verb == "decline":
+            ask(
+                ctx,
+                "accept-forward",
+                f"osc {sub} decline: a decline is the user's call",
+            )
+        elif verb == "approvenew":
+            ask(
+                ctx,
+                "accept-forward",
+                f"osc {sub} approvenew: it approves every new request there",
+            )
+        elif verb in ("accept", "approve"):
+            obs_batch([f"/request/{r}" for r in ids if r.isdigit()], ctx)
+            for rid in ids or [""]:  # a word that is no id asks
+                accept_one(rid, ctx)
+
+
+def api_changestate(args, ctx, cwd):
+    """An osc api POST that accepts or declines a request:
+    /request/N?cmd=changestate|changereviewstate&newstate=accepted|declined."""
+    opts, pos = osc_args("api", args)
+    keys = {k for k, _ in opts}
+    method = ([v for k, v in opts if k in ("-X", "-m", "--method")] or [""])[-1]
+    method = method or (
+        "POST" if keys & {"-d", "--data", "-T", "-f", "--file"} else "GET"
+    )
+    if method.upper() != "POST":
+        return
+    for url in (u for a in pos for u in substitute(a, ctx, cwd) or [a]):
+        m = re.search(r"/request/([^/?#]+)/*\?([^#]*)", url)
+        if not m:
+            continue
+        q = urllib.parse.parse_qs(m.group(2))
+        if "approve" in q.get("cmd", []):  # staged, then accepted by OBS
+            accept_one(m.group(1), ctx)
+        if not set(q.get("cmd", [])) & {"changestate", "changereviewstate"}:
+            continue
+        states = set(q.get("newstate", []))
+        if "declined" in states:
+            ask(
+                ctx,
+                "accept-forward",
+                "a decline through osc api: a decline is the user's call",
+            )
+        if "accepted" in states:
+            accept_one(m.group(1), ctx)
+
+
+def forwards(run, ctx, cwd):
+    """accept_forward's rules on a submit to Factory from outside home:."""
+    sub = osc_sub(run)[0]
+    for words in submit_operands(run):
+        to = [d for d in spellings(words[2], ctx, cwd)] if len(words) >= 3 else [None]
+        if 0 < len(words) < 3:
+            to = spellings(words[0], ctx, cwd)
+        if to and all(d not in (None, "openSUSE:Factory") for d in to):
+            continue  # osc picks the target of a bare osc sr itself: maybe Factory
+        for src, pkg in sources(words, ctx, cwd):
+            if src and src.startswith("home:"):  # a branch, not a forward
+                continue
+            if not src or not pkg or not PKG_NAME.fullmatch(pkg):
+                ask(ctx, "accept-forward", f"cannot tell what osc {sub} forwards")
+                continue
+            ok, why = eligible(src, pkg, ctx)
+            if not ok:
+                ask(ctx, "accept-forward", f"osc {sub} {src}/{pkg} to Factory: {why}")
+
+
+def sources(words, ctx, cwd):
+    """The (project, package) pairs one submit's operands send, each spelling
+    the call sets; the checkout's when it names none (None when unknown)."""
+    if len(words) < 3:
+        return [(checkout_package(ctx, cwd, "_project"), checkout_package(ctx, cwd))]
+    srcs = spellings(words[0], ctx, cwd) or [None]
+    pkgs = spellings(words[1], ctx, cwd, False) or [None]
+    return [(s, p) for s in srcs for p in pkgs]
+
+
+def accept_one(rid, ctx):
+    """accept_forward's rules on one request id."""
+    if not rid.isdigit():
+        ask(ctx, "accept-forward", "cannot tell which request osc request accept takes")
+        return
+    ok, text = obs_get(f"/request/{rid}", ctx)
+    req = xml_root(text) if ok and text else None
+    if req is None:
+        ask(ctx, "accept-forward", f"cannot read request {rid}")
+        return
+    if req.tag != "request" or not req.findall("action"):
+        ask(ctx, "accept-forward", f"request {rid} has no action")
+        return
+    for a in req.findall("action"):
+        src, dst = a.find("source"), a.find("target")
+        if a.get("type") != "submit" or dst is None or not dst.get("project"):
+            ask(ctx, "accept-forward", f"request {rid} is no plain submit")
+            continue
+        pkg = dst.get("package") or (src.get("package") if src is not None else None)
+        ok, why = (
+            maintains(dst.get("project"), pkg, ctx) if pkg else (False, "no package")
+        )
+        if ok:
+            ok, why = eligible(dst.get("project"), pkg, ctx)
+        if not ok:
+            ask(ctx, "accept-forward", f"accepting request {rid}: {why}")
+
+
+# Where comments and reviews are posted: OBS's /comments/..., Gitea's
+# .../comments and .../reviews.
+COMMENT_API = Rx(r"/(?:comments?|reviews)(?=[/?#\s\"']|$)")
+
+
+# The OBS comments endpoint of one request.
+REQUEST_COMMENT = Rx(r"^/*comments/request/(\d+)/*(?:[?#]|$)")
+
+
+def maintained_requests(ids, ctx):
+    """Why a comment on these requests needs the user's go; empty when each id
+    names a request this account filed (a reply to its reviewers), or one
+    whose every action targets a package it maintains (maintains())."""
+    if not ids or not all(r.isdigit() for r in ids):
+        return "cannot tell which request it comments on"
+    obs_batch([f"/request/{r}" for r in ids], ctx)
+    for rid in ids:
+        ok, text = obs_get(f"/request/{rid}", ctx)
+        req = xml_root(text) if ok and text else None
+        if req is None or req.tag != "request":
+            return f"cannot read request {rid}"
+        actions = req.findall("action")
+        if not actions:
+            return f"request {rid} has no action"
+        user = obs_user(ctx)
+        if user and req.get("creator") == user:
+            continue
+        for a in actions:
+            src, dst = a.find("source"), a.find("target")
+            prj = dst.get("project") if dst is not None else None
+            pkg = (dst.get("package") if dst is not None else None) or (
+                src.get("package") if src is not None else None
+            )
+            if not prj or not pkg:
+                return f"request {rid} names no target package"
+            ok, why = maintains(prj, pkg, ctx)
+            if not ok:
+                return f"request {rid}: {why}"
+    return ""
+
+
+# A src.opensuse.org repository named literally, owner/name.
+OWNER_REPO = Rx(r"([A-Za-z0-9][\w.-]*)/([A-Za-z0-9_][\w.+-]*)")
+# The API endpoint that posts a comment on one issue or PR.
+ISSUE_COMMENT = Rx(
+    r"/*repos/([A-Za-z0-9][\w.-]*)/([A-Za-z0-9_][\w.+-]*)/issues/(\d+)/comments/*"
+)
+# The options a judged tea comment may carry, and those a tea api POST adds;
+# any other option asks, since it can change where the comment goes.
+TEA_COMMENT_OPTS = {"repo": "repo", "r": "repo", "login": "login", "l": "login"}
+TEA_API_OPTS = {"X": "method", "method": "method", "f": "field", "field": "field"}
+TEA_API_OPTS |= {"F": "field", "Field": "field", "d": "data", "data": "data"}
+
+
+def gitea_get(path, ctx, raw=False):
+    """(True, data) for an anonymous src.opensuse.org API GET of path (raw: its
+    text, not parsed as JSON), (True, None) for a 404, (False, what failed)
+    otherwise. Offline, PR_GUARD_GITEA_DIR/<path, with / as _> answers ("@ERR"
+    fails)."""
+    import json
+    import time
+    import urllib.error
+    import urllib.request
+
+    key = ("gitea", path, raw)
+    if key in ctx.devel:
+        return ctx.devel[key]
+    stub = os.environ.get("PR_GUARD_GITEA_DIR")
+    try:
+        if stub:
+            f = os.path.join(stub, path.replace("/", "_"))
+            text = open(f, encoding="utf-8").read() if os.path.exists(f) else None
+            if text is not None and text.strip() == "@ERR":
+                raise OSError("failed")
+        else:
+            left = ctx.deadline - time.monotonic()
+            if left <= 0:
+                raise OSError(f"the lookups of this call ran past {NET_BUDGET} s")
+            try:
+                with urllib.request.urlopen(
+                    f"{GITEA}/{path}", timeout=min(15, left)
+                ) as r:
+                    text = r.read().decode("utf-8")
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    raise
+                text = None
+        got = (True, text if raw or text is None else json.loads(text))
+    except Exception as e:  # any failure asks
+        got = (False, f"{path} ({type(e).__name__}: {e})")
+    ctx.devel[key] = got
+    return got
+
+
+def tea_item(owner, repo, n, ctx):
+    """Why a comment on src.opensuse.org issue or PR owner/repo#n needs the
+    user's go; empty when this account opened it, or maintains the repository:
+    in its project's _maintainership.json, or for pool in Factory's devel
+    project of the package (maintains())."""
+    user = obs_user(ctx)
+    if not user:
+        return "the account is unknown (osc whois failed)"
+    ok, item = gitea_get(f"repos/{owner}/{repo}/issues/{n}", ctx)
+    if not ok:
+        return f"cannot read {item}"
+    if not isinstance(item, dict):
+        return f"{owner}/{repo}#{n} does not exist"
+    # Gitea matches owner and name in any case: judge the canonical ones.
+    full = (item.get("repository") or {}).get("full_name") or ""
+    if full.lower() != f"{owner}/{repo}".lower() or not OWNER_REPO.fullmatch(full):
+        return f"cannot tell which repository {owner}/{repo}#{n} is in"
+    owner, repo = full.split("/")
+    poster = item.get("user")
+    if isinstance(poster, dict) and poster.get("login") == user:
+        return ""
+    if owner == "pool":
+        ok, text = obs_get(f"/source/openSUSE:Factory/{repo}/_meta", ctx)
+        root = xml_root(text) if ok and text else None
+        dev = root.find("devel") if root is not None else None
+        if dev is None or not dev.get("project"):
+            return f"pool/{repo} has no Factory devel project to read"
+        ok, why = maintains(dev.get("project"), dev.get("package") or repo, ctx)
+        return "" if ok else f"pool/{repo}: {why}"
+    ok, maints = git_maintainers(owner, "_ObsPrj", repo, ctx)
+    if not ok:
+        return maints
+    if user in maints:
+        return ""
+    return f"{owner}/{repo} is maintained by {', '.join(sorted(maints)) or 'nobody'}"
+
+
+# A login or reviewer as the project git may name one ("@" a group): nothing
+# that could split a list or a line.
+GIT_LOGIN = Rx(r"@?[A-Za-z0-9][A-Za-z0-9_.-]*")
+GIT_NAME = Rx(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+# The branch or commit a <scmsync> #fragment names.
+GIT_REF = Rx(r"(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
+def git_maintainers(owner, prjgit, pkg, ctx, ref=""):
+    """(True, maintainers) of pkg in src.opensuse.org's owner/prjgit
+    _maintainership.json at ref (its default branch when ""), the project git
+    autogits reads: the package's list, else the project's (""); (False, why)
+    when it cannot be read, or an entry is no list of plain logins. Only the
+    legacy form ({name: [login, ...]}) is read."""
+    q = f"?ref={ref}" if ref else ""
+    ok, m = gitea_get(f"repos/{owner}/{prjgit}/raw/_maintainership.json{q}", ctx)
+    if not ok:
+        return False, f"cannot read {m}"
+    if not isinstance(m, dict):
+        return False, f"{owner} has no _maintainership.json"
+    lists = [m.get(k, []) for k in (pkg, "")]
+    if not all(
+        isinstance(v, list)
+        and all(isinstance(x, str) and GIT_LOGIN.fullmatch(x) for x in v)
+        for v in lists
+    ):
+        return False, f"{owner}'s _maintainership.json did not parse"
+    return True, set(lists[0] or lists[1])
+
+
+def git_maintained(prj, pkg, git, ctx):
+    """maintains() of prj/pkg for a project kept in the project git git
+    (project_git()): (True, "") when its _maintainership.json lists this
+    account (git_maintainers()); else (False, why)."""
+    if not git[0]:
+        return False, f"{prj} is kept in {git[1]}, whose {git[2]} this cannot read"
+    ok, maints = git_maintainers(git[0], git[1], pkg, ctx, git[2])
+    if not ok:
+        return False, maints
+    if obs_user(ctx) in maints:
+        return True, ""
+    who = ", ".join(sorted(maints)) or "nobody"
+    at = f"#{git[2]}" if git[2] else ""
+    return False, f"{prj}/{pkg} is maintained by {who} ({git[0]}/{git[1]}{at})"
+
+
+def jwcc(text):
+    """JSON with comments and trailing commas, parsed as autogits parses
+    workflow.config (hujson.Standardize); ValueError when it does not parse."""
+
+    def strip(code):
+        return re.sub(r",(\s*[\]}])", r"\1", "".join(code))
+
+    out, code, i = [], [], 0
+    while i < len(text):
+        if text[i] == '"':
+            j = i + 1
+            while j < len(text) and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out += [strip(code), text[i : j + 1]]
+            code, i = [], j + 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = len(text) if j < 0 else j
+        elif text.startswith("/*", i):
+            i = text.index("*/", i + 2) + 2
+        else:
+            code.append(text[i])
+            i += 1
+    return json.loads("".join(out) + strip(code))
+
+
+def git_reviewers(owner, prjgit, ctx, ref=""):
+    """(True, reviewers) that owner/prjgit's workflow.config at ref makes
+    autogits request on every pull request: its Reviewers, a list or an object
+    of names, each without its +-*~ prefix (none without the file or the key);
+    (False, why) when it cannot be read, or Reviewers is anything else."""
+    q = f"?ref={ref}" if ref else ""
+    ok, text = gitea_get(
+        f"repos/{owner}/{prjgit}/raw/workflow.config{q}", ctx, raw=True
+    )
+    if not ok:
+        return False, f"cannot read {text}"
+    try:
+        conf = jwcc(text) if text is not None else {}
+    except ValueError:
+        return False, f"{owner}/{prjgit}'s workflow.config did not parse"
+    revs = conf.get("Reviewers", []) if isinstance(conf, dict) else None
+    if not isinstance(revs, (list, dict)) or not all(
+        isinstance(r, str) and GIT_NAME.fullmatch(r.lstrip("+-*~")) for r in revs
+    ):
+        return False, f"{owner}/{prjgit}'s workflow.config did not parse"
+    return True, {r.lstrip("+-*~") for r in revs}
+
+
+# A project kept in git: its _meta's <scmsync> names the project git, and the
+# branch or commit autogits syncs (#fragment).
+PROJECT_GIT = Rx(
+    r"https://src\.opensuse\.org/([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9_][A-Za-z0-9_.+-]*?)"
+    r"(?:\.git)?(?:\?[^#\s]*)?(?:#([^#\s]*))?"
+)
+
+
+def project_git(pmeta, text):
+    """(owner, repo, ref) of the src.opensuse.org project git a project
+    _meta's <scmsync> names (ref "" without a fragment), None for a project
+    OBS keeps, ("", url, what) for one this cannot read: kept elsewhere, a
+    ref that is no plain branch or commit, or a <scmsync> autoforward-gate.sh
+    cannot read for certain in the _meta's text: not plain text (a CDATA
+    section, a comment), or not alone (a second one, a comment that could
+    hold one)."""
+    import html
+
+    el = pmeta.find("scmsync")
+    url = (el.text or "").strip() if el is not None else ""
+    plain = re.findall(r"<scmsync>([^<]*)</scmsync>", text)
+    if "<scmsync" in text and (
+        not url
+        or text.count("<scmsync") != 1
+        or "<!--" in text
+        or "<![CDATA[" in text
+        or not plain
+        or html.unescape(plain[-1]).strip() != url
+    ):
+        return "", "a <scmsync> that is not plain text or not alone", "maintainers"
+    if not url:
+        return None
+    m = PROJECT_GIT.fullmatch(url)
+    if not m:
+        return "", url, "maintainers"
+    owner, repo, ref = m.group(1), m.group(2), m.group(3) or ""
+    if ref and not GIT_REF.fullmatch(ref):
+        return "", url, "ref"
+    return owner, repo, ref
+
+
+def lone_tea(text):
+    """Whether a shell call is one bare tea command and nothing else: no
+    other command, wrapper, redirect or substitution that could make the
+    path a --repo names, or move the directory tea resolves it in."""
+    import shlex
+
+    # Without $, \ and `, bash and shlex split the same quotes and words
+    # ($'\'' and "\"" are where they part).
+    if not isinstance(text, str) or "\n" in text.strip() or set("$\\`") & set(text):
+        return False
+    # Outside quotes only plain characters: no brace, glob, tilde or history
+    # expansion can add a word the guard did not judge.
+    quote = None
+    for c in text.strip():
+        if quote:
+            quote = None if c == quote else quote
+        elif c in "'\"":
+            quote = c
+        elif not (c.isascii() and (c.isalnum() or c in " _./:=@%+,-")):
+            return False
+    if quote:
+        return False
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        lex.commenters = ""  # bash reads a # inside a word as text
+        words = list(lex)
+    except ValueError:
+        return False
+    return words[:1] == ["tea"] and not any(
+        w and set(w) <= set("();<>|&") for w in words
+    )
+
+
+def tea_comment(args, ctx, cwd, api=False):
+    """Why a tea comment, or a tea api POST to an issue's comments, needs the
+    user's go; empty when the item passes tea_item(). Only the plain form is
+    judged -- --login src.opensuse.org and a --repo owner/name that is no local
+    path (tea reads one as a checkout), or the API's literal endpoint -- since
+    tea's own remote and login choice is not the guard's to replay. The call
+    must be the tea command alone (lone_tea())."""
+
+    def one(w):
+        vals = spellings(w, ctx, cwd, False)
+        return vals[0] if len(vals) == 1 else None
+
+    names = TEA_COMMENT_OPTS | (TEA_API_OPTS if api else {})
+    opts, pos, i, done = {}, [], 0, False
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if done or a[:1] != "-" or a == "-":
+            pos.append(a)
+            continue
+        if a == "--":
+            done = True
+            continue
+        k, eq, v = (a[2:] if a[:2] == "--" else a[1:]).partition("=")
+        key = names.get(k)
+        if key is None:
+            return f"tea's option {shown(a)} is not judged"
+        if not eq:
+            v, i = (args[i] if i < len(args) else ""), i + 1
+        if key in opts and key != "field" and key != "data":
+            return f"{shown(a)} is given twice"
+        opts[key] = one(v)
+    if opts.get("login") != "src.opensuse.org":
+        return "it names no --login src.opensuse.org"
+    if not lone_tea(ctx.command):
+        return "it is not one literal tea command alone"
+    if api:
+        if opts.get("method", "POST").upper() != "POST":
+            return f"tea api {opts.get('method')}"
+        m = ISSUE_COMMENT.fullmatch((one(pos[1]) or "") if len(pos) == 2 else "")
+        if not m:
+            return "a write to comments or reviews"
+        return tea_item(m.group(1), m.group(2), m.group(3), ctx)
+    n = one(pos[1]) if len(pos) > 1 else None
+    if not n or not n.isdigit():
+        return "cannot tell which issue or PR it comments on"
+    m = OWNER_REPO.fullmatch(opts.get("repo") or "")
+    if not m:
+        return "it names no --repo owner/name"
+    here = cwd.dirs if isinstance(cwd, Dirs) else [cwd]
+    if not all(isinstance(d, str) and d for d in here) or any(
+        os.path.lexists(os.path.join(d, m.group(0))) for d in here
+    ):
+        return f"--repo {m.group(0)} may be a local checkout"
+    return tea_item(m.group(1), m.group(2), n, ctx)
+
+
+def comment_rules(name, run, ctx, cwd):
+    """A command that posts a comment or a review on OBS or src.opensuse.org:
+    osc comment create, tea comment, git-obs pr comment|review, a close with a
+    comment (git-obs -m), and an API write to comments or reviews. gh is not
+    judged: GitHub is outside the packaging forges, as for merges."""
+    args = run[1:]
+    if name == "osc":
+        for one in osc_runs(run, ctx, cwd):
+            if one is None:
+                ask(
+                    ctx,
+                    "comment",
+                    f"cannot tell which osc command {shown(osc_sub(run)[0])} is",
+                )
+                continue
+            sub, rest = osc_sub(one)
+            if sub == "comment":
+                pos = osc_args("comment", rest, OSC_OPTS_ASK)[1]
+                words = [w for p in pos for w in p.strip("/").split("/")]
+                verbs = spellings(words[0], ctx, cwd, False) if words else []
+                if words and not verbs:
+                    ask(
+                        ctx,
+                        "comment",
+                        f"cannot tell what osc comment {shown(words[0])} does",
+                    )
+                for v in verbs:
+                    if v == "create" and words[1:2] == ["request"]:
+                        ids = [
+                            r
+                            for w in words[2:]
+                            for r in spellings(w, ctx, cwd, False) or [""]
+                        ]
+                        why = maintained_requests(ids, ctx)
+                        if why:
+                            ask(ctx, "comment", f"osc comment create: {why}")
+                    elif v in ("create", "delete"):
+                        ask(ctx, "comment", f"osc comment {v}")
+            elif sub == "api":
+                opts, pos = osc_args("api", rest)
+                keys = {k for k, _ in opts}
+                method = (
+                    [v for k, v in opts if k in ("-X", "-m", "--method")] or [""]
+                )[-1]
+                method = method or (
+                    "POST" if keys & {"-d", "--data", "-T", "-f", "--file"} else "GET"
+                )
+                urls = [u for a in pos for u in substitute(a, ctx, cwd) or [a]]
+                if method.upper() not in ("GET", "HEAD") and any(
+                    COMMENT_API.search(u) for u in urls
+                ):
+                    on = [REQUEST_COMMENT.search(u) for u in urls]
+                    mine = all(on) and not maintained_requests(
+                        [m.group(1) for m in on], ctx
+                    )
+                    if not mine:
+                        ask(
+                            ctx,
+                            "comment",
+                            f"osc api {method} {shown(pos[0]) if pos else ''}",
+                        )
+        return
+    if name == "tea":
+        words = tea_words(args)
+        if words[:1] in (["comment"], ["comments"], ["c"]) and words[1:2] not in (
+            ["list"],
+            ["ls"],
+        ):
+            why = tea_comment(args, ctx, cwd)
+            if why:
+                # No subcommand and no body: tea still adds one, but a read was meant.
+                verb = words[1:2] in (
+                    [w] for w in ("add", "a", "edit", "e", "delete", "rm")
+                )
+                body = any(a.split("=")[0] in ("-d", "--description") for a in args)
+                hint = "" if verb or body or len(words) > 2 else COMMENT_READ
+                ask(ctx, "comment", f"tea {words[0]}: {why}", hint)
+        if words[:1] in (["pr"], ["pulls"], ["pull"]) and words[1:2] in (
+            [w] for w in ("review", "approve", "lgtm", "a", "reject", "reply")
+        ):
+            ask(ctx, "comment", f"tea {words[0]} {words[1]}")
+        api, reads = words[:1] == ["api"], only_reads("tea", args)
+    elif name == "git-obs":
+        rest = git_obs_rest(args)
+        words = [a for a in rest if a[:1] != "-"]
+        if (
+            words[:2] == ["pr", "comment"]
+            or words[:2] == ["pr", "review"]
+            and words[2:3] in (["approve"], ["decline"], ["interactive"])
+        ):
+            ask(ctx, "comment", "git-obs " + " ".join(words[:3]))
+        if words[:2] in (["pr", "close"], ["pr", "reopen"]) and any(
+            long_prefix(a, ("--message",)).split("=")[0] in ("-m", "--message")
+            or a[:2] == "-m"
+            for a in rest
+        ):
+            ask(ctx, "comment", f"git-obs pr {words[1]} with a comment")
+        api, reads = words[:1] == ["api"], git_obs_reads(args)
+    if api and not reads:
+        text = " ".join([*args, *expansions(args, ctx, cwd)])
+        if COMMENT_API.search(text):
+            why = (
+                tea_comment(args, ctx, cwd, api=True)
+                if name == "tea"
+                else "a write to comments or reviews"
+            )
+            if why:
+                ask(ctx, "comment", f"{name} api: {why}")
+
+
+# What a call may run beside an osc commit or a submit the gate stamp lets
+# through: commands that only read, osc and git subcommands that only read.
+READERS = {
+    "cd",
+    "pushd",
+    "popd",
+    "echo",
+    "printf",
+    "true",
+    "false",
+    ":",
+    "test",
+    "[",
+    "[[",
+}
+READERS |= {"ls", "pwd", "cat", "grep", "egrep", "fgrep", "head", "tail", "wc", "stat"}
+READERS |= {
+    "date",
+    "cut",
+    "tr",
+    "jq",
+    "basename",
+    "dirname",
+    "realpath",
+}
+READERS |= {"readlink", "command", "type", "which", "set", "export", "local"}
+READERS |= {"trap", "wait"}
+READERS |= {"for", "in", "do", "done", "if", "then", "else", "elif", "fi", "while"}
+READERS |= {"until", "case", "esac", "select", "function", "time", "{", "}", "!"}
+OSC_READS = {
+    "status",
+    "st",
+    "diff",
+    "di",
+    "ldiff",
+    "linkdiff",
+    "rdiff",
+    "pdiff",
+    "results",
+}
+OSC_READS |= {"r", "prjresults", "pr", "log", "cat", "less", "ls", "list", "ll", "info"}
+OSC_READS |= {"buildlog", "bl", "blt", "buildlogtail", "remotebuildlog", "rbl", "rblt"}
+OSC_READS |= {
+    "buildhistory",
+    "buildhist",
+    "jobhistory",
+    "jobhist",
+    "search",
+    "se",
+    "bse",
+}
+OSC_READS |= {"whois", "user", "who", "maintainer", "bugowner", "develproject", "dp"}
+OSC_READS |= SUBMITS | {"creq", "createrequest", "version", "help"}
+GIT_READS = {
+    "status",
+    "log",
+    "diff",
+    "show",
+    "rev-parse",
+    "ls-files",
+    "describe",
+    "blame",
+}
+
+
+def note_writer(name, run, ctx, cwd):
+    """Remember a command of this call that can write (judge() turns a
+    stamped commit or submit in such a call into an ask). osc commit is its
+    own kind: other commits do not change a checkout, but do change a source."""
+    what = name
+    if name == "osc":
+        sub, args = osc_sub(run)
+        sub = OSC_ALIAS.get(sub, sub)
+        if sub in OSC_READS:
+            return
+        if sub in ("rq", "request", "review"):
+            verb = (osc_args("request", args, OSC_OPTS_ASK)[1] or [""])[0]
+            if verb in ("list", "ls", "show", "log"):
+                return
+        if sub == "comment" or sub == "api" and comment_or_get(args):
+            return
+        what = "osc commit" if sub == "commit" else f"osc {sub}"
+    elif name == "git":
+        i = 1
+        while i < len(run) and run[i][:1] == "-":
+            i += 2 if run[i] in ("-C", "-c", "--git-dir", "--work-tree") else 1
+        sub = run[i] if i < len(run) else ""
+        if sub in GIT_READS:
+            return
+        what = f"git {sub}".strip()
+    elif name == "sort":  # writes only with -o
+        if not any(
+            a == "-o" or a.startswith("--o") or a[:1] == "-" != a[1:2] and "o" in a
+            for a in run[1:]
+        ):
+            return
+    elif name == "uniq":  # writes only to a second operand
+        valued = ("--skip-fields", "--skip-chars", "--check-chars")
+        if len(parse_opts(run[1:], "fsw", valued)[1]) < 2:
+            return
+    elif name in ("mkdir", "cp", "mv", "install", "rm", "tar"):
+        raws = write_targets(name, run[1:])
+        targets = None if raws is None else [target_path(a, cwd) for a in raws]
+        note_write(
+            ctx, what, None if targets is None or None in targets else tuple(targets)
+        )
+        return
+    elif name == "tee":  # writes the files it names
+        files = [a for a in run[1:] if a[:1] != "-"]
+        if not files:
+            return
+        targets = [target_path(a, cwd) for a in files]
+        note_write(ctx, what, None if None in targets else tuple(targets))
+        return
+    elif name in READERS:
+        return
+    note_write(ctx, what)
+
+
+def write_targets(name, args):
+    """The paths mkdir, cp, mv, install, rm or tar writes, as written; None when
+    only the shell can tell (no operand to read, a tar mode it does not know)."""
+    if name == "mkdir":
+        return parse_opts(args, "m", ("--mode",))[1]
+    if name == "rm":
+        return parse_opts(args, "")[1]
+    if name in COPY_VALUED:
+        opts, pos = parse_opts(args, COPY_VALUED[name], COPY_LONG)
+        flags = dict(opts)
+        into = flags.get("-t", flags.get("--target-directory"))
+        if name == "install" and ("-d" in flags or "--directory" in flags):
+            return pos
+        if into is not None:
+            return [into] + (pos if name == "mv" else [])
+        if len(pos) < 2:
+            return None
+        return pos if name == "mv" else pos[-1:]  # mv also takes its sources away
+    # tar: an archive it creates or appends to, or the directory it unpacks into
+    modes = {"--extract": "x", "--get": "x", "--create": "c", "--append": "r"}
+    modes.update({"--update": "u", "--list": "t"})
+    mode, archive, into, i = None, None, None, 0
+    while i < len(args):
+        a, i = args[i], i + 1
+        if a.startswith("--"):
+            k, eq, v = a.partition("=")
+            mode = modes.get(k, mode)
+            if k in ("--file", "--directory"):
+                if not eq:
+                    v, i = (args[i] if i < len(args) else None), i + 1
+                archive, into = (v, into) if k == "--file" else (archive, v)
+        elif a.startswith("-") or i == 1:  # -xzf FILE, or tar's old xzf FILE
+            letters = a.lstrip("-")
+            for j, c in enumerate(letters):
+                if c in "xcrut":
+                    mode = c
+                elif c in "fC":  # the rest of a dashed cluster, else the next word
+                    if a.startswith("-") and letters[j + 1 :]:
+                        v = letters[j + 1 :]
+                    else:
+                        v, i = (args[i] if i < len(args) else None), i + 1
+                    archive, into = (v, into) if c == "f" else (archive, v)
+                    break
+    if mode == "t":
+        return []
+    if mode == "x":
+        return [into or "."]
+    if mode in ("c", "r", "u"):
+        return [] if archive in ("-", None) else [archive]
+    return None
+
+
+def note_write(ctx, what, targets=None):
+    """One writer of the call: where it stands, what it is, the absolute
+    paths it writes (None: unknown), the loops around it, its pipeline."""
+    ctx.writers.append((ctx.seq, what, targets, tuple(ctx.loops), ctx.cur_pipe))
+
+
+def target_path(raw, cwd):
+    """The file a write to raw lands in, through symlinks, as the kernel
+    resolves it (a link's .. leaves its target, which normpath would not
+    see); None when only the shell can tell."""
+    p = os.path.expanduser(raw)
+    if (
+        re.search(r"[$`*?\[]", p)
+        or not os.path.isabs(p)
+        and (not cwd or isinstance(cwd, Dirs))
+    ):
+        return None
+    return os.path.realpath(os.path.join(cwd or "/", p))
+
+
+def within(path, d):
+    """Whether path lies in directory d, both resolved."""
+    a, b = os.path.realpath(path), os.path.realpath(d)
+    return a == b or a.startswith(b.rstrip("/") + "/")
+
+
+def comment_or_get(args):
+    """Whether osc api arguments only read (a GET) or only post a comment."""
+    opts, pos = osc_args("api", args)
+    method = ([v for k, v in opts if k in ("-X", "-m", "--method")] or ["GET"])[-1]
+    return method.upper() in ("GET", "HEAD") or all(COMMENT_API.search(p) for p in pos)
+
+
+GATE_STAMPS = os.path.join("~", ".local", "state", "opensuse-packaging", "gate", "obs")
+
+
+def stamp_of(prj, pkg):
+    """gate.sh's stamp for prj/pkg, or None."""
+    import json
+
+    path = os.path.join(os.path.expanduser(GATE_STAMPS), pkg, prj + ".json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return st if isinstance(st, dict) else None
+
+
+def checkout_files(d, want):
+    """Whether the files osc commits from checkout d are want ({name: md5}),
+    as gate.sh keys them: .osc/_files with _to_be_added and _to_be_deleted,
+    no _link or _service:*, each file's md5 (the names first, then the md5s,
+    stopping at the first that differs)."""
+    import hashlib
+    import xml.etree.ElementTree as ET
+
+    try:
+        names = {
+            e.get("name")
+            for e in ET.parse(os.path.join(d, ".osc", "_files"))
+            .getroot()
+            .findall("entry")
+        }
+    except (OSError, ET.ParseError):
+        return False
+    for extra, add in (("_to_be_added", True), ("_to_be_deleted", False)):
+        try:
+            with open(os.path.join(d, ".osc", extra), encoding="utf-8") as fh:
+                for n in fh.read().split():
+                    (names.add if add else names.discard)(n)
+        except OSError:
+            pass
+    names = {n for n in names if n and n != "_link" and not n.startswith("_service:")}
+    if not isinstance(want, dict) or names != set(want):
+        return False
+    for n in sorted(names):
+        h = hashlib.md5()
+        try:
+            with open(os.path.join(d, n), "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+        except OSError:
+            return False
+        if h.hexdigest() != want[n]:
+            return False
+    return True
+
+
+def gate_commit(run, ctx, cwd):
+    """An osc commit of a tree gate.sh did not judge GREEN: no stamp, files
+    changed since, or a whole project checkout. A stamped tree is let through
+    only by judge(), once the whole call holds no other writer."""
+    sub, args = osc_sub(run)
+    if OSC_ALIAS.get(sub, sub) != "commit":
+        return
+    pos = osc_args("commit", args)[1]
+    for raw in pos or ["."]:
+        for d in cwd.dirs if isinstance(cwd, Dirs) else [cwd]:
+            paths = locate(raw, ctx, d)[0]
+            if not paths:
+                ask(
+                    ctx,
+                    "gate-stamp",
+                    f"osc commit {shown(raw)}: which checkout is unknown",
+                )
+            for p in paths or ():
+                co = p if os.path.isdir(p) else os.path.dirname(p)
+                prj = checkout_package(ctx, co, "_project")
+                pkg = checkout_package(ctx, co)
+                if not prj or not pkg or "/" in prj + pkg or pkg[:1] == ".":
+                    what = f"the project checkout {prj}" if prj else co
+                    ask(ctx, "gate-stamp", f"osc commit of {what}: no package checkout")
+                    continue
+                what = f"osc commit of {prj}/{pkg}"
+                if os.path.exists(os.path.join(co, ".osc", "_scm")):
+                    block("scm-commit", what)
+                st = stamp_of(prj, pkg)
+                if (
+                    not st
+                    or st.get("verdict") != "GREEN"
+                    or not checkout_files(co, st.get("files"))
+                ):
+                    ask(ctx, "gate-stamp", f"{what}: no GREEN gate.sh run of this tree")
+                # either way, a write before it in this call is refused (gate_writers)
+                ctx.gate_pending.append(
+                    ("commit", what, co, ctx.seq, tuple(ctx.loops), ctx.cur_pipe)
+                )
+
+
+def gate_submit(run, ctx, cwd):
+    """A submit request whose source files match no tree gate.sh judged GREEN
+    with the change review's PASS recorded: one GET of the expanded listing.
+    A match is let through only by judge(), once the call holds no writer."""
+    import glob
+
+    sub, args = osc_sub(run)
+    revs = [
+        v
+        for k, v in parse_opts(args, "mFrsaA", REQUEST_VALUED)[0]
+        if k in ("-r", "--revision")
+    ]
+    query = "?expand=1" + (f"&rev={revs[-1]}" if revs else "")
+    for words in submit_operands(run):
+        # Factory takes no --no-entry stamp; a target osc picks itself may be Factory
+        dst = words[2] if len(words) >= 3 else words[0] if words else None
+        dsts = spellings(dst, ctx, cwd) if dst else []
+        factory = not dsts or any(d in (None, "openSUSE:Factory") for d in dsts)
+        for src, pkg in sources(words, ctx, cwd):
+            if not src or not pkg or not PKG_NAME.fullmatch(pkg):
+                ask(ctx, "gate-stamp", f"cannot tell what osc {sub} sends")
+                continue
+            ok, text = obs_get(f"/source/{src}/{pkg}{query}", ctx)
+            root = xml_root(text) if ok and text else None
+            if root is None:
+                ask(
+                    ctx,
+                    "gate-stamp",
+                    f"osc {sub}: cannot read the files of {src}/{pkg}",
+                )
+                continue
+            files = {
+                e.get("name"): e.get("md5")
+                for e in root.findall("entry")
+                if e.get("name") != "_link"
+                and not (e.get("name") or "").startswith("_service:")
+            }
+            stamps = os.path.join(
+                os.path.expanduser(GATE_STAMPS), glob.escape(pkg), "*.json"
+            )
+            paths = glob.glob(stamps)
+            if not any(reviewed(path, files, False, factory) for path in paths):
+                why = (
+                    "its gate.sh run waived the .changes entry (--no-entry), and "
+                    "openSUSE:Factory declines a request without a new one"
+                    if any(reviewed(path, files) for path in paths)
+                    else "no GREEN gate.sh run with a recorded review PASS has these files"
+                )
+                ask(ctx, "gate-stamp", f"osc {sub} of {src}/{pkg}: {why}")
+            elif not any(reviewed(path, files, True, factory) for path in paths):
+                ask(
+                    ctx,
+                    "build-evidence",
+                    f"osc {sub} of {src}/{pkg}: the reviewed tree has no GREEN build "
+                    "recorded",
+                )
+            elif not any(
+                reviewed(path, files, True, factory, dsts or [None]) for path in paths
+            ):
+                ask(
+                    ctx,
+                    "build-evidence",
+                    f"osc {sub} of {src}/{pkg}: its OBS build judged no repo of "
+                    f"{dst or 'the target'}",
+                )
+            else:
+                what = f"osc {sub} of {src}/{pkg}"
+                ctx.gate_pending.append(
+                    ("submit", what, None, ctx.seq, tuple(ctx.loops), ctx.cur_pipe)
+                )
+
+
+def in_checkout(path):
+    """Whether path lies in an osc checkout (a directory above it holds .osc)."""
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    while d:
+        if os.path.isdir(os.path.join(d, ".osc")):
+            return True
+        if os.path.dirname(d) == d:
+            return False
+        d = os.path.dirname(d)
+    return False
+
+
+def holds_checkout(path):
+    """Whether directory path holds an osc checkout one level down (a project
+    directory, or the parent of a package checkout)."""
+    try:
+        return any(
+            os.path.isdir(os.path.join(path, n, ".osc")) for n in os.listdir(path)
+        )
+    except OSError:
+        return False
+
+
+def gate_writers(ctx):
+    """judge()'s last step: a stamped commit after a write into its checkout or
+    to a directory holding it (before it, in a loop around both, beside it in
+    its pipeline or the background), and a submit after a write that can change
+    what OBS holds (a commit, a script, a write into or above any checkout; not
+    its own log), are refused:
+    a fault the agent fixes by splitting the call, not one for the user to
+    approve."""
+    for kind, what, co, seq, loops, pipe in ctx.gate_pending:
+
+        def counts(ws, wh, targets, wl, wp):
+            if kind == "commit":
+                return (
+                    wh != "osc commit"
+                    and (
+                        ws < seq
+                        or set(wl) & set(loops)
+                        or wp == pipe  # its pipeline runs beside it
+                        or seq in ctx.bg  # it runs in the background
+                        or ctx.any_bg  # something does: it may be the commit
+                    )
+                    and (
+                        targets is None
+                        or any(within(t, co) or within(co, t) for t in targets)
+                    )
+                )
+            return (
+                ws < seq or set(wl) & set(loops) or seq in ctx.bg or ctx.any_bg
+            ) and (
+                targets is None
+                or any(in_checkout(t) or holds_checkout(t) for t in targets)
+            )
+
+        w = sorted({w[1] for w in ctx.writers if counts(*w)})
+        if w:
+            more = ", ".join(w[:3]) + (", …" if len(w) > 3 else "")
+            block(
+                "gate-sequence",
+                f"{what}: this call also runs {more}, which can change the files first",
+            )
+
+
+PRODUCT = Rx(r"^(openSUSE:(Leap|Backports|Step)|SUSE:)")
+LEAP16 = Rx(r"^openSUSE:(Leap:16\.|Backports:SLE-16\.)")
+VERSION = Rx(r"\d+(\.\d+)+")
+SLE_SP = Rx(r"SLE-(\d+)-SP(\d+)")
+
+
+def covers(build, dst, target):
+    """Whether a GREEN build covers a request to dst: a local log, or an OBS
+    stamp from before gate.sh judged repos, covers any; an OBS build covers
+    Factory and the gate's target (its devel project) when a
+    Factory/Tumbleweed build of it succeeded, a Leap 16 target through a
+    green repo naming its version, any other target only through a green
+    repo --repos added (before gate.sh recorded those: any green non-Factory
+    repo) naming dst's version (SLE-15-SP7: 15_SP7, 15-SP7 or 15.7); a
+    product whose version it cannot read, never."""
+    if build.get("kind") != "obs" or not isinstance(build.get("repos"), list):
+        return True
+    target = (target or "").split("/")[0]
+    if (
+        dst is None
+        or dst == "openSUSE:Factory"
+        or dst.startswith("openSUSE:Factory:")
+        or (dst == target and not PRODUCT.search(dst))
+    ):
+        return build.get("factory") is True
+    others = build.get("others") if isinstance(build.get("others"), list) else []
+    added = build.get("added") if isinstance(build.get("added"), list) else others
+    sp, ver = SLE_SP.search(dst), VERSION.search(dst)
+    if sp:
+        a, b = sp.groups()
+        names = [f"{a}_SP{b}", f"{a}-SP{b}", f"{a}.{b}"]
+    else:
+        names = [ver.group(0)] if ver else []
+    if not names:
+        return not PRODUCT.search(dst) and bool(added)
+    pool = others if LEAP16.search(dst) else added
+    return any(n in r for n in names for r in pool)
+
+
+def reviewed(path, files, built=False, factory=False, dsts=None):
+    """Whether gate.sh's stamp at path is GREEN, holds a review PASS (built:
+    and a GREEN build, a local log's or OBS's; factory: and no --no-entry
+    waiver; dsts: a build that covers each of them), and judged exactly files
+    ({name: md5})."""
+    import json
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    review = st.get("review") if isinstance(st, dict) else None
+    build = st.get("build") if isinstance(st, dict) else None
+    return (
+        isinstance(review, dict)
+        and st.get("verdict") == "GREEN"
+        and review.get("verdict") == "PASS"
+        and st.get("files") == files
+        and (not built or isinstance(build, dict) and build.get("verdict") == "GREEN")
+        and not (factory and st.get("no_entry"))
+        and (dsts is None or all(covers(build, d, st.get("target")) for d in dsts))
+    )
+
+
+REVIEWER = "changes-review"
+GATE_NAME = Rx(r"(?<![\w.-])gate\.sh\b")
+# gate.sh's options that take the next word: what follows one is no option
+GATE_VALUED = {
+    "--entries",
+    "--amend-top",
+    "--squash-mine",
+    "--target",
+    "--git-base",
+    "--build-log",
+    "--rpms",
+    "--cleaner-deviation",
+    "--no-entry",
+}
+REVIEW_WORD = Rx(r"(?<![\w-])--review(?![\w-])")
+# expansions that make several words, quoted or not
+SPLITS = Rx(r"\$[@*]|\$\{[@*!#]|\[[@*]\]")
+
+
+def runs_gate(word, ctx, cwd):
+    """Whether word runs gate.sh: by name in any spelling, by the text this call
+    assigned it, through a link, or as a byte copy of the skill's own; None
+    when only the shell knows (a stdin program, a value it cannot read)."""
+    if word is None:
+        return None
+    names = substitute(word, ctx, cwd) if VARIABLE.search(word) else [word]
+    if names and "gate.sh" in {os.path.basename(w) for w in names}:
+        return True
+    texts = [word, *held(word, ctx)]
+    for t in list(texts):  # what a substitution in them runs, as written
+        texts += [
+            ctx.sub_bodies[int(n)]
+            for n in SUB_WORD.findall(t)
+            if int(n) < len(ctx.sub_bodies)
+        ]
+    if any(GATE_NAME.search(t) for t in texts):
+        return True
+    skill = skill_dir()
+    mine = os.path.join(skill, "scripts", "gate.sh") if skill else ""
+    for p in (locate(word, ctx, cwd)[0] or ()) if names else ():
+        real = os.path.realpath(p)
+        if os.path.basename(real) == "gate.sh":
+            return True
+        try:
+            if mine and os.path.getsize(real) == os.path.getsize(mine) < MAX_BYTES:
+                with open(real, "rb") as a, open(mine, "rb") as b:
+                    if a.read() == b.read():
+                        return True
+        except OSError:
+            pass
+    return False if names is not None else None
+
+
+def review_record(word, args, ctx, cwd, via="", label=""):
+    """gate.sh run outside a changes-review agent with --review in any spelling
+    of an argument (brace expansion and the values this call set included), or
+    with one the guard cannot read where an option can stand: one that makes
+    several words ("$@", an array, any expansion once the call sets IFS), one
+    with a word after it (--review takes a file), what xargs adds (via). A
+    lone last word, or a valued option's value, cannot be --review. word: the
+    script as the command or the shell names it, None for a program on stdin
+    (label names the shell). The harness names the agent (Claude Code's
+    agent_type, the opencode 2.x plugin's agent), which the model cannot set."""
+    if ctx.agent == REVIEWER:
+        return
+    ifs = "IFS" in ctx.values or "IFS" in ctx.exported
+    review, unread, value = False, via, False
+    for k, a in enumerate(args):
+        for w in braces(a) or [None]:
+            vals = (
+                None
+                if w is None
+                else substitute(w, ctx, cwd)
+                if VARIABLE.search(w)
+                else [w]
+            )
+            bodies = [
+                ctx.sub_bodies[int(n)]
+                for n in SUB_WORD.findall(w or "")
+                if int(n) < len(ctx.sub_bodies)
+            ]
+            if any(REVIEW_WORD.search(b) for b in bodies):  # $(echo --review F)
+                review = True
+            elif vals is None or ifs and VARIABLE.search(w):
+                several = w is None or ifs or SPLITS.search(w)
+                if not value and (several or k + 1 < len(args)):
+                    unread = unread or "an argument only the shell knows"
+            elif any(t.split("=", 1)[0] == "--review" for v in vals for t in v.split()):
+                review = True
+        value = a in GATE_VALUED
+    if not review and not unread:
+        return
+    gate = runs_gate(word, ctx, cwd)
+    who = f"agent {ctx.agent}" if ctx.agent else "the main session"
+    if review and gate is not False:
+        what = "gate.sh" if gate else label or shown(word)
+        ask(ctx, "review-self", f"{what} --review from {who}")
+    elif unread and gate:
+        ask(ctx, "gate-args", f"gate.sh from {who} with {unread}")
+
+
+def factory_devel(pkg, ctx):
+    """The devel project openSUSE:Factory's _meta names for pkg; "" when it
+    names none or Factory has no such package. A failed, slow or unreadable
+    lookup refuses: it must not read as "no devel project"."""
+    import xml.etree.ElementTree as ET
+
+    if pkg in ctx.devel:
+        return ctx.devel[pkg]
+    what = f"openSUSE:Factory/{pkg}/_meta"
+    stub = os.environ.get("PR_GUARD_META_DIR")
+    if stub:
+        path = os.path.join(stub, pkg + ".xml")
+        text = open(path, encoding="utf-8").read() if os.path.exists(path) else None
+    else:
+        ok, text = obs_get(f"/source/openSUSE:Factory/{pkg}/_meta", ctx)
+        if not ok:
+            block("request-target-unknown", text)
+    devel = ""
+    if text is not None:
+        try:
+            el = ET.fromstring(text).find("devel")
+        except ET.ParseError:
+            block("request-target-unknown", f"{what} (the answer did not parse)")
+        devel = (el.get("project") or "") if el is not None else ""
+        if el is not None:
+            ctx.devel["develpkg", pkg] = el.get("package") or pkg
+    ctx.devel[pkg] = devel
+    return devel
+
+
+def source_listing(prj, pkg, ctx):
+    """The parsed source listing of prj/pkg, None for a 404. A failed, slow or
+    unreadable lookup refuses."""
+    import xml.etree.ElementTree as ET
+
+    key = ("listing", prj, pkg)
+    if key in ctx.devel:
+        return ctx.devel[key]
+    what = f"{prj}/{pkg}"
+    stub = os.environ.get("PR_GUARD_META_DIR")
+    if stub:
+        path = os.path.join(stub, "src", prj, pkg + ".xml")
+        text = open(path, encoding="utf-8").read() if os.path.exists(path) else None
+    else:
+        ok, text = obs_get(f"/source/{prj}/{pkg}", ctx)
+        if not ok:
+            block("request-target-unknown", text)
+    root = None
+    if text is not None:
+        try:
+            root = ET.fromstring(text)
+        except ET.ParseError:
+            block("request-target-unknown", f"{what} (the answer did not parse)")
+    ctx.devel[key] = root
+    return root
+
+
+def target_kind(dst, pkg, ctx):
+    """("aggregate", None) or ("link", "PRJ/PKG") when dst/pkg only mirrors
+    another project's package (a _link within dst, or to Factory or SUSE, is
+    its own source), else (None, None). A 404 is a package dst does not carry
+    yet. A failed or unreadable lookup refuses."""
+    key = (dst, pkg)
+    if key in ctx.devel:
+        return ctx.devel[key]
+    root = source_listing(dst, pkg, ctx)
+    got = (None, None)
+    if root is not None:
+        names = {e.get("name") for e in root.findall("entry")}
+        link = root.find("linkinfo")
+        if "_aggregate" in names:
+            got = ("aggregate", None)
+        elif link is not None and link.get("project") not in (None, dst):
+            lp = link.get("project")
+            if not OWN_RULES.match(lp):
+                got = ("link", f"{lp}/{link.get('package') or pkg}")
+    ctx.devel[key] = got
+    return got
+
+
+def osc_targets(sub, pos, opts):
+    """The projects an osc write names, "." for the checkout's: the
+    destination of copypac, linkpac, aggregatepac and branch (from a
+    checkout, linkpac's operands are the destination), release's project and
+    --target-project, the project of meta prj|pkg with -F or -e, and the one
+    of the rest (rdelete, rremove, setdevelproject, lock ...). Empty when the
+    call writes into nothing it names."""
+    keys = {k for k, _ in opts}
+
+    def project(args):  # osc's PROJECT PACKAGE, or PROJECT/PACKAGE
+        a = args.pop(0) if args else None
+        if a and a.count("/") != 1 and args:
+            args.pop(0)
+        return a and a.split("/")[0]
+
+    words = [w for p in pos for w in p.strip("/").split("/")]  # osc's slash_split
+    if sub == "meta":
+        if words[:1] not in (["prj"], ["pkg"]):
+            return []
+        if not keys & {"-F", "--file", "-e", "--edit"}:
+            return []
+        rest = words[1:]
+        return [rest[0] if len(rest) > (words[0] == "pkg") else "."]
+    if sub == "branch":
+        return words[2:3]
+    if sub == "maintainer":  # PRJ [PKG], or the checkout's
+        return (words[:1] or ["."]) if keys & ROLE_WRITES else []
+    if sub in ("copypac", "linkpac", "aggregatepac"):
+        rest = list(pos)
+        project(rest)
+        return [project(rest) or project(list(pos))]
+    if sub == "setdevelproject" and (
+        len(pos) < 2 or len(pos) == 2 and "/" not in pos[0]
+    ):
+        return ["."]  # the devel project is what it names
+    if sub == "release":
+        return [project(list(pos)) or "."] + [
+            v for k, v in opts if k == "--target-project"
+        ]
+    if sub in ("rdelete", "undelete", "rremove", "lock", "rmkpac"):
+        return [project(list(pos))]
+    if sub == "repo":  # add or remove change the project's meta; list reads it
+        return (
+            [project(pos[1:]) or "."]
+            if pos[:1] in (["add"], ["remove"], ["rm"])
+            else []
+        )
+    if sub == "mbranch":  # a second operand is the project it branches into
+        return pos[1:2]
+    return [project(list(pos)) or "."]
+
+
+def api_segment(url):
+    """The first path segment of an API URL (or path), when the text before
+    the first $ or backtick spells it out whole; else None."""
+    head = re.split(r"[$`]", url)[0]
+    if "://" in head:
+        head = head.split("://", 1)[1].partition("/")[2] if "/" in head[8:] else ""
+    parts = re.sub(r"/+", "/", head).lstrip("/").split("/")
+    return parts[0] if len(parts) > 1 else None
+
+
+def api_targets(method, url):
+    """The projects an osc api write to url writes into."""
+    import posixpath
+    import urllib.parse
+
+    if "://" in url:
+        parts = urllib.parse.urlsplit(url)
+        path, query = parts.path, parts.query
+    else:  # a path, which may start with // (osc prefixes the API URL)
+        path, _, query = url.partition("#")[0].partition("?")
+    path = posixpath.normpath(re.sub(r"/+", "/", urllib.parse.unquote(path)) or "/")
+    query = urllib.parse.parse_qs(query)
+    cmds = query.get("cmd", [])
+    if method.upper() == "POST" and cmds and set(cmds) <= READ_CMDS:
+        return query.get("target_project", []) if "branch" in cmds else []
+    return [m.group(1) for m in SOURCE_PRJ.finditer(path)]
+
+
+def call_args(text, i):
+    """The top-level arguments of the call whose "(" ends at i."""
+    args, cur, depth, q, end = [], [], 0, None, min(len(text), i + 2000)
+    while i < end:
+        c = text[i]
+        if q:
+            if c == "\\":
+                cur.append(text[i : i + 2])
+                i += 2
+                continue
+            if c == q:
+                q = None
+        elif c in "\"'":
+            q = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif c == "," and depth == 0:
+            args.append("".join(cur).strip())
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    last = "".join(cur).strip()
+    return args + [last] if last else args
+
+
+def writes(text):
+    """Evidence of a request that is not a literal GET or HEAD."""
+    if WRITE.search(text):
+        return True
+    for ln in text.split("\n"):
+        m = CURL.search(ln)
+        seg = re.split(r"[;&|]", ln[m.end() :])[0] if m else ""
+        if m and (
+            BODY_LONG.search(seg)
+            or CURL_METHOD.search(seg)
+            or CURL_FILE.search(seg)
+            or (CURL_BODY.search(seg) and not CURL_GET.search(seg))
+        ):
+            return True
+        m = TEA_API.search(ln)
+        if m and BODY_LONG.search(re.split(r"[;&|]", ln[m.end() :])[0]):
+            return True
+    for m in ARGV_TOOL.finditer(text):
+        seg = " ".join(call_args(text, m.end()))
+        if m.group(1) != "tea" or re.match(r"[\s\"',]*api[\"']", seg):
+            if BODY_LONG.search(seg):
+                return True
+    for m in CALL.finditer(text):
+        pos = [a for a in call_args(text, m.end()) if not KWARG.match(a)]
+        if m.group(1):
+            if len(pos) >= 2:
+                return True
+            continue
+        lit = QUOTED.fullmatch(pos[0]) if pos else None
+        if pos and not lit:
+            return True  # the method is a variable
+        if (
+            lit
+            and lit.group(2).isalpha()
+            and lit.group(2).upper() not in ("GET", "HEAD")
+        ):
+            return True
+    return False
+
+
+def httpie_reads(run, stdin):
+    """Whether an HTTPie or xh call provably only reads: no request item that
+    sends data, and an explicit GET or HEAD -- or no stdin it would send as a
+    body (--ignore-stdin, nothing piped in)."""
+    if httpie_writes(run):
+        return False
+    words = [a for a in run[1:] if a[:1] != "-"]
+    ignore = "--ignore-stdin" in run or "-I" in run
+    return words[:1] in (["GET"], ["HEAD"]) or ignore and stdin is None
+
+
+def curl_reads(args):
+    """Whether a curl call provably only reads: -q (--disable) first, so no
+    curlrc adds a method or body, and only_reads()."""
+    first = args[0] if args else ""
+    no_rc = first == "--disable" or re.fullmatch(r"-q[a-zA-Z]*", first)
+    return bool(no_rc) and only_reads("curl", args)
+
+
+def httpie_writes(run):
+    """HTTPie and xh: an explicit method, or request items that make a POST."""
+    words, i = [], 1
+    while i < len(run):
+        a = run[i]
+        if a == "--raw" or a.startswith("--raw="):
+            return True
+        if a in HTTPIE_VALUED:
+            i += 2
+            continue
+        if not a.startswith("-"):
+            words.append(a)
+        i += 1
+    if len(words) > 1 and re.fullmatch(r"[A-Z]+", words[0]):
+        return words[0] not in ("GET", "HEAD", "OPTIONS")
+    return any(HTTPIE_DATA.match(w) for w in words[1:])
+
+
+def only_reads(tool, args, names=()):
+    """Whether a curl, tea api or git-obs api call provably only reads: each
+    option one of READ_OPTS, its method GET or HEAD. names: the long options a
+    prefix may stand for."""
+    flags, valued, lflags, lvalued = READ_OPTS[tool]
+    method = METHOD_OPT[tool]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            break
+        if a[:1] != "-" or a == "-":
+            continue
+        if a[:2] == "--":
+            k, eq, v = long_prefix(a, names).partition("=")
+            if k[2:] in lflags.split() and not eq:
+                continue
+            if k != method and k[2:] not in lvalued.split():
+                return False
+            if not eq:
+                v, i = (args[i] if i < len(args) else ""), i + 1
+        else:
+            j = 1
+            while j < len(a) and a[j] in flags:
+                j += 1
+            if j == len(a):
+                continue
+            if a[j] != "X" and a[j] not in valued:
+                return False
+            k, v = ("--method" if a[j] == "X" else a[j]), a[j + 1 :].lstrip("=")
+            if not v:
+                v, i = (args[i] if i < len(args) else ""), i + 1
+        if k in (method, "--method") and v.upper() not in ("GET", "HEAD"):
+            return False
+        if k in ("H", "--header") and "method" in v.lower():
+            return False
+    return True
+
+
+def wget_reads(args):
+    """Whether a wget call provably only reads: its wgetrc off (--no-config),
+    and no option that sends a body, sets a method other than GET or HEAD, or
+    runs wgetrc commands (-e)."""
+    if "--no-config" not in args:
+        return False
+    for a in args:
+        k, _, v = a.partition("=")
+        if a[:2] == "--" and len(k) > 2:
+            for w in WGET_WRITES:
+                if w.startswith(k[2:]) and not (w == "method" and v.upper() in GET):
+                    return False
+        elif a[:1] == "-":
+            for c in a[1:]:
+                if c == "e":
+                    return False
+                if c in WGET_VALUED:
+                    break
+    return True
+
+
+def code_reads(text):
+    """Whether program text provably only reads: a curl or wget on a merge
+    URL's line only reads by its options, and the text shows no other sign of
+    a write at all."""
+    if writes(text):
+        return False
+    other = False
+    for ln in text.split("\n"):
+        m = CURL.search(ln) if MERGE_URL.search(ln) else None
+        if m:
+            args = re.findall(r"[^\s\"',\[\]()]+", re.split(r"[;&|]", ln[m.end() :])[0])
+            if not (curl_reads(args) if m.group() == "curl" else wget_reads(args)):
+                return False
+        else:
+            other = True
+    return not (other and MAY_WRITE.search(text))
+
+
+def norm_urls(text):
+    """text for the URL rules: percent-encoding decoded, runs of / collapsed
+    (a scheme's // kept), dot segments removed."""
+    import urllib.parse
+
+    text = re.sub(r"(?<!:)//+", "/", urllib.parse.unquote(text))
+    end = r"(?=/|[?#\s\"'`]|$)"
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(rf"/\.{end}", "", text)
+        text = re.sub(rf"/[^/\s\"'`?#]+/\.\.{end}", "", text)
+    return text
+
+
+def api_rules(text, ctx, cwd, write=False, reads=None):
+    """The pulls API: a merge -- a merge payload; a merge URL on a pool (or
+    unknown) repository, however it is sent; elsewhere one in a call that
+    does not provably only read (reads: that proof for a command line;
+    program text must show no sign of a write) -- or any write to pool (or
+    unknown) pulls. URLs are judged normalised (norm_urls)."""
+    text = norm_urls(text)
+    if REQUEST_CREATE.search(text):
+        block("request-api", "a request created through the API")
+    if (
+        DO_MERGE.search(text)
+        or MERGE_URL.search(text)
+        and (
+            pool_or_unknown(text, ctx, cwd)
+            or not (code_reads(text) if reads is None else reads)
+        )
+    ):
+        block("merge-api", "an API merge of a PR")
+    if PULLS_REF.search(text) and (write or writes(text)):
+        if pool_or_unknown(text, ctx, cwd):
+            block("create-api", "a write to pool pulls")
+
+
+def line_rules(ln, ctx, cwd):
+    """Rules one line of a program holds all the evidence for."""
+    tool_rules(ln, ctx, cwd)
+    for seg in re.split(r"[;&|]", ln):
+        if PUSH.search(seg) and not STASH_PUSH.search(seg) and PUSH_POOL.search(seg):
+            block("push-pool", "a push naming pool/ or AGit refs")
+        osc_rules(seg)
+
+
+# What runs the text it is given in this shell, by name or held in a variable.
+RUNNERS = SHELLS | {"eval", "trap"}
+
+
+# The tools the asks judge, and what runs a command from its arguments.
+TOOL_WORDS = {"osc", "tea", "git-obs", "gh", "git", "eval", "trap", "coproc"}
+
+
+def starts_tool(args):
+    """Whether arguments hand a command word only the shell knows a judged
+    tool or a runner to start: their first word, or one of them read as a
+    command line ('osc rq accept N', bash -c)."""
+    words = [w for a in args for w in a.split()]
+    if any(os.path.basename(w) in TOOL_WORDS for w in words[:1]):
+        return True
+    if any(w in SHELLS and words[k + 1 : k + 2] == ["-c"] for k, w in enumerate(words)):
+        return True
+    return any(
+        a.split()[:1] and os.path.basename(a.split()[0]) in TOOL_WORDS for a in args
+    )
+
+
+def literal_commands(text):
+    """Whether every command word of shell text is literal: what only the
+    shell knows stands in argument positions alone."""
+    for item in commands(arrays(tokenize(text))):
+        if len(item) == 2 and item[0]:
+            run = unwrap(item[0])[0]
+            if run and VARIABLE.search(run[0]):
+                return False
+    return True
+
+
+def body_texts(words, lwords, what, ctx, cwd):
+    """The texts an eval or trap string stands for: itself when literal (the
+    literal-aware words show no expansion), each spelling of what the call
+    set; none, and an ask, when only the shell knows it."""
+    text = " ".join(words)
+    lit = " ".join(lwords) if lwords and len(lwords) == len(words) else text
+    if not VARIABLE.search(lit):
+        return [text]
+    vals = substitute(text, ctx, cwd)
+    if vals:
+        return vals
+    if literal_commands(text):  # unknown arguments only: judged as unknown
+        return [text]
+    ask(ctx, "eval-dynamic", f"{what} {shown(text)[:80]}")
+    return []
+
+
+def run_text(text, kind, ctx, cwd, depth):
+    """A program read whole: inline code, or text fed to a shell or interpreter."""
+    if kind == "shell":
+        api_rules("\n".join(code_lines(text)), ctx, cwd)
+        shell_pass(text, ctx, cwd, depth)
+        return
+    lines = code_lines(text)
+    for ln in lines:
+        line_rules(ln, ctx, cwd)
+    whole = "\n".join(lines)
+    api_rules(whole, ctx, cwd)
+    if STAMP.search(whole):
+        block("stamp", "program text touching the stamp directory")
+    for m in CODE_PUSH.finditer(whole):
+        if not other_forge(whole, m, ctx, cwd):
+            unsure("a git push inside program text")
+
+
+def other_forge(text, m, ctx, cwd):
+    """Whether the git push matched at m names, as a literal, a remote that
+    another forge hosts -- judged in cwd, so any directory change refuses."""
+    if CODE_DIR.search(text):
+        return False
+    after, q = text[m.end() :], text[m.start()]
+    if after[:1] in "\"'":  # an argument list: each argument its own literal
+        args, at = [], 1
+        a = CODE_ARG.match(after, at)
+        while a:
+            args.append(a.group(2))
+            at = a.end()
+            a = CODE_ARG.match(after, at)
+    else:  # one command string: its words up to the closing quote
+        end = after.find(q)
+        args = after[:end].split() if end >= 0 else []
+        if any(re.search(r"[${}%]", w) for w in args):
+            return False
+    remote = next((a for a in args if not a.startswith("-")), None)
+    if not remote or not LITERAL.fullmatch(remote) and not URLISH.search(remote):
+        return False
+    url = (
+        remote
+        if URLISH.search(remote)
+        else git(cwd, (), "remote", "get-url", "--push", remote)
+    )
+    return bool(url) and not FORGE.search(url)
+
+
+def quoted(line, end):
+    """Whether line[end] sits inside quotes, ${...} or a comment opened
+    earlier on the line -- not in a $(...) or (...), where a << is one."""
+    head = line[:end]
+    if (len(head) - len(head.rstrip("\\"))) % 2:  # \<< is a < and a <
+        return True
+    _, frames, open_span = shell_read(head)
+    return bool(open_span) or bool(frames) and frames[-1] in ('"', "${")
+
+
+def split_heredocs(text, ctx):
+    """Text with each heredoc's delimiter replaced by a word "\\x01<n>" that
+    names its body, kept as (body, expands) in ctx.docs."""
+    lines, out, i = text.split("\n"), [], 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        # A << inside quotes is text: taking it for a heredoc would hide the
+        # lines after it.
+        ops = [m for m in HEREDOC.finditer(line) if not quoted(line, m.start())]
+        parts, at = [], 0
+        for m in ops:
+            end, body = m.group(2) or m.group(4), []
+            while i < len(lines):
+                cur = lines[i].rstrip("\r")
+                i += 1
+                if (cur.lstrip("\t") if m.group(1) else cur) == end:
+                    break
+                body.append(cur)
+            parts += [line[at : m.start()], f"<<\x01{len(ctx.docs)}"]
+            at = m.end()
+            ctx.docs.append(("\n".join(body), not (m.group(2) or m.group(3))))
+        out.append("".join(parts) + line[at:])
+    return "\n".join(out)
+
+
+# What a # must follow to start a comment: an unescaped blank or operator, not
+# the space of "a\\ #", nor the ) that closes a $(...) inside the word.
+WORD_BREAK = frozenset(" \t\n;&|()")
+SUB_OPEN = (["$"], ["<"], [">"])
+CODE = (None, "(", "$(")  # where quotes, comments and parens are the shell's
+CASE = re.compile(r"case[ \t\n]")
+
+
+def shell_read(text):
+    """(text as bash reads it, the frames still open at its end, the quote,
+    backtick or # whose span the text ends in). Each backslash-newline is
+    removed, not in single quotes; each $'...' spelled in plain single quotes,
+    decoded; each comment dropped. Nesting is followed as bash does -- "...",
+    $(...), (...), ${...}, and `...`, which ends at the next backtick whatever
+    it holds -- so a quote or # inside one is not the outer one's. A case
+    inside (...) is refused: its pattern's ) would end the parenthesis."""
+    return lex(text, 0, [])[:3]
+
+
+def sub_end(text, i):
+    """The index of the ) that ends the $(...), <(...) or >(...) whose ( is at
+    text[i], nested as shell_read() does; len(text) when none does."""
+    return lex(text, i + 1, ["$("], stop=0)[3]
+
+
+def lex(text, i, st, stop=None):
+    """shell_read() from text[i] inside the frames st, and the index it ended
+    at: the ) that leaves stop frames open, or len(text). A command's first
+    word after its keywords that is case or esac only once its quotes or
+    backslashes are gone is refused: the shell runs it as a command, the
+    rules would read the lines after it as case patterns."""
+    out, n = [], len(text)
+    dollar = glued = False
+    inner = sum(f != "(" for f in st)  # open frames but (: no words tracked in them
+    word, wq, cmd, target, in_dq = None, False, True, False, False
+
+    def end_word():
+        nonlocal word, wq, cmd, target
+        if word is None:
+            return
+        w = "".join(word)
+        if target:
+            target = False
+        elif cmd:
+            if wq and w in ("case", "esac"):
+                raise ValueError(f"a quoted {w} runs as a command, not the keyword")
+            cmd = w in KEYWORDS
+        word, wq = None, False
+
+    def add(chars, quoting=False):
+        nonlocal word, wq
+        if inner == 0 or in_dq and inner == 1 and st[-1] == '"':
+            word = word if word is not None else []
+            word.extend(chars)
+            wq = wq or quoting
+        elif word is not None:
+            word.append("\0")  # a substitution or ${...}: no keyword
+
+    while i < n:
+        c, top = text[i], (st[-1] if st else None)
+        if c == "\\" and i + 1 < n:
+            if text[i + 1] != "\n":  # a removed one keeps $ next to its ', ) to its #
+                out.append(text[i : i + 2])
+                add(text[i + 1], True)
+                dollar = glued = False
+            i += 2
+            continue
+        if c == "`" or c == "'" and top != '"':
+            j = i + 1
+            while j < n and text[j] != c:
+                j += 2 if text[j] == "\\" and (c == "`" or dollar) else 1
+            if j >= n:
+                end_word()
+                return "".join(out) + text[i:], st, c, n
+            if c == "'" and dollar:
+                body = ansi_c(text[i + 1 : j])
+                out[-1] = "'" + body.replace("'", "'\\''") + "'"
+                if word:
+                    word.pop()  # its $
+                add(body, True)
+            else:
+                out.append(text[i : j + 1])
+                add(text[i + 1 : j] if c == "'" else "\0", True)
+            i, dollar, glued = j + 1, False, False
+            continue
+        closes = False
+        if top in CODE:
+            if c == "#" and not glued and (not out or out[-1] in WORD_BREAK):
+                j = text.find("\n", i)
+                if j < 0:
+                    end_word()
+                    return "".join(out), st, "#", n
+                i, dollar = j, False
+                continue
+            if inner == 0 and c in " \t\r;&|<>\n":
+                if c in "<>" and word and not wq and "".join(word).isdigit():
+                    word = None  # the fd of 2>: no argument
+                end_word()
+                if c in "<>":
+                    target = True
+                elif c in "&|" and out[-1:] in (["<"], [">"]):
+                    pass  # >&, <&, >|: still the redirection
+                elif c not in " \t\r":
+                    cmd, target = True, False
+            if c == '"':
+                in_dq = inner == 0
+                add("", True)
+                st.append(c)
+                inner += 1
+            elif c == "(":
+                sub = out[-1:] in SUB_OPEN
+                if not sub and inner == 0:
+                    end_word()
+                    cmd, target = True, False
+                elif inner == 0 and word is None:
+                    add("\0")  # <(...) is a word, as $(...) is
+                st.append("$(" if sub else "(")
+                inner += sub
+            elif c == ")":
+                if top:  # with none open, a case pattern's
+                    st.pop()
+                    inner -= top == "$("
+                    closes = top == "$("
+                    if len(st) == stop:
+                        return "".join(out), st, None, i
+                if not closes and inner == 0:
+                    end_word()
+                    cmd, target = True, False
+            elif top and CASE.match(text, i) and (not out or out[-1] in WORD_BREAK):
+                raise ValueError(
+                    "a case inside (...) or $(...) is not read, its pattern's ) "
+                    "would end it: run the case outside"
+                )
+            elif c not in " \t\r;&|<>\n":
+                add(c)
+        elif c == "(" and out[-1:] == ["$"]:
+            add(c)
+            st.append("$(")
+            inner += 1
+        elif top == '"' and c == '"' or top == "${" and c == "}":
+            st.pop()
+            inner -= 1
+        else:
+            if top == "${" and c == '"':
+                st.append(c)
+                inner += 1
+            add(c)
+        if c == "{" and out[-1:] == ["$"]:
+            st.append("${")
+            inner += 1
+        out.append(c)
+        dollar = c == "$" and not dollar  # $$ is the PID: $$'...' is plain
+        glued = closes
+        i += 1
+    end_word()
+    return "".join(out), st, None, n
+
+
+def substitutions(text, quotes=True, base=0, lit=False):
+    """(text with each $(...), `...`, <(...) and >(...) replaced by a word only
+    the shell can expand, their bodies). They run even inside double quotes,
+    where the tokenizer sees one word; quotes=False reads an expanding heredoc
+    body, where quote characters are literal. The word of a $(...) or `...`
+    is $__subN, N its body's index counted from base. lit: the literal-aware
+    text, where a $ or backtick the shell takes literally -- single-quoted,
+    backslashed, or in a decoded $'...' -- is spelled as in LIT_CHARS."""
+    out, bodies, q, i, n = [], [], None, 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\" and q != "'":
+            esc = text[i + 1 : i + 2]
+            out.append(LIT_CHARS[esc] if lit and esc in LIT_CHARS else text[i : i + 2])
+            i += 2
+            continue
+        if not q and c.isdigit() and (i == 0 or text[i - 1] in " \t\n;&|()"):
+            j = i
+            while j < n and text[j].isdigit():
+                j += 1
+            if j < n and text[j] in "<>":  # 2>file: an fd, not an argument
+                out.append(FD_MARK + text[i:j])
+                i = j
+                continue
+        if lit and not q and text.startswith("$'", i):
+            j = i + 2
+            while j < n and text[j] != "'":
+                j += 2 if text[j] == "\\" else 1
+            word = literal(ansi_c(text[i + 2 : j]))
+            out.append("'" + word.replace("'", "'\\''") + "'")
+            i = j + 1
+            continue
+        if q == "'":
+            q = None if c == "'" else q
+            c = LIT_CHARS.get(c, c) if lit else c
+        elif quotes and c == "'" and q is None:
+            q = c
+        elif quotes and c == '"':
+            q = None if q else c
+        elif c == "`":
+            j = i + 1
+            while j < n and text[j] != "`":
+                j += 2 if text[j] == "\\" else 1
+            out.append(f"$__sub{base + len(bodies)}")
+            bodies.append(text[i + 1 : j])
+            i = j + 1
+            continue
+        elif text.startswith("$(", i) or (not q and text.startswith(("<(", ">("), i)):
+            j = sub_end(text, i + 1)
+            if text.startswith("$((", i):  # $((...)) is arithmetic
+                out.append("$__sub")
+            else:
+                out.append(
+                    f"$__sub{base + len(bodies)}" if c == "$" else " /dev/fd/63 "
+                )
+                bodies.append(text[i + 2 : j])
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), bodies
+
+
+def ansi_c(text):
+    """The text of a $'...' word, its backslash escapes decoded as bash does;
+    a character a str cannot hold raises ValueError."""
+
+    def one(m):
+        e = m.group(1)
+        if e[0] in "xuU" and len(e) > 1:
+            n = int(e[1:], 16)
+        elif e[0] in "01234567":
+            n = int(e, 8) & 0xFF
+        elif e[0] == "c" and len(e) > 1:  # a control character
+            if not e[1].isascii():
+                raise ValueError(
+                    f"$'...' escape {m.group(0)} is a byte, not a character"
+                )
+            n = {"\\": 0x1C, "?": 0x7F}.get(e[1], ord(e[1].upper()) & 0x1F)
+        else:
+            return ANSI_ESC.get(e, m.group(0))  # an unknown escape keeps its backslash
+        if n > 0x10FFFF or 0xD800 <= n <= 0xDFFF:
+            raise ValueError(f"$'...' escape {m.group(0)} names no character")
+        return chr(n)
+
+    return ANSI_C.sub(one, text).split("\0", 1)[0]  # a NUL ends the word
+
+
+def tokenize(text):
+    import shlex
+
+    lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>\n")
+    lex.whitespace, lex.whitespace_split, lex.commenters = " \t\r", True, ""
+    try:
+        return list(lex)
+    except ValueError:  # unbalanced quotes: a rougher split still finds the words
+        return re.findall(r"[;&|()<>\n]+|[^\s;&|()<>]+", text)
+
+
+def arrays(tokens):
+    """Tokens with each array literal, name=( ... ), joined into its assignment
+    word: its parentheses open no subshell and its words run nothing."""
+    out, i, n = [], 0, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        i += 1
+        if not (
+            tok[:1] == "(" and set(tok) <= OPS and out and ASSIGN.fullmatch(out[-1])
+        ):
+            out.append(tok)
+            continue
+        words, rest = [], tok[1:]
+        while ")" not in rest and i < n:
+            t = tokens[i]
+            i += 1
+            if t and set(t) <= OPS:
+                rest = t
+            else:
+                words.append(t)
+        out[-1] += "(" + " ".join(words) + ")"
+        rest = rest[rest.find(")") + 1 :] if ")" in rest else ""
+        if rest:
+            out.append(rest)
+    return out
+
+
+def commands(tokens):
+    """Yield "(", ")", "|", ";;", "&" and (argv, redirections) per simple command;
+    a redirection is (operator, word)."""
+    argv, redirs, op = [], [], None
+    for tok in tokens:
+        if tok and set(tok) <= OPS:
+            if "<" in tok or ">" in tok:
+                # the fd of 2>&1 goes with its operator (substitutions() marked it)
+                fd = argv and argv[-1][:1] == FD_MARK
+                op = (argv.pop()[1:] if fd else "") + tok
+                continue
+            if argv or redirs:
+                yield argv, redirs
+            argv, redirs, op = [], [], None
+            for sep in SEPS.findall(tok):
+                if sep in ("(", ")", "|", "|&"):
+                    yield sep[0]
+                elif sep.startswith(";;") or sep == ";&":
+                    yield ";;"
+                elif sep == "&":
+                    yield "&"
+            continue
+        if op is not None:
+            redirs.append((op, tok))
+            op = None
+        else:
+            argv.append(tok)
+    if argv or redirs:
+        yield argv, redirs
+
+
+def resolve(raw, cwd):
+    """(path, None); (None, None) for a path only the shell can expand; or
+    (None, why) for a literal path that cannot be placed."""
+    p = os.path.expanduser(re.sub(r"^\$\{?HOME\}?(?=/|$)", "~", raw))
+    if re.search(r"[$`*?\[]", p):
+        return None, None
+    if not os.path.isabs(p):
+        if not cwd:
+            return None, "the working directory is unknown"
+        p = os.path.join(cwd, p)
+    return os.path.normpath(p), None
+
+
+def substitute(word, ctx, cwd, seen=frozenset(), memo=None):
+    """Every spelling of word once its $NAME and ${NAME} are replaced by what
+    this call assigned them (a for loop assigns each of its words), $PWD by
+    the tracked directory, $TMPDIR and $HOME by the environment; None when
+    anything else only the shell knows is left, past 64 spellings, or past
+    EXPANDED characters (a value that doubles itself)."""
+    memo = {} if memo is None else memo
+    if (word, seen) not in memo:
+        memo[word, seen] = capped(_substitute(word, ctx, cwd, seen, memo))
+    return memo[word, seen]
+
+
+def capped(spellings):
+    too_long = spellings and sum(map(len, spellings)) > EXPANDED
+    return None if too_long else spellings
+
+
+def braces(word):
+    """The words bash's brace expansion makes of word, in its order: comma
+    lists and {x..y[..step]} sequences, nested, ${...} left alone, none of
+    them empty; None past 64 words, EXPANDED characters or a 1 KB word
+    (bash's scan is quadratic in nested braces)."""
+    if "{" not in word:
+        return [word]
+    if len(word) > 1024:
+        return None
+    try:
+        return capped([w for w in _braces(word) if w])  # empty words drop out
+    except OverflowError:
+        return None
+
+
+def _brace_scan(word, i, stop):
+    """bash's brace_gobbler from i: the index of the first stop character at
+    the top level (braces and ${...} nest), or len(word); and whether a "," or
+    a ".." not closing the braces sat at the top level before it."""
+    level, sep = 0, False
+    while i < len(word):
+        c = word[i]
+        if c == "$" and word[i + 1 : i + 2] == "{":
+            level, i = level + 1, i + 2
+            continue
+        if c in stop and level == 0:
+            return i, sep
+        if c == "{":
+            level += 1
+        elif c == "}" and level:
+            level -= 1
+        elif level == 0 and c == ",":
+            sep = True
+        elif level == 0 and word[i : i + 2] == ".." and word[i + 2 : i + 3] != "}":
+            sep = True
+        i += 1
+    return i, sep
+
+
+def _braces(word):
+    i = 0
+    while True:  # the first "{" that opens an expression: a close, and a separator
+        i = _brace_scan(word, i, "{")[0]
+        if i == len(word):
+            return [word]
+        close, sep = _brace_scan(word, i + 1, "}")
+        if close < len(word) and sep:
+            break
+        i += 1
+    amble, rest = word[i + 1 : close], word[close + 1 :]
+    if "," in amble:
+        tack, j = [], 0
+        while j <= len(amble):  # its top-level alternatives
+            k = _brace_scan(amble, j, ",")[0]
+            tack += _braces(amble[j:k])
+            j = k + 1
+            if len(tack) > 64:
+                raise OverflowError
+    else:
+        tack = brace_seq(amble)
+        if tack is None:
+            if not rest:
+                return [word]
+            tack = [word[i : close + 1]]
+    tails = _braces(rest) if rest else [""]
+    if len(tack) * len(tails) > 64:
+        raise OverflowError
+    return [word[:i] + t + r for t in tack for r in tails]
+
+
+def brace_seq(amble):
+    """The words of a {x..y[..step]} body, or None when it is no sequence."""
+    m = BRACE_SEQ.fullmatch(amble)
+    if not m:
+        return None
+    step = abs(int(m.group(3) or m.group(6) or 1)) or 1
+    if m.group(1) is not None:
+        a, b = int(m.group(1)), int(m.group(2))
+        zero = any(re.match(r"[-+]?0\d", x) for x in m.group(1, 2))
+        width = max(len(m.group(1)), len(m.group(2))) if zero else 0
+        show = lambda n: f"{n:0{width}d}"  # noqa: E731
+    else:
+        a, b, show = ord(m.group(4)), ord(m.group(5)), chr
+    if abs(b - a) // step >= 64:
+        raise OverflowError
+    way = 1 if b >= a else -1
+    return [show(n) for n in range(a, b + way, step * way)]
+
+
+def _substitute(word, ctx, cwd, seen, memo):
+    m = VAR_REF.search(word)
+    if not m:
+        return None if VARIABLE.search(word) else [word]
+    name = m.group(1) or m.group(2)
+    if name in ctx.values:
+        vals = ctx.values[name]
+    elif name == "PWD":
+        vals = [cwd] if cwd else None
+    elif name in ("TMPDIR", "HOME"):
+        vals = [os.environ[name]] if os.environ.get(name) else None
+    else:
+        vals = None
+    if not vals or name in seen:
+        return None
+    tails = substitute(word[m.end() :], ctx, cwd, seen, memo)
+    out = []
+    for v in vals:
+        heads = substitute(v, ctx, cwd, seen | {name}, memo)
+        if heads is None or tails is None:
+            return None
+        out += [word[: m.start()] + h + t for h in heads for t in tails]
+    return out if len(out) <= 64 else None
+
+
+def locate(raw, ctx, cwd):
+    """(paths, None) for the files a word names, globs expanded in cwd as the
+    shell would; (None, why) when a literal path cannot be placed; (None, None)
+    when the word keeps something only the shell knows."""
+    words = substitute(raw, ctx, cwd)
+    if words is None:
+        return None, None
+    import glob
+
+    paths = []
+    for w in words:
+        p = os.path.expanduser(w)
+        if not os.path.isabs(p):
+            if not cwd:
+                return None, "the working directory is unknown"
+            p = os.path.join(cwd, p)
+        found = sorted(glob.glob(p)) if GLOB.search(p) else []
+        paths += [os.path.normpath(f) for f in found or [p]]
+    return paths, None
+
+
+def regular(path):
+    """Whether path is a regular file, which the guard may open and read."""
+    import stat
+
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+def written(real, ctx):
+    return any(real == w or real.startswith(w + os.sep) for w in ctx.written)
+
+
+def note_written(raw, ctx, cwd):
+    """Remember a file (or a tree) the call writes; one only the shell can
+    place is not remembered."""
+    paths, _ = locate(raw, ctx, cwd)
+    ctx.written.update(os.path.realpath(p) for p in paths or ())
+
+
+def skill_dir():
+    env = os.environ.get("PR_GUARD_SKILL_DIR")
+    if env:
+        return os.path.realpath(env)
+    for cand in (
+        "~/.claude/skills/opensuse-packaging",
+        "~/.agents/skills/opensuse-packaging",
+    ):
+        if os.path.isdir(os.path.expanduser(cand)):
+            return os.path.realpath(os.path.expanduser(cand))
+    return None
+
+
+def scripts_path():
+    """The skill's scripts/ for a message, absolute: a relative scripts/gate.sh
+    had agents write their own gate into the package checkout."""
+    skill = skill_dir()
+    return os.path.join(skill, "scripts") if skill else "<skill>/scripts"
+
+
+def in_skill(real):
+    """The skill checkout, when real is one of its scripts/; else None."""
+    skill = skill_dir()
+    scripts = os.path.realpath(os.path.join(skill, "scripts")) if skill else None
+    return skill if scripts and real.startswith(scripts + os.sep) else None
+
+
+def pinned(skill):
+    """The files of the skill's scripts/ at the pinned ref, when every file
+    that the index or the ref lists there matches its pinned blob on disk; else
+    an empty set. The scripts run their siblings, so one edited file untrusts
+    them all. Compared by blob hash of the bytes on disk (--no-filters: a clean
+    filter would hash an edit to the pinned blob); `git diff` would trust an
+    assume-unchanged index entry, and HEAD any local commit."""
+    ref = os.environ.get("PR_GUARD_PIN_REF") or PIN_REF
+    tree = git(skill, (), "ls-tree", "-r", "-z", ref, "--", "scripts")
+    index = git(skill, (), "ls-files", "-s", "-z", "--", "scripts")
+    if not tree or index is None:
+        return set()
+    blobs = {}
+    for ent in filter(None, tree.split("\0")):
+        meta, _, path = ent.partition("\t")
+        blobs[path] = meta.split()[-1]
+    tracked = {ent.partition("\t")[2] for ent in filter(None, index.split("\0"))}
+    if tracked - set(blobs):
+        return set()
+    order = sorted(blobs)
+    got = git(skill, (), "hash-object", "--no-filters", "--", *order)
+    if got is None or got.split() != [blobs[p] for p in order]:
+        return set()
+    return set(order)
+
+
+def canonical(real, skill, ctx):
+    """A skill script, while its scripts/ matches the pinned ref and this call
+    writes nothing there."""
+    if skill not in ctx.canon:
+        ctx.canon[skill] = pinned(skill)
+    scripts = os.path.realpath(os.path.join(skill, "scripts"))
+    if written(scripts, ctx) or any(
+        w.startswith(scripts + os.sep) for w in ctx.written
+    ):
+        return False
+    return os.path.relpath(real, skill) in ctx.canon[skill]
+
+
+def scan_file(raw, kind, ctx, cwd, depth, env=(), run=False):
+    """Read the scripts a word names when the command runs them; the command's
+    own (depth 0) scripts must be readable now, or the call is refused. run:
+    executed by its path, which it then sees as $0."""
+    paths, why = locate(raw, ctx, cwd)
+    if paths is None:
+        if depth == 0:
+            if why:
+                block("exec-unreadable", f"{raw} ({why})")
+            block("exec-unresolved", raw)
+        return
+    for path in paths:
+        scan_path(path, raw, kind, ctx, cwd, depth, env, run)
+
+
+def scan_path(path, raw, kind, ctx, cwd, depth, env, run):
+    real = os.path.realpath(path)
+    if written(real, ctx):
+        block("exec-written", raw)
+    if os.path.isdir(real):
+        return
+    skill = in_skill(real)
+    if skill:
+        if not run:
+            block("canonical-read", f"{raw} read as a program")
+        if canonical(real, skill, ctx):
+            changed = [e for e in env if e not in CLEAN_ENV] + ctx.exported
+            if changed:
+                block("canonical-env", f"{raw} run with {', '.join(changed)}")
+            return
+    if real in ctx.scanned:
+        return
+    ctx.scanned.add(real)
+    try:
+        if os.path.exists(path) and not regular(path):  # a FIFO: open() may hang
+            raise OSError(0, "not a regular file")
+        with open(real, "rb") as fh:
+            data = fh.read(MAX_BYTES)
+    except OSError as e:
+        if depth == 0:
+            where = "" if path == raw else f"{path}: "
+            block("exec-unreadable", f"{raw} ({where}{e.strerror or e})")
+        return
+    if data.startswith(b"\x7fELF"):
+        return
+    text = data.decode("utf-8", "replace")
+    if kind == "auto":
+        kind = "shell" if real.endswith(".sh") or SH_SHEBANG.match(text) else "code"
+    if kind == "code":
+        run_text(text, kind, ctx, cwd, depth)
+        return
+    # A script's quoted strings are data (test fixtures quote the very commands
+    # guarded here): its tool rules apply per parsed command, not per line.
+    api_rules("\n".join(code_lines(text)), ctx, cwd)
+    if depth < MAX_DEPTH:
+        shell_pass(text, ctx, cwd, depth + 1)
+
+
+def shell_assigned(name, args):
+    """The variables a command gives values only the shell knows: read,
+    mapfile/readarray, printf -v, getopts, unset, and declare -n (a name that
+    refers to another)."""
+    if name == "read":
+        opts, pos = parse_opts(args, "adinNptu")
+        return [v for k, v in opts if k == "-a"] + (pos or ["REPLY"])
+    if name in ("mapfile", "readarray"):
+        return (parse_opts(args, "dnOsuCc")[1] or ["MAPFILE"])[:1]
+    if name == "printf" and args[:1] == ["-v"]:
+        return args[1:2]
+    if name == "getopts":
+        return args[1:2]
+    if name == "unset":
+        return [a for a in args if a[:1] != "-"]
+    if name in DECLARE:
+        opts, pos = parse_opts(args, "")
+        if any(k == "-n" for k, _ in opts):
+            return [a.split("=", 1)[0] for a in pos]
+    return []
+
+
+def assign(word, lword, ctx):
+    """Remember what NAME=VALUE (or NAME+=VALUE, which appends to every value
+    the name holds) gives NAME, as written and as literal-aware text; its name."""
+    k, v = word.split("=", 1)
+    lv = lword.split("=", 1)[1] if lword and "=" in lword else None
+    k, append = k.rstrip("+"), k.endswith("+")
+    for store, val in ((ctx.values, v), (ctx.lit_values, lv)):
+        if append:
+            old = store.get(k) or ["${%s}" % k]  # the value from outside the call
+            store[k] = [None if o is None or val is None else o + val for o in old]
+        else:
+            store.setdefault(k, []).append(val)
+    return k
+
+
+def unwrap(argv):
+    """Strip keywords, assignments and command wrappers: (argv, shell string or
+    None, environment changes, the directory env -C moves to)."""
+    changes, chdir, i, n = [], None, 0, len(argv)
+
+    def skip(j, valued):
+        while j < n and argv[j].startswith("-") and argv[j] != "-":
+            if argv[j] == "--":
+                return j + 1
+            j += 2 if argv[j] in valued else 1
+        return j
+
+    while i < n:
+        w, base = argv[i], os.path.basename(argv[i])
+        if w in KEYWORDS or w == "coproc":
+            i += 1
+            if w == "coproc" and argv[i + 1 : i + 2] == ["{"]:
+                i += 1  # coproc NAME { ...; }
+        elif w == "function":
+            i += 2
+        elif ASSIGN.match(w):
+            changes.append(w.split("=", 1)[0].rstrip("+"))
+            i += 1
+        elif base == "rtk":
+            i = skip(i + 1, ())
+            if i < n and argv[i] == "run":
+                return [], " ".join(argv[i + 1 :]), changes, chdir
+            if i < n and argv[i] in ("err", "test", "summary", "proxy"):
+                i += 1
+        elif base == "env":
+            j = i + 1
+            # env takes every NAME=VALUE before the command, identifier or not.
+            while j < n and (argv[j].startswith("-") or "=" in argv[j]):
+                a = argv[j]
+                if a == "--":
+                    j += 1
+                    break
+                if a.startswith("-"):
+                    changes.append("env " + a)
+                    # Short options cluster (-iC DIR, -CDIR); long ones take
+                    # =VALUE and any unique prefix (--ch=DIR), as getopt does.
+                    opt, val = None, None
+                    if a.startswith("--"):
+                        k, eq, v = a[2:].partition("=")
+                        for name, short in ENV_LONG:
+                            if len(k) >= 1 and name.startswith(k):
+                                opt, val = short, (v if eq else None)
+                                break
+                    else:
+                        for c_i, c in enumerate(a[1:], 1):
+                            if c in "uCSa":
+                                opt, val = c, a[c_i + 1 :] or None
+                                break
+                    j += 1
+                    if opt in ("u", "C", "S", "a") and val is None:
+                        val = argv[j] if j < n else ""
+                        j += 1
+                    if opt == "S":
+                        return [], " ".join([val, *argv[j:]]), changes, chdir
+                    if opt == "C":
+                        chdir = val
+                else:
+                    changes.append(a.split("=", 1)[0])
+                    j += 1
+            i = j
+        elif base == "uv" and argv[i + 1 : i + 2] == ["run"]:
+            i = skip(i + 2, UV_RUN_VALUED)
+            if i < n and argv[i].endswith(".py"):
+                return ["python3"] + argv[i:], None, changes, chdir
+        elif base == "timeout":
+            i = skip(i + 1, ("-s", "-k", "--signal", "--kill-after")) + 1
+        elif base == "watch":  # its command runs through sh -c, or as is with -x
+            j = skip(i + 1, ("-n", "--interval", "-q", "--equexit"))
+            if {"-x", "--exec"} & set(argv[i + 1 : j]):
+                i = j
+                continue
+            return [], " ".join(argv[j:]), changes, chdir
+        elif base == "parallel":  # the command before ::: runs through a shell
+            j = skip(i + 1, PARALLEL_VALUED)
+            rest = argv[j:]
+            end = next(
+                (k for k, a in enumerate(rest) if a.startswith(":::")), len(rest)
+            )
+            text = PLACEHOLDER.sub("$__arg", " ".join(rest[:end]))
+            return [], text, changes, chdir
+        elif base in WRAPPERS:
+            if base in ("sudo", "doas"):
+                changes.append(base)
+            i = skip(i + 1, WRAPPERS[base].split())
+        else:
+            break
+    return argv[i:], None, changes, chdir
+
+
+def note_env(run, ctx):
+    """Remember an environment change a later canonical call would inherit."""
+    name, args = os.path.basename(run[0]), run[1:]
+    if name == "set":
+        if "allexport" in args or any(re.fullmatch(r"-\w*a\w*", a) for a in args):
+            ctx.exported.append("set -a")
+        return
+    opts = "".join(a[1:] for a in args if a.startswith("-"))
+    if name != "export" and "x" not in opts or name == "export" and "n" in opts:
+        return
+    if "f" in opts:
+        ctx.exported.append(f"{name} -f")
+    names = [a.split("=", 1)[0].rstrip("+") for a in args if not a.startswith("-")]
+    ctx.exported += [x for x in names if x not in CLEAN_ENV]
+
+
+def interpreter(run, lang, stdin, env, ctx, cwd, depth, via=""):
+    """Read what a shell or interpreter runs: inline code, its script file, or
+    the program it takes on stdin. via: what a wrapper adds to its arguments."""
+    spec, kind = LANGS[lang], "shell" if lang == "shell" else "code"
+    codes, flag_c, from_stdin, inplace, i = [], False, False, False, 1
+    while i < len(run):
+        a = run[i]
+        if a == "--":
+            i += 1
+            break
+        if a == "-":
+            from_stdin = True
+            break
+        if a.startswith("--"):
+            opt, eq, val = a.partition("=")
+            role = LONG.get(lang, {}).get(opt)
+            if role == "code":
+                codes.append(val if eq else " ".join(run[i + 1 : i + 2]))
+            i += 1 if eq or not role else 2
+            continue
+        if len(a) < 2 or not (a[0] == "-" or a[0] == "+" and lang == "shell"):
+            break
+        i, j, code_next = i + 1, 1, False
+        while j < len(a):
+            ch, rest = a[j], a[j + 1 :]
+            if ch in spec.get("code", ""):
+                if lang == "shell":
+                    flag_c = True
+                elif spec.get("attached") and rest:
+                    codes.append(rest)
+                    break
+                elif spec.get("attached"):
+                    code_next = True
+                    break
+                else:
+                    code_next = True
+            elif ch in spec.get("module", "") or ch in spec.get("noexec", ""):
+                return
+            elif ch in spec.get("stdin", ""):
+                from_stdin = True
+            elif ch in spec.get("valued", ""):
+                i += 0 if rest else 1
+                break
+            elif ch in spec.get("rest", ""):
+                inplace = inplace or lang == "perl" and ch == "i"
+                break
+            elif ch in spec.get("digits", ""):
+                j += 1 + len(re.match(r"x[0-9a-fA-F]+|[0-7]*", rest).group())
+                continue
+            j += 1
+        if code_next:
+            codes.append(" ".join(run[i : i + 1]))
+            i += 1
+        if codes and lang == "python":  # -c ends python's own options
+            break
+    operands = run[i:]
+    if inplace:  # perl -i rewrites the files after its program
+        for f in operands[0 if codes else 1 :]:
+            note_written(f, ctx, cwd)
+    if flag_c:
+        codes.append(" ".join(operands[:1]))
+    for code in codes:
+        run_text(code, kind, ctx, cwd, depth)
+    if codes:
+        return
+    if operands and not from_stdin:
+        word = operands[0]
+        held = substitute(word, ctx, cwd) if VARIABLE.search(word) else None
+        for path in [word, *(held or ())]:
+            if (lang, os.path.splitext(path)[1]) in (
+                ("python", ".sh"),
+                ("shell", ".py"),
+            ):
+                held_as = "" if path == word else f" ({path})"
+                block("interpreter", f"{os.path.basename(run[0])} {word}{held_as}")
+        if lang == "shell":
+            review_record(word, operands[1:], ctx, cwd, via)
+        scan_file(word, kind, ctx, cwd, depth, env, run=True)
+    else:
+        if lang == "shell":  # the program on stdin may be gate.sh
+            label = f"{os.path.basename(run[0])} reading stdin"
+            review_record(
+                None,
+                operands[from_stdin and operands[:1] == ["-"] :],
+                ctx,
+                cwd,
+                via,
+                label,
+            )
+        feed(stdin, kind, os.path.basename(run[0]), ctx, cwd, depth)
+
+
+# A sleep operand as GNU sleep reads it (strtod, then a unit): leading blanks,
+# a +, a decimal or hex number, or infinity.
+SLEEP_ARG = re.compile(
+    r"\s*\+?(?:(0x(?:[0-9a-f]+(?:\.[0-9a-f]*)?|\.[0-9a-f]+)(?:p[-+]?\d+)?)"
+    r"|((?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?)|(inf(?:inity)?))([smhd]?)",
+    re.I,
+)
+SLEEP_UNIT = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def seconds(a):
+    """The seconds a sleep operand stands for, or None for no number."""
+    m = SLEEP_ARG.fullmatch(a)
+    if not m:
+        return None
+    hexa, dec, inf, unit = m.groups()
+    try:
+        n = float("inf") if inf else float.fromhex(hexa) if hexa else float(dec)
+    except OverflowError:  # 0x1p99999: past any float, so for good
+        n = float("inf")
+    return n * SLEEP_UNIT[unit.lower()]
+
+
+def long_sleep(run, ctx, cwd):
+    """A fixed wait of a minute or more in one call: GNU sleep adds its
+    operands, and the call adds its sleeps. A variable this call set counts at
+    its longest value; an operand only the shell knows, or an option, as 0. A
+    loop's body counts once."""
+    this = 0.0
+    for a in run[1:]:
+        if a == "--":
+            continue
+        values = substitute(a, ctx, cwd) if VARIABLE.search(a) else [a]
+        this += max(seconds(v) or 0.0 for v in values or [""])
+    ctx.slept += this
+    if ctx.slept >= 60:
+        more = "" if ctx.slept == this else f" ({ctx.slept:g} s in this call)"
+        block("sleep", " ".join(["sleep", *run[1:]]) + more)
+
+
+def feed(stdin, kind, name, ctx, cwd, depth):
+    """The program a shell or interpreter reads from stdin."""
+    if stdin is None:
+        return
+    how, what = stdin
+    if how == "text":
+        run_text(what, kind, ctx, cwd, depth)
+    elif how == "files":
+        for raw in what:
+            scan_file(raw, kind, ctx, cwd, depth)
+    elif depth == 0:
+        block("exec-unreadable", f"the program {name} reads from {what}")
+
+
+def output(name, args, stdin):
+    """What echo, printf or cat write to a pipe: (kind, what) or None."""
+    if name == "echo":
+        while args and re.fullmatch(r"-[neE]+", args[0]):
+            args = args[1:]
+        return "text", " ".join(args).replace("\\n", "\n")
+    if name == "printf":
+        if not args or args[0] == "-v":
+            return None
+        rest = list(args[1:])
+        text = re.sub(
+            r"%%|%[-+ #0-9.]*[a-zA-Z]",
+            lambda m: "%" if m.group() == "%%" else (rest.pop(0) if rest else ""),
+            args[0],
+        )
+        text += "".join(" " + r for r in rest)
+        return "text", text.replace("\\n", "\n").replace("\\t", "\t")
+    files = [a for a in args if a == "-" or not a.startswith("-")]
+    if not files or files == ["-"]:
+        return stdin
+    return "files", [f for f in files if f != "-"]
+
+
+def check_push(args, ctx, cwd, gargs, send=False):
+    """git push, or git send-pack (send), judged by the branches it updates on
+    the remote it names."""
+    pos, every, remote, i = [], False, None, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            pos += args[i + 1 :]
+            break
+        if a in ("-o", "--push-option", "--receive-pack", "--exec", "--repo"):
+            if a == "--repo" and i + 1 < len(args):
+                remote = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--repo="):
+            remote = a[len("--repo=") :]
+        elif a in ("--all", "--mirror", "--branches") or send and a == "--stdin":
+            every = True
+        elif not a.startswith("-"):
+            pos.append(a)
+        i += 1
+    if pos:
+        remote, specs = pos[0], pos[1:]
+    else:
+        specs = []
+    if any(PUSH_POOL.search(a) for a in args):
+        block("push-pool", "a push naming pool/ or AGit refs")
+    if remote and URLISH.search(remote):
+        url = remote
+    else:
+        if not cwd:
+            unsure("the working directory is unknown")
+        remote = remote or push_remote(cwd, gargs)
+        url = ctx.remotes.get((cwd, remote)) or git(
+            cwd, gargs, "remote", "get-url", "--push", remote
+        )
+        if not url:
+            unsure(f"no remote {remote!r} in {cwd}")
+    m = FORGE.search(url)
+    if not m:
+        return  # another forge
+    owner, repo = m.group(1).lower(), m.group(2)
+    if owner == "pool":
+        block("push-pool", f"a push to {url}")
+    if not (LITERAL.fullmatch(owner) and LITERAL.fullmatch(repo)):
+        unsure(f"{url} is named by a variable")
+    if any(VARIABLE.search(s) for s in specs):
+        unsure("the pushed branch is held in a variable")
+    # A pattern or a matching push (":", send-pack without refs, push.default
+    # matching) is judged like --all, by every local branch.
+    every = every or any("*" in s or s.lstrip("+") == ":" for s in specs)
+    dst = None
+    if not every and not specs:
+        dst = None if send else push_branch(cwd, gargs, remote)
+        every = send or dst == "*"
+    if every:
+        out = git(cwd, gargs, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+        if out is None:
+            unsure("cannot list the local branches")
+        dsts = set(out.split())
+    elif specs:
+        dsts = {destination(s, cwd, gargs) for s in specs}
+    else:
+        dsts = {dst}
+    if None in dsts:
+        unsure("cannot tell which branch it updates")
+    for pr in open_pool_prs(ctx, repo):
+        head = pr.get("head") or {}
+        login = ((head.get("repo") or {}).get("owner") or {}).get("login") or ""
+        if login.lower() == owner and head.get("ref") in dsts:
+            block(
+                "push-pr-head",
+                f"{owner}:{head.get('ref')} heads open PR pool/{repo}#{pr.get('number')}",
+            )
+    # Last, so a push the pool rules refuse keeps its reason.
+    if HTTPS.match(url):
+        block(
+            "push-https", f"a push to {url if url == remote else f'{remote} ({url})'}"
+        )
+
+
+def current_branch(cwd, gargs):
+    return git(cwd, gargs, "symbolic-ref", "--short", "-q", "HEAD") if cwd else None
+
+
+def destination(spec, cwd, gargs):
+    s = spec.lstrip("+")
+    dst = s.split(":", 1)[1] if ":" in s else s
+    if dst in ("", "HEAD", "@"):
+        return current_branch(cwd, gargs)
+    return dst[len("refs/heads/") :] if dst.startswith("refs/heads/") else dst
+
+
+def push_remote(cwd, gargs):
+    cur = current_branch(cwd, gargs)
+    keys = [f"branch.{cur}.pushRemote"] if cur else []
+    keys += ["remote.pushDefault"] + ([f"branch.{cur}.remote"] if cur else [])
+    for key in keys:
+        val = git(cwd, gargs, "config", "--get", key)
+        if val:
+            return val
+    return "origin"
+
+
+def push_branch(cwd, gargs, remote):
+    """The remote branch a push without a refspec updates, "*" for every
+    matching one, or None."""
+    if git(cwd, gargs, "config", "--get-all", f"remote.{remote}.push"):
+        return None  # configured refspecs: not worth second-guessing
+    mode = git(cwd, gargs, "config", "--get", "push.default") or "simple"
+    if mode == "matching":
+        return "*"
+    out = git(
+        cwd, gargs, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{push}"
+    )
+    if out and out.startswith(remote + "/"):
+        return out[len(remote) + 1 :]
+    # @{push} needs the remote-tracking ref; a fresh clone has none.
+    cur = current_branch(cwd, gargs)
+    if cur and mode in ("upstream", "tracking"):
+        merge = git(cwd, gargs, "config", "--get", f"branch.{cur}.merge")
+        if merge:
+            return (
+                merge[len("refs/heads/") :]
+                if merge.startswith("refs/heads/")
+                else merge
+            )
+    return cur
+
+
+def open_pool_prs(ctx, repo):
+    """Open PRs of pool/<repo>; a 404 means there is no such pool repository.
+    Any other failure refuses: an empty answer must not read as "no PR". The
+    lookups of one call share NET_BUDGET, and one still running when it is
+    spent refuses too, before the hook's timeout lets the call run unjudged."""
+    import threading
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    if repo in ctx.prs:
+        return ctx.prs[repo]
+    stub = os.environ.get("PR_GUARD_PULLS_DIR")
+    got = {}
+
+    def fetch():
+        try:
+            if stub:
+                path = os.path.join(stub, repo + ".json")
+                got["data"] = []
+                if os.path.exists(path):
+                    with open(path, encoding="utf-8") as fh:
+                        got["data"] = json.load(fh)
+            else:
+                url = f"{GITEA}/repos/pool/{urllib.parse.quote(repo)}/pulls?state=open&limit=50"
+                try:
+                    with urllib.request.urlopen(url, timeout=15) as r:
+                        got["data"] = json.load(r)
+                except urllib.error.HTTPError as e:
+                    if e.code != 404:
+                        raise
+                    got["data"] = []
+        except Exception as e:  # raised again in the caller's thread
+            got["error"] = e
+
+    worker = threading.Thread(target=fetch, daemon=True)
+    worker.start()
+    worker.join(max(0.0, ctx.deadline - time.monotonic()))
+    if worker.is_alive():
+        unsure(f"the open-PR lookups of this call ran past {NET_BUDGET} s")
+    err = got.get("error")
+    if isinstance(err, (OSError, ValueError)):
+        unsure(f"could not list the open PRs of pool/{repo}: {err}")
+    if err is not None:
+        raise err
+    data = got["data"]
+    if not isinstance(data, list) or not all(isinstance(p, dict) for p in data):
+        unsure(f"unexpected open-PR list for pool/{repo}")
+    if len(data) >= 50:
+        unsure(f"pool/{repo} has 50+ open PRs, the lookup cannot rule this branch out")
+    ctx.prs[repo] = data
+    return data
+
+
+def git_command(argv, ctx, cwd, lit=None):
+    """lit: argv as literal-aware text, or None."""
+    i, gargs = 1, []
+    while i < len(argv) and argv[i].startswith("-"):
+        a = argv[i]
+        if a == "-C" and i + 1 < len(argv):
+            cwd = resolve(argv[i + 1], cwd)[0]
+            i += 2
+        elif a in ("-c", "--git-dir", "--work-tree", "--namespace", "--config-env"):
+            gargs += argv[i : i + 2]
+            i += 2
+        else:
+            if a.startswith(
+                ("--git-dir=", "--work-tree=", "--namespace=", "--config-env=")
+            ):
+                gargs.append(a)
+            i += 1
+    sub = argv[i:]
+    if sub[:1] in (["push"], ["send-pack"]):
+        check_push(sub[1:], ctx, cwd, gargs, send=sub[0] == "send-pack")
+    elif sub[:1] == ["obs"]:
+        ln = " ".join(["git-obs", *sub[1:]])
+        tool_rules(ln, ctx, cwd)
+        lsub = lit[i + 1 :] if lit and len(lit) == len(argv) else None
+        pr_message("git-obs", sub[1:], lsub, ctx, cwd)
+        wide = " ".join([ln, *expansions(sub[1:], ctx, cwd)])
+        api_rules(wide, ctx, cwd, reads=git_obs_reads(sub[1:]))
+        comment_rules("git-obs", ["git-obs", *sub[1:]], ctx, cwd)
+    elif sub[:1] == ["remote"] and sub[1:2] in (["add"], ["set-url"]):
+        pos, j = [], 2
+        while j < len(sub):
+            if sub[j] in ("-t", "-m"):
+                j += 2
+                continue
+            if not sub[j].startswith("-"):
+                pos.append(sub[j])
+            j += 1
+        if len(pos) >= 2:
+            ctx.remotes[(cwd, pos[0])] = pos[1]
+    return gargs, sub
+
+
+def git_secrets(argv, gargs, sub, ctx, cwd):
+    """git printing a stored credential, handed an askpass program or a
+    credential header by its config, or a password in a URL; git obs as
+    git-obs."""
+    if sub[:1] == ["obs"]:
+        git_obs_secret(sub[1:])
+        if git_obs_rest(sub[1:])[:1] == ["api"]:
+            wide = " ".join(["git-obs", *sub[1:], *expansions(sub[1:], ctx, cwd)])
+            auth_rules("git-obs api", sub[1:], wide)
+    if sub[:2] == ["credential", "fill"]:
+        block("secret-git", "git credential fill")
+    if sub[:1] and sub[0].startswith("credential-") and "get" in sub[1:]:
+        block("secret-git", f"git {sub[0]} get")
+    cfg = [a for a in sub[1:] if a[:1] != "-"] if sub[:1] == ["config"] else []
+    setting = cfg[:1] == ["set"]
+    cfg = cfg[1:] if setting else cfg
+    for a in [*gargs, *cfg[:1]]:
+        m = re.search(r"(?i)core\.askpass", a)
+        if m and (a in gargs or setting or len(cfg) > 1):
+            block("askpass", f"setting {m.group()}")
+        m = AUTH_HEADER.search(a) if a in gargs else None
+        if m:
+            block("auth-header", f"git with a credential header ({m.group(1)})")
+    if any(USERINFO.search(a) for a in argv):
+        block("auth-url", "git with a password in a URL")
+
+
+def git_obs_rest(args):
+    """git-obs arguments past its global options: its subcommand onwards."""
+    i = 0
+    while i < len(args) and args[i][:1] == "-":
+        a = long_prefix(args[i], GIT_OBS_LONG)
+        i += 2 if a in ("-G", "--gitea-login", "--gitea-config") else 1
+    return args[i:]
+
+
+def git_obs_secret(args):
+    """git-obs printing its logins: login list, gitcredentials-helper."""
+    pos = [a for a in git_obs_rest(args) if a[:1] != "-"]
+    if pos[:2] == ["login", "list"]:
+        block("secret-git-obs", "git-obs login list")
+    if "gitcredentials-helper" in pos:
+        block("secret-git-obs", "git-obs gitcredentials-helper")
+
+
+def git_obs_reads(args):
+    """Whether git-obs arguments provably only read: an api call that does, or
+    another subcommand, which sends no request of its own making."""
+    i = 0
+    while i < len(args) and args[i][:1] == "-":
+        a = long_prefix(args[i], GIT_OBS_LONG)
+        i += 2 if a in ("-G", "--gitea-login", "--gitea-config") else 1
+    return args[i : i + 1] != ["api"] or only_reads("git-obs", args, GIT_OBS_LONG)
+
+
+def guess(run, ctx, cwd, own=False):
+    """A command whose name only the shell knows, judged as each guarded tool
+    -- as osc only when it could be osc: a value naming osc, or none known and
+    a variable named for it. A refusal names the variable. own: a command the
+    agent runs, which the credential rules judge too."""
+    rest = run[1:]
+    try:
+        tool_rules(" ".join(["tea", *rest]), ctx, cwd, argv=True)
+        tool_rules(" ".join(["git-obs", *rest]), ctx, cwd)
+        api_rules(" ".join(["curl", *rest]), ctx, cwd, reads=False)
+        gparts = None
+        creds = rest[:1] in (["credential"], ["config"], ["-c"]) or (
+            rest[:1] and rest[0].startswith("credential-")
+        )
+        if rest[:1] in (["push"], ["obs"]) or own and creds:
+            gparts = git_command(["git", *rest], ctx, cwd)
+        held = substitute(run[0], ctx, cwd)
+        osc = (
+            held is None
+            and re.search(r"(?i)osc", run[0])
+            or any(os.path.basename(h) == "osc" for h in held or ())
+        )
+        if osc:
+            request_args(["osc", *rest], ctx, cwd)
+            request_message(["osc", *rest], None, ctx, cwd)
+            osc_writes(["osc", *rest], ctx, cwd)
+            request_target(["osc", *rest], ctx, cwd)
+            request_link(["osc", *rest], ctx, cwd)
+            request_cleanup(["osc", *rest], ctx, cwd)
+            osc_deletes(["osc", *rest], ctx, cwd)
+        if own:
+            for tool in ("gh", "tea", "git-obs", "secret-tool"):
+                secret_rules(tool, [tool, *rest], ctx, cwd)
+            if osc:
+                osc_secret(["osc", *rest], ctx, cwd)
+            if gparts:
+                git_secrets(["git", *rest], *gparts, ctx, cwd)
+            auth_rules("curl", rest, " ".join(rest))
+            if not re.search(r"(?i)osc|obs|tea", run[0]):
+                direct_api("curl", " ".join(rest))
+    except Blocked as b:
+        raise Blocked(b.rule, b.kind, f"{run[0]}: {b.detail}") from None
+
+
+def command_words(word, ctx, cwd, depth):
+    """The argv spellings of a command held in several words -- a variable
+    whose value has spaces, an array ${A[@]} or ${A[*]} -- or None when the
+    word is not one. On the call's own command line "$@", "$*" and an unknown
+    array are refused, outside a function that passes them on; a script's
+    are its arguments, which the guard does not follow."""
+    arr = ARRAY_ALL.fullmatch(word)
+    if arr and arr.group(1):
+        vals = ctx.values.get(arr.group(1))
+        if vals:
+            return [v.strip("()").split() for v in vals]
+    if arr and not ctx.in_function and depth == 0:
+        block("command-unknown", word)
+    if arr:
+        return [[]]
+    vals = substitute(word, ctx, cwd)
+    if vals and any(len(v.split()) > 1 for v in vals):
+        return [v.split() for v in vals]
+    return None
+
+
+def asks_help(args):
+    """Whether a tool's arguments ask for its help, which acts on nothing: -h
+    or --help before any "--", and not the value of the option before it."""
+    for i, a in enumerate(args):
+        if a == "--":
+            return False
+        prev = args[i - 1] if i else ""
+        if a in ("-h", "--help") and (not prev.startswith("-") or "=" in prev):
+            return True
+    return False
+
+
+def parse_opts(args, valued, long_valued=()):
+    """(options as (flag, value), operands) of a getopt-style argument list;
+    valued: the short options that take a value, long_valued the long ones."""
+    opts, pos, i = [], [], 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            pos += args[i:]
+            break
+        if a.startswith("--"):
+            k, eq, v = a.partition("=")
+            if not eq and k in long_valued and i < len(args):
+                v, i = args[i], i + 1
+            opts.append((k, v))
+        elif a.startswith("-") and len(a) > 1:
+            for j in range(1, len(a)):
+                if a[j] in valued:
+                    v = a[j + 1 :]
+                    if not v and i < len(args):
+                        v, i = args[i], i + 1
+                    opts.append(("-" + a[j], v))
+                    break
+                opts.append(("-" + a[j], ""))
+        else:
+            pos.append(a)
+    return opts, pos
+
+
+def note_writes(name, args, ctx, cwd):
+    """Remember the files tee, cp, mv, install, sed -i and curl -o/-O write."""
+    dests = []
+    if name == "tee":
+        dests = parse_opts(args, "")[1]
+    elif name in COPY_VALUED:
+        opts, pos = parse_opts(args, COPY_VALUED[name], COPY_LONG)
+        flags = dict(opts)
+        into = flags.get("-t", flags.get("--target-directory"))
+        if name == "install" and ("-d" in flags or "--directory" in flags):
+            dests = pos
+        elif into is None and len(pos) >= 2:
+            pos, into = pos[:-1], pos[-1]
+            whole = "-T" in flags or "--no-target-directory" in flags
+            isdir = any(map(os.path.isdir, locate(into, ctx, cwd)[0] or ()))
+            if whole or not (len(pos) > 1 or into.endswith("/") or isdir):
+                pos, dests = [], [into]
+        if into is not None:
+            dests += [os.path.join(into, os.path.basename(s.rstrip("/"))) for s in pos]
+    elif name == "sed":
+        opts, pos = parse_opts(args, "efl", ("--expression", "--file", "--line-length"))
+        flags = {k for k, _ in opts}
+        if flags & {"-i", "--in-place"}:
+            given = flags & {"-e", "-f", "--expression", "--file"}
+            dests = pos if given else pos[1:]
+    elif name == "curl":
+        import urllib.parse
+
+        opts, pos = parse_opts(args, CURL_VALUED, ("--output", "--output-dir"))
+        dests = [v for k, v in opts if k in ("-o", "--output") and v != "-"]
+        if {k for k, _ in opts} & {"-O", "--remote-name", "--remote-name-all"}:
+            dests += [
+                os.path.basename(urllib.parse.urlsplit(u).path)
+                for u in pos
+                if "://" in u
+            ]
+        into = [v for k, v in opts if k == "--output-dir"]
+        dests = [os.path.join(into[-1], d) if into else d for d in dests if d]
+    for d in dests:
+        note_written(d, ctx, cwd)
+
+
+def checkout_units(top):
+    """The osc checkouts an rm of top deletes, top included: a package checkout
+    (.osc/_package) is one; a project checkout counts its packages, or itself
+    when it holds none (osc co PRJ PKG is one); plain directories are searched
+    two levels down."""
+
+    def osc(d):
+        return os.path.isdir(os.path.join(d, ".osc"))
+
+    def subdirs(d):
+        try:
+            with os.scandir(d) as it:
+                return sorted(
+                    e.path
+                    for e in it
+                    if e.is_dir(follow_symlinks=False) and e.name != ".osc"
+                )
+        except OSError:
+            return []
+
+    def unit(d):
+        if os.path.isfile(os.path.join(d, ".osc", "_package")):
+            return [d]
+        return [s for s in subdirs(d) if osc(s)] or [d]
+
+    if osc(top):
+        return unit(top)
+    found, level = [], [top]
+    for _ in range(2):
+        below = []
+        for d in level[:4096]:
+            for s in subdirs(d):
+                if osc(s):
+                    found += unit(s)
+                else:
+                    below.append(s)
+        level = below
+    return found
+
+
+# find's tests that narrow a -delete to the files they name.
+FIND_NAMED = {"-name", "-iname", "-path", "-ipath", "-wholename", "-regex", "-iregex"}
+
+
+def rm_checkouts(name, run, ctx, cwd):
+    """A recursive rm, or a find -delete with no name test, that deletes two or
+    more osc checkouts at once: siblings' work may live there. An operand only
+    the shell knows is not judged."""
+    args = run[1:]
+    if name == "find":
+        named = any(
+            a in FIND_NAMED and args[i + 1 : i + 2] not in (["*"], [])
+            for i, a in enumerate(args)
+        )
+        if "-delete" not in args or named:
+            return
+        while args and (args[0] in ("-H", "-L", "-P") or args[0].startswith("-O")):
+            args = args[1:]
+        k = next((i for i, a in enumerate(args) if a[:1] in "-(!),"), len(args))
+        operands = args[:k] or ["."]
+    else:
+        opts, operands = parse_opts(args, "")
+        if not {k for k, _ in opts} & {"-r", "-R", "--recursive"}:
+            return
+    units = []
+    for raw in operands:
+        for p in locate(raw, ctx, cwd)[0] or ():
+            if raw.endswith("/"):  # rm and find follow a symlink named so
+                p = os.path.realpath(p)
+            elif os.path.islink(p):
+                continue
+            if os.path.isdir(p):
+                units += [u for u in checkout_units(p) if u not in units]
+    if len(units) > 1:
+        top = os.path.commonpath(units)
+        names = [os.path.relpath(u, top) for u in units]
+        few = ", ".join(names[:3]) + (", …" if len(names) > 3 else "")
+        ask(
+            ctx,
+            "rm-checkouts",
+            f"{name} deletes {len(units)} osc checkouts at once: {few}",
+        )
+
+
+def git_dir(raw, ctx, cwd):
+    """Whether raw names a git directory: one named *.git, one holding HEAD and
+    objects/, or one only the shell can place."""
+    for p in substitute(raw, ctx, cwd) or [None]:
+        path = None if p is None else resolve(p.rstrip("/") or "/", cwd)[0]
+        if path is None or path.endswith(".git"):
+            return True
+        if os.path.isfile(os.path.join(path, "HEAD")) and os.path.isdir(
+            os.path.join(path, "objects")
+        ):
+            return True
+    return False
+
+
+def in_stamps(text, ctx, cwd):
+    """Whether text names a target-gate component directly under a git
+    directory; with no path before it, that directory is cwd."""
+    for m in STAMP_WORD.finditer(text):
+        s = m.start()
+        if s and text[s - 1] == "/":
+            if git_dir(PARENT.search(text[: s - 1]).group(), ctx, cwd):
+                return True
+        elif not cwd or git_dir(cwd, ctx, cwd):
+            return True
+    return False
+
+
+def held(word, ctx):
+    """The values this call gave the variables a word names, and theirs, as
+    written: a value built on a substitution never expands, yet names a path.
+    Each variable is visited once, so a value that doubles stays cheap."""
+    out, todo, seen = [], [word], set()
+    while todo:
+        for a, b in VAR_REF.findall(todo.pop()):
+            name = a or b
+            if name not in seen:
+                seen.add(name)
+                vals = ctx.values.get(name) or []
+                out += vals
+                todo += vals
+    return out
+
+
+def stamp_word(word, ctx, cwd, path=False):
+    """Whether a word names the stamp directory -- as written, by what its
+    variables were given, once expanded, and (path) once placed in cwd, which
+    may itself lie inside it."""
+    words = [word, *held(word, ctx), *(substitute(word, ctx, cwd) or ())]
+    if path:
+        words += locate(word, ctx, cwd)[0] or ()
+    return any(in_stamps(w, ctx, cwd) for w in words)
+
+
+def pinned_gate(name, run, ctx, cwd):
+    """Whether this runs the skill's target-gate.sh by path while it matches
+    the pinned ref."""
+    word = run[0] if name == "target-gate.sh" else ""
+    if name in SHELLS and len(run) > 1:
+        word = run[1]
+    if "/" not in word or os.path.basename(word) != "target-gate.sh":
+        return False
+    paths = locate(word, ctx, cwd)[0] or []
+    real = os.path.realpath(paths[0]) if len(paths) == 1 else ""
+    skill = in_skill(real)
+    return bool(skill) and canonical(real, skill, ctx)
+
+
+def reads_only(name, run, ctx, cwd):
+    """A look that writes no file: a read-only tool; sed without -i, and awk,
+    whose program and options name no stamp; python -m json.tool without an
+    output file."""
+    args = run[1:]
+    if name in READ_ONLY:
+        return not (name == "find" and FIND_ACTS.intersection(run))
+    if name in ("sed", "awk", "gawk", "mawk"):
+        valued, long_valued = SED_OPTS if name == "sed" else AWK_OPTS
+        opts, pos = parse_opts(args, valued, long_valued)
+        flags = {k for k, _ in opts}
+        if name == "sed" and flags & {"-i", "--in-place"}:
+            return False
+        given = flags & (SED_PROGRAM if name == "sed" else AWK_PROGRAM)
+        files = set(pos[0 if given else 1 :])
+        return not any(stamp_word(a, ctx, cwd) for a in args if a not in files)
+    if PYTHON.fullmatch(name) and args[:1] in (["-m"], ["-mjson.tool"]):
+        rest = args[1:] if args[0] == "-mjson.tool" else args[2:]
+        if args[0] == "-m" and args[1:2] != ["json.tool"]:
+            return False
+        return len(parse_opts(rest, "", ("--indent",))[1]) <= 1
+    return False
+
+
+# The working directory after a cd whose target the guard cannot place but
+# which names the stamp directory: in_stamps() reads it as inside one.
+STAMP_CWD = "/unresolved.git/target-gate"
+
+
+class Dirs(str):
+    """The working directory after a cd to each word of a loop: dirs holds
+    them, and the string itself names no directory, so a rule that reads it as
+    a path finds nothing there and refuses."""
+
+    def __new__(cls, dirs):
+        self = super().__new__(cls, "/(one of several directories)")
+        self.dirs = dirs
+        return self
+
+
+def enter(target, ctx, cwd):
+    """The directory cd/pushd/env -C moves to -- expanded from what the call
+    set, Dirs for several -- or STAMP_CWD when only the shell can place it and
+    it names the stamp directory."""
+    new = resolve(target, cwd)[0]
+    if new is None and not isinstance(cwd, Dirs):
+        places = []
+        for w in substitute(target, ctx, cwd) or ():
+            places += locate(w, ctx, cwd)[0] or [None]  # a glob as the shell expands it
+        if places and None not in places:
+            if any(stamp_word(p, ctx, cwd, path=True) for p in places):
+                return STAMP_CWD
+            new = places[0] if len(set(places)) == 1 else Dirs(sorted(set(places)))
+    if new is None and stamp_word(target, ctx, cwd):
+        return STAMP_CWD
+    return new
+
+
+def touches_stamp(name, run, outs, ctx, cwd):
+    """A command that names the stamp directory, or runs inside it -- but the
+    pinned target-gate.sh, a look that writes no file, and git's arguments,
+    which are text (branch names, messages, grep patterns)."""
+    if pinned_gate(name, run, ctx, cwd):
+        return False
+    if all(t == "/dev/null" for t in outs) and reads_only(name, run, ctx, cwd):
+        return False
+    if cwd and in_stamps(cwd, ctx, cwd):
+        return True
+    if name == "git":
+        return False
+    declared = name in DECLARE
+    return any(
+        stamp_word(a, ctx, cwd) for a in run if not (declared and ASSIGN.match(a))
+    )
+
+
+def one_command(argv, redirs, stdin, ctx, cwd, depth, lit=(None, None)):
+    """Check one simple command: (the working directory after it, what it
+    writes to a pipe). lit: its argv and stdin as literal-aware text."""
+    ctx.seq += 1
+    if argv[:1] == ["coproc"]:  # it runs in the background
+        ctx.bg.add(ctx.seq)
+        ctx.any_bg = True
+    if argv[:1] in (["for"], ["while"], ["until"], ["select"]):  # for note_write
+        ctx.loops.append(ctx.seq)
+    elif argv[:1] == ["done"] and ctx.loops:
+        ctx.loops.pop()
+    outs = [
+        t
+        for op, t in redirs
+        if ">" in op and not (op.endswith("&") and (t.isdigit() or t == "-"))
+    ]
+    for t in outs:
+        if stamp_word(t, ctx, cwd, path=True):
+            block("stamp", "a redirection into the stamp directory")
+        note_written(t, ctx, cwd)
+        if t != "/dev/null":
+            where = target_path(t, cwd)
+            note_write(ctx, f"a redirection to {t}", where and (where,))
+    for op, t in redirs:  # the credential rules judge the agent's own commands
+        if depth == 0 and op.lstrip("0123456789") in ("<", "<>"):
+            for w in braced([t], "a redirection"):
+                cred_word(w, "a redirection", False, ctx, cwd)
+    run, shell, env, chdir = unwrap(argv)
+    if not run and shell is None:
+        # Assignments alone: the shell keeps them, and its children see those
+        # of names already in the environment.
+        for a, la in zip(argv, lit[0] or [None] * len(argv)):
+            k = assign(a, la, ctx) if ASSIGN.match(a) else None
+            if k and k not in CLEAN_ENV and (k in os.environ or SENSITIVE.fullmatch(k)):
+                ctx.exported.append(k)
+        if depth == 0:
+            assignment_rules(argv)
+        return cwd, None
+    here = cwd if chdir is None else enter(chdir, ctx, cwd)
+    if shell is not None:
+        shell_pass(shell, ctx, here, depth)
+        if depth == 0:
+            assignment_rules(argv)
+            before, own = wrapper_words(argv, shell)
+            for w in braced(before, os.path.basename(before[0]) if before else ""):
+                cred_word(w, os.path.basename(before[0]), False, ctx, here)
+            for w in braced(own, "parallel"):
+                cred_word(w, "parallel", False, ctx, here)
+        return cwd, ("unknown", "a wrapper")
+    lrun = (
+        lit[0][len(argv) - len(run) :] if lit[0] and len(lit[0]) == len(argv) else None
+    )
+    if lrun and VARIABLE.search(run[0]) and not VARIABLE.search(lrun[0]):
+        run = [lrun[0].translate(UNLITERAL), *run[1:]]  # a quoted or $'...' name
+    name = os.path.basename(run[0])
+    if VARIABLE.search(name):
+        words = command_words(run[0], ctx, here, depth)
+        if words is not None:  # a command held in words: judge each spelling
+            # An array that appends to itself (CURL=("${CURL[@]}" -4)) spells
+            # its own name first: that spelling is each other one plus what it adds.
+            base = [w for w in words if w and w[0] != run[0]]
+            own = [w[1:] for w in words if w and w[0] == run[0]]
+            for w in base + [[*b, *o] for o in own for b in base or [[]]]:
+                if w:
+                    one_command([*w, *run[1:]], redirs, stdin, ctx, here, depth)
+            return cwd, ("unknown", name)
+        tools = {os.path.basename(h) for h in substitute(run[0], ctx, here) or ()}
+        if not tools and "/" not in run[0] and starts_tool(run[1:]):
+            ask(
+                ctx,
+                "eval-dynamic",
+                f"{shown(run[0])} {shown(run[1])[:40]}: the command word is unknown",
+            )
+        if len(tools) == 1 and tools <= GUARDED | RUNNERS:  # held in a variable
+            name = tools.pop()
+            run = [name, *run[1:]]
+    if name in ctx.wrappers and len(run) > 1:  # a function that runs "$@"
+        one_command(run[1:], redirs, stdin, ctx, here, depth)
+    note_writer(name, run, ctx, here)
+    for k in shell_assigned(name, run[1:]):
+        ctx.values[k] = ctx.lit_values[k] = []  # a value only the shell knows
+    out = ("unknown", name)
+    joined = " ".join(run)
+    if name in ("cd", "pushd"):
+        rest = [a for a in run[1:] if a not in ("-L", "-P", "-e", "-@")]
+        new = None if rest[:1] == ["-"] else enter(rest[0] if rest else "~", ctx, cwd)
+        return new, None
+    if name == "popd":
+        return None, None
+    if name == "for":
+        if run[2:3] == ["in"]:
+            ctx.values.setdefault(run[1], []).extend(run[3:])
+            words = lrun[3:] if lrun else [None] * len(run[3:])
+            ctx.lit_values.setdefault(run[1], []).extend(words)
+        return cwd, None
+    if depth == 0:  # before a file is read as a program
+        credential_read(name, argv, run, ctx, here)
+    if touches_stamp(name, run, outs, ctx, here):
+        block("stamp", "a command touching the stamp directory")
+    note_writes(name, run[1:], ctx, here)
+    wrapped = argv[: len(argv) - len(run)]
+    via = (
+        "the arguments xargs adds" if "xargs" in map(os.path.basename, wrapped) else ""
+    )
+    if name in ("source", ".") and len(run) > 1:
+        review_record(run[1], run[2:], ctx, here, via)
+    elif name not in SHELLS:
+        review_record(run[0], run[1:], ctx, here, via)
+    gparts = None
+    if name in DECLARE or name == "set":
+        note_env(run, ctx)
+        for k, a in enumerate(run[1:] if name in DECLARE else (), 1):
+            if ASSIGN.match(a) and "-n" not in {
+                o for o, _ in parse_opts(run[1:], "")[0]
+            }:
+                assign(a, lrun[k] if lrun else None, ctx)
+    elif VARIABLE.search(name):
+        # A path held in a variable is read; a command name, judged as a tool.
+        held = substitute(run[0], ctx, here)
+        if held and all("/" in h for h in held):
+            scan_file(run[0], "auto", ctx, here, depth, env, run=True)
+        else:
+            guess(run, ctx, here, depth == 0)
+    elif name in ("tea", "git-obs", "git", "osc") and asks_help(run[1:]):
+        pass
+    elif name == "tea":
+        args = [TEA_LONG.sub("--", a) for a in run[1:]]  # Go takes -repo as --repo
+        wide = " ".join(["tea", *args, *expansions(args, ctx, here)])
+        reads = only_reads("tea", args)
+        tea_api_merge(wide, ctx, here, reads)
+        tool_rules(" ".join(["tea", *args]), ctx, here, argv=True)
+        largs = lrun and [TEA_LONG.sub("--", a) for a in lrun[1:]]
+        pr_message("tea", args, largs, ctx, here)
+        if TEA_API.search(wide) and "pulls" in wide and not reads:
+            if pool_or_unknown(wide, ctx, here, cmd=True):
+                block("create-tea-api", "a tea api write to pool pulls")
+        comment_rules("tea", ["tea", *args], ctx, here)
+    elif name == "git-obs":
+        tool_rules(joined, ctx, here)
+        pr_message("git-obs", run[1:], lrun and lrun[1:], ctx, here)
+        wide = " ".join([joined, *expansions(run[1:], ctx, here)])
+        api_rules(wide, ctx, here, reads=git_obs_reads(run[1:]))
+        comment_rules("git-obs", run, ctx, here)
+    elif name == "git":
+        gparts = git_command(run, ctx, here, lrun)
+    elif name == "osc":
+        ctx.apiurl = osc_apiurl(run, ctx, here)
+        obs_prefetch(run, ctx, here)
+        wide = " ".join([joined, *expansions(run[1:], ctx, here)])
+        if osc_sub(run)[0] == "api" and REQUEST_CREATE.search(norm_urls(wide)):
+            block("request-api", "a request created through the API")
+        request_args(run, ctx, here)
+        request_message(run, (lrun, lit[1]), ctx, here)
+        osc_writes(run, ctx, here)
+        request_target(run, ctx, here)
+        request_link(run, ctx, here)
+        request_cleanup(run, ctx, here)
+        osc_deletes(run, ctx, here)
+        osc_prompt(run, stdin)
+        comment_rules("osc", run, ctx, here)
+        accept_forward(run, ctx, here)
+        gate_commit(run, ctx, here)
+        gate_submit(run, ctx, here)
+    elif name in HTTP_TOOLS:
+        # A URL held in a variable this call assigned is judged by its value.
+        held = [
+            v for k in re.findall(r"\$\{?(\w+)", joined) for v in ctx.values.get(k, ())
+        ]
+        text = " ".join([joined, *held, *expansions(run[1:], ctx, here)])
+        write = name in HTTPIE and httpie_writes(run)
+        reads = {"curl": curl_reads(run[1:]), "wget": wget_reads(run[1:])}
+        api_rules(text, ctx, here, write, reads.get(name, httpie_reads(run, stdin)))
+    elif name == "trap":  # its command runs in this shell when the call ends
+        ops = [k for k, a in enumerate(run) if k and a not in ("--", "-p", "-l", "-P")]
+        if len(ops) >= 2 and run[ops[0]] != "-":
+            k = ops[0]
+            for text in body_texts(
+                [run[k]], lrun and lrun[k : k + 1], "trap", ctx, here
+            ):
+                ctx.traps.append((text, here, depth))
+    elif name == "eval":
+        for text in body_texts(run[1:], lrun and lrun[1:], "eval", ctx, here):
+            run_text(text, "shell", ctx, here, depth)
+    elif name == "find":
+        find_exec(run, ctx, here, depth)
+        if depth == 0:
+            rm_checkouts(name, run, ctx, here)
+    elif name == "rm":
+        if depth == 0:  # the agent's own delete; a script's runs in its own state
+            rm_checkouts(name, run, ctx, here)
+    elif name in SHELLS:
+        interpreter(run, "shell", stdin, env, ctx, here, depth, via)
+    elif PYTHON.fullmatch(name):
+        interpreter(run, "python", stdin, env, ctx, here, depth)
+    elif name in ("node", "nodejs", "perl"):
+        interpreter(run, name.replace("nodejs", "node"), stdin, env, ctx, here, depth)
+    elif name == "sleep":
+        # The call's own wait: Monitor exists to wait, a background call holds
+        # nothing, and a script's backoff is the script's.
+        if depth == 0 and ctx.tool != "Monitor" and not ctx.background:
+            long_sleep(run, ctx, here)
+    elif name in ("source", ".") and len(run) > 1:
+        scan_file(run[1], "shell", ctx, here, depth)
+    elif "/" in run[0]:
+        scan_file(run[0], "auto", ctx, here, depth, env, run=True)
+    elif name in ("echo", "printf", "cat"):
+        out = output(name, run[1:], stdin)
+    if depth == 0:
+        credential_rules(name, argv, run, gparts, ctx, here)
+    if any(op in STDOUT or op in (">&", "1>&") and t != "1" for op, t in redirs):
+        out = None
+    return cwd, out
+
+
+def find_exec(run, ctx, cwd, depth):
+    """Judge each command find runs, a match's name ({}) held in a variable,
+    and the -dir ones run in a directory only find knows."""
+    i = 1
+    while i < len(run):
+        if run[i] not in FIND_EXEC:
+            i += 1
+            continue
+        end = next(
+            (j for j in range(i + 1, len(run)) if run[j] in (";", "+")), len(run)
+        )
+        argv = [PLACEHOLDER.sub("$__arg", a) for a in run[i + 1 : end]]
+        where = None if run[i].endswith("dir") else cwd
+        if argv:
+            one_command(argv, [], None, ctx, where, depth)
+        i = end + 1
+
+
+def function_bodies(items, ctx):
+    """{item index: +1 where a function body starts, -1 after it ends}; a
+    function whose body runs "$@", "$*" or "$1" as a command joins ctx.wrappers."""
+    marks = {}
+    for k, item in enumerate(items):
+        argv = item[0] if len(item) == 2 else []
+        name = argv[1] if argv[:1] == ["function"] and len(argv) > 1 else None
+        if name is None and len(argv) == 1 and items[k + 1 : k + 3] == ["(", ")"]:
+            name = argv[0]
+        if name is None:
+            continue
+        depth, j = 0, k + 1
+        while j < len(items):
+            words = items[j][0] if len(items[j]) == 2 else []
+            depth += words.count("{") - words.count("}")
+            head = [w for w in words if w not in KEYWORDS][:1]
+            if head and ARGS_RUN.fullmatch(head[0]):
+                ctx.wrappers.add(name)
+            if depth <= 0 and "}" in words:
+                break
+            j += 1
+        marks[k + 1] = marks.get(k + 1, 0) + 1
+        marks[j + 1] = marks.get(j + 1, 0) - 1
+    return marks
+
+
+def loop_assignments(items, lits):
+    """{index of a loop's first command: the assignments its body makes, as
+    (word, literal-aware word)}: a variable a loop assigns holds each of its
+    values at every point of the loop, the next iteration's included."""
+    starts, out = [], {}
+    for k, item in enumerate(items):
+        if len(item) != 2 or not item[0]:
+            continue
+        if item[0][0] in ("for", "while", "until", "select"):
+            starts.append(k)
+        elif item[0][0] == "done" and starts:
+            start = starts.pop()
+            found = out.setdefault(start, [])
+            for j in range(start, k):
+                if len(items[j]) != 2 or not items[j][0]:
+                    continue
+                argv, largv = items[j][0], (lits[j] or (None, None))[0]
+                run = unwrap(argv)[0]
+                name = os.path.basename(run[0]) if run else ""
+                words = argv[: len(argv) - len(run)] if run else argv
+                if name in DECLARE:
+                    words = [*words, *run[1:]]
+                lwords = largv and largv[: len(words)] if name not in DECLARE else None
+                for n, w in enumerate(words):
+                    if ASSIGN.match(w):
+                        found.append((w, lwords[n] if lwords else None))
+                for v in shell_assigned(name, run[1:]):
+                    found.append((v + "+=", None))  # unknown
+    return out
+
+
+def widen(word, lword, ctx):
+    """Give a variable a loop assigns every value it takes there too; one this
+    call did not set before, or appended to, becomes unknown."""
+    k, v = word.split("=", 1)
+    known = ctx.values.get(k.rstrip("+"))
+    if k.endswith("+") or not known:
+        ctx.values[k.rstrip("+")] = ctx.lit_values[k.rstrip("+")] = []
+        return
+    ctx.values[k] = known + [v]
+    ctx.lit_values[k] = (ctx.lit_values.get(k) or []) + [lword]
+
+
+def shell_pass(text, ctx, cwd, depth):
+    """Walk the simple commands of shell text, following cd, subshells, and
+    pipes into a shell or interpreter. Returns what it writes to stdout, as
+    literal-aware text: one output() per writer, in order."""
+    first = len(ctx.docs)
+    body = split_heredocs(text, ctx)
+    for doc, expands in ctx.docs[first:]:
+        if expands:
+            for inner in substitutions(doc, quotes=False)[1]:
+                shell_pass(inner, ctx, cwd, depth)
+    base = len(ctx.subs)
+    body = shell_read(body)[0]
+    lit = substitutions(body, base=base, lit=True)[0]
+    body, inners = substitutions(body, base=base)
+    ctx.subs += [None] * len(inners)
+    ctx.sub_bodies += inners
+    for k, inner in enumerate(inners):
+        ctx.subs[base + k] = shell_pass(inner, ctx, cwd, depth)
+    items = list(commands(arrays(tokenize(body))))
+    lits = list(commands(arrays(tokenize(lit))))
+    shape = [len(i) == 2 and (len(i[0]), len(i[1])) or i for i in items]
+    if shape != [len(i) == 2 and (len(i[0]), len(i[1])) or i for i in lits]:
+        lits = [None] * len(items)  # a literal $'...' split otherwise: all unknown
+    stack, out, piped, case, pattern = [], None, None, 0, False
+    writers, lpiped, joined = [], None, False
+    groups, last = [], (0, -1)  # open ( and { groups; the last command or group
+    loops = loop_assignments(items, lits)
+    bodies = function_bodies(items, ctx)
+    for k, (item, litem) in enumerate(zip(items, lits)):
+        for word, lword in loops.get(k, ()):
+            widen(word, lword, ctx)
+        ctx.in_function += bodies.get(k, 0)
+        head = [w for w in item[0] if w not in KEYWORDS][:1] if len(item) == 2 else []
+        # A case clause's patterns, up to its ")", are words, not commands.
+        if pattern:
+            if item == ")" or head == ["esac"]:
+                pattern, case = False, case - (head == ["esac"])
+            continue
+        if head in (["case"], ["esac"]):
+            case += 1 if head == ["case"] else -1
+            pattern = head == ["case"]
+        elif item == ";;":
+            pattern = case > 0
+        elif item == "|":
+            piped = out
+            lpiped = writers.pop() if writers else None
+            joined = True
+        elif item == "&":  # every command of what it backgrounds
+            ctx.any_bg = True
+            ctx.bg.update(range(last[0], last[1] + 1))
+        elif item == "(":
+            stack.append(cwd)
+            groups.append(ctx.seq + 1)
+        elif item == ")":
+            cwd = stack.pop() if stack else cwd
+            last = (groups.pop() if groups else ctx.seq, ctx.seq)
+            out = ("unknown", "a subshell")
+            writers.append(out)
+        else:
+            argv, redirs = item
+            largv, lredirs = litem or (None, None)
+            stdin, piped = piped, None
+            lstdin, lpiped = lpiped, None
+            for k, (op, word) in enumerate(redirs):
+                lword = lredirs[k][1] if lredirs else None
+                if op == "<<" and word[:1] == "\x01" and word[1:].isdigit():
+                    doc, expands = ctx.docs[int(word[1:])]
+                    stdin, lstdin = (
+                        ("text", doc),
+                        ("text", doc if expands else literal(doc)),
+                    )
+                elif op == "<<<":
+                    stdin, lstdin = ("text", word), lword and ("text", lword)
+                elif op == "<":
+                    stdin = lstdin = ("files", [word])
+            lit = (largv, lstdin)
+            before = cwd
+            ctx.pipe += not joined  # a pipeline's commands share its number
+            ctx.cur_pipe, joined = ctx.pipe, False
+            if argv[:1] == ["{"]:
+                groups.append(ctx.seq + 1)
+            cwd, out = one_command(argv, redirs, stdin, ctx, cwd, depth, lit)
+            closes = argv[-1:] == ["}"] and groups
+            last = (groups.pop() if closes else ctx.seq, ctx.seq)
+            writers.append(placed(lit_output(argv, redirs, out, lit), ctx, before))
+    return [w for w in writers if w is not None]
+
+
+def placed(out, ctx, cwd):
+    """out with the files it names placed where the writer ran: cwd."""
+    if not out or out[0] != "files":
+        return out
+    paths = [locate(raw, ctx, cwd)[0] for raw in out[1]]
+    if None in paths:
+        return ("unknown", "a file where only the shell can place it")
+    return ("files", [p for ps in paths for p in ps])
+
+
+def lit_output(argv, redirs, out, lit):
+    """What a command writes to stdout (out, as output() says), as
+    literal-aware text: echo, printf and cat from their literal-aware words,
+    a bare < FILE, as in $(<FILE), its file; None for nothing."""
+    largv, lstdin = lit
+    run = unwrap(argv)[0]
+    if not argv and any(op == "<" for op, _ in redirs):
+        return lstdin
+    if (
+        out is None
+        or not run
+        or os.path.basename(run[0]) not in ("echo", "printf", "cat")
+    ):
+        return out
+    if largv is None or len(largv) != len(argv):
+        return ("unknown", "text the guard could not read literally")
+    lrun = largv[len(argv) - len(run) :]
+    name, args = os.path.basename(run[0]), lrun[1:]
+    if any(BRACES.search(a) for a in args):
+        return ("unknown", "a brace expansion")
+    if name == "printf" and args and args[0] != "-v":
+        convs = PRINTF_CONV.findall(args[0])
+        if any(c[1] for c in convs) or len(args) - 1 > len(convs):
+            return ("unknown", "a printf width, precision or reused format")
+    return output(name, args, lstdin) or ("unknown", "text")
+
+
+# Credential files, as a normalised path (the file, or anything below the
+# directory): tea (git-obs reads it too), osc, gh, netrc, git's two stores, osc's
+# cookie jar, an MCP server's key.
+CRED_PATH = Rx(
+    r"/\.config/(?:tea|osc|gh)(?:/|$)|/\.local/state/osc(?:/|$)"
+    r"|/\.(?:netrc|oscrc|git-credentials|config/git/credentials)$"
+    r"|/\.config/mcp-[^/]*/api-key$"
+)
+# The same as a word spells them, for a path the guard cannot place.
+CRED_WORD = Rx(
+    r"(?<![\w.\\-])\.(?:config\}?/+(?:tea|osc|gh|git/+credentials|mcp-[^/]*/+api-key)"
+    r"|local/+state/+osc|netrc|oscrc|git-credentials)(?![\w.-])"
+    r"|\$\{?XDG_CONFIG_HOME\}?/+(?:tea|osc|gh|git/+credentials)(?![\w.-])"
+)
+# The same below $HOME, for a recursive read of a directory above them.
+CRED_ROOTS = ("/.config/tea", "/.config/osc", "/.config/gh", "/.local/state/osc")
+CRED_ROOTS += ("/.netrc", "/.oscrc", "/.git-credentials", "/.config/git/credentials")
+CRED_ROOTS += ("/.config/mcp-",)
+# Names that are credential files wherever they sit.
+CRED_NAMES = {"oscrc", "cookiejar"}
+# Commands that look at a file without reading it; commands that read a tree.
+NO_READ = {"ls", "stat", "test", "[", "[[", "mkdir", "rmdir", "touch", "chmod"}
+NO_READ |= {"chown", "readlink", "realpath", "dirname", "basename", "du"}
+RECURSIVE = {"grep", "egrep", "fgrep", "rgrep", "zgrep", "ugrep", "rg", "ag", "ack"}
+RECURSIVE |= {"cp", "scp", "rsync", "tar", "bsdtar", "zip", "7z", "7za", "diff", "find"}
+# A search pattern and a sed or awk program are text, not a file. Per tool: the
+# short and long options that take a value, and those that give the pattern
+# (a -f FILE is still read).
+SEARCH = {"egrep": "grep", "fgrep": "grep", "rgrep": "grep", "zgrep": "grep"}
+SEARCH.update({"ugrep": "grep", "ag": "rg", "ack": "rg", "gawk": "awk", "mawk": "awk"})
+GREP_GIVEN = {"-e", "-f", "--regexp", "--file"}
+PATTERN_OPTS = {
+    "grep": (
+        "efmABCdD",
+        ("--regexp", "--file", "--max-count", "--after-context", "--before-context",
+         "--context", "--directories", "--devices", "--include", "--exclude",
+         "--exclude-dir", "--exclude-from", "--label"),
+        GREP_GIVEN,
+    ),
+    "rg": (
+        "ABCEefgjMmrTtd",
+        ("--regexp", "--file", "--glob", "--iglob", "--type", "--type-not",
+         "--max-count", "--after-context", "--before-context", "--context",
+         "--encoding", "--replace", "--threads", "--max-depth", "--max-columns"),
+        GREP_GIVEN,
+    ),
+    "sed": (*SED_OPTS, SED_PROGRAM),
+    "awk": (*AWK_OPTS, AWK_PROGRAM),
+}  # fmt: skip
+# A grep that prints one build-* setting of an INI file (the skill's scripts
+# read build-root from oscrc so): flags that cannot widen the output, and a
+# pattern anchored to the key.
+KEY_GREP_FLAGS = tuple("ehHsEFGiq")
+KEY_GREP_LONG = {"--no-filename", "--with-filename", "--no-messages", "--quiet"}
+KEY_GREP_LONG |= {"--extended-regexp", "--fixed-strings", "--basic-regexp"}
+KEY_GREP_LONG |= {"--ignore-case", "--silent", "--regexp"}
+SPACES = r"(?:\\s\*|\[\[:space:\]\]\*| \*)?"
+KEY_LINE = Rx(rf"\^{SPACES}build-[\w-]+{SPACES}=")
+# git's and ssh's askpass program: set by a variable or git config, or named
+# by the variable.
+ASKPASS_SET = Rx(r"(?:GIT|SSH)_ASKPASS\+?=|\w+\+?=.*(?i:core\.askpass)")
+ASKPASS_REF = Rx(r"\$\{?(?:GIT|SSH)_ASKPASS\b")
+# The tools' own secret printers: gh auth and tea login subcommands, and osc's
+# HTTP debugging (-H, a --setopt or environment key) and token path.
+SECRET_GH = {"token", "status", "git-credential"}
+SECRET_TEA = {"helper", "git-credential", "edit", "e"}
+TEA_VALUED = {"-l", "--login", "-r", "--repo", "-R", "--remote", "-o", "--output"}
+OSC_H = Rx(r"-[vqh]*H\w*")
+HTTP_DEBUG = Rx(r"(?i)\bhttp_(?:full_)?debug\b")
+OSC_DEBUG_ENV = Rx(r"(?i)OSC_HTTP(?:_FULL)?_DEBUG\+?=")
+PERSON_TOKEN = Rx(r"/person/[^/?#\s]+/token(?![\w-])")
+# Header names that carry a credential, a URL's userinfo, wget's password
+# options.
+AUTH_HEADER = Rx(
+    r"(?i)(?<![\w-])((?:proxy-)?authorization|private-token|cookie"
+    r"|x-[\w-]*(?:token|api-?key|auth)[\w-]*|api-?key)\s*:(?!=)"
+)
+USERINFO = Rx(r"://[^/\s:@\"'`]*:[^/\s@\"'`]*@|://[\w-]{20,}@")
+WGET_SECRETS = ("--password", "--http-password", "--http-passwd", "--proxy-password")
+WGET_SECRETS += ("--proxy-passwd", "--ftp-password", "--ftp-passwd")
+# The OBS API: api.opensuse.org, and these first path segments on
+# build.opensuse.org (its web pages are no API). Gitea's: src.opensuse.org/api.
+OBS_ROOTS = r"source|build|published|request(?!/+show\b)|search|person|group"
+OBS_ROOTS += r"|statistics|status|public|trigger|staging|worker|architectures"
+OBS_ROOTS += r"|distributions|attribute|comments|configuration|issue_trackers|about"
+API_HOSTS = (
+    r"api\.opensuse\.org\.?(?::\d+)?(?![\w.-])"
+    rf"|build\.opensuse\.org\.?(?::\d+)?/+(?:{OBS_ROOTS})(?![\w-])"
+    r"|src\.opensuse\.org\.?(?::\d+)?/+api(?![\w-])"
+)
+# One in a command-line word, with or without its scheme.
+# The userinfo stops at = and (: each is a start of its own, and a run of them
+# rescanned from every one was quadratic (100 kB took 50 s).
+API_WORD = Rx(rf"(?i)(?:^|(?<=[\s\"'`=(@])|://)(?:[^\s/\"'`@=(]*@)?(?:{API_HOSTS})")
+
+
+def homes():
+    home = os.path.expanduser("~")
+    return {home.rstrip("/"), os.path.realpath(home).rstrip("/")} - {""}
+
+
+def tilde(path):
+    """path with the home directory spelled ~."""
+    for home in homes():
+        if path == home or path.startswith(home + "/"):
+            return "~" + path[len(home) :]
+    return path
+
+
+def above_creds(path):
+    """Whether a recursive read of path reaches a credential file."""
+    if re.fullmatch(r".*/\.config/mcp-[^/]*/?", path):
+        return True
+    top = path.rstrip("/") + "/"
+    return any((h + r).startswith(top) for h in homes() for r in CRED_ROOTS)
+
+
+def braced(words, what):
+    """words as bash's brace expansion leaves them (braces()); one it cannot
+    enumerate is refused. Bash expands braces before quote removal, so a quoted
+    space inside one alternative does not stop the others from being judged."""
+    out = []
+    for w in words:
+        alts = braces(w)
+        if alts is None:
+            block(
+                "credential-read",
+                f"{what} reads {shown(w)[:80]}, a brace expansion past 64 words or 1 KB",
+            )
+        out += alts
+    return out
+
+
+def wrapper_words(argv, shell):
+    """The words of a command that runs shell text (unwrap()) other than that
+    text and assignments: (the wrappers before it, with their options; GNU
+    parallel's own options, and what follows its :::, ::::, :::+ or ::::+ --
+    inputs, or files of them)."""
+    k = next((i for i, w in enumerate(argv) if os.path.basename(w) == "parallel"), None)
+    if k is None:
+        n, t = -1, len(argv)
+        while t > 0 and n < len(shell):
+            t -= 1
+            n += len(argv[t]) + 1
+        k = t if n == len(shell) and " ".join(argv[t:]) == shell else len(argv)
+        return [w for w in argv[:k] if not ASSIGN.match(w)], []
+    j = k + 1
+    while j < len(argv) and argv[j].startswith("-") and argv[j] != "-":
+        if argv[j] == "--":
+            j += 1
+            break
+        j += 2 if argv[j] in PARALLEL_VALUED else 1
+    rest = argv[j:]
+    end = next((i for i, a in enumerate(rest) if a.startswith(":::")), len(rest))
+    inputs = [a for a in rest[end:] if not a.startswith(":::")]
+    return [w for w in argv[:k] if not ASSIGN.match(w)], argv[k + 1 : j] + inputs
+
+
+def cred_word(word, what, deep, ctx, cwd):
+    """Refuse a word that names a credential file: placed in cwd (each
+    directory of a loop) through this call's values, globs, dot segments and
+    symlinks, or as written when it cannot be placed; deep (a recursive
+    reader), a directory above one; or the askpass variables. A word with a
+    space is text, a file that does not exist is not read; an option's value
+    follows its "=", and curl's @FILE its "@"."""
+    if re.search(r"\s", word):
+        return
+    if ASKPASS_REF.search(word):
+        block("askpass", f"{what} runs or reads the askpass program {shown(word)}")
+    parts = [word, word.partition("=")[2], word[1:] if word[:1] == "@" else ""]
+    for p in filter(None, parts):
+        for d in cwd.dirs if isinstance(cwd, Dirs) else [cwd]:
+            paths, why = ([], None) if p[:1] == "-" else locate(p, ctx, d)
+            if paths is None and why and os.path.basename(p) in CRED_NAMES:
+                block("credential-read", f"{what} reads {p} ({why})")
+            for path in filter(os.path.lexists, paths or ()):
+                for x in (path, os.path.realpath(path)):
+                    if CRED_PATH.search(x):
+                        block("credential-read", f"{what} reads {tilde(x)}")
+                    if deep and above_creds(x):
+                        block(
+                            "credential-read",
+                            f"{what} reaches the credential files under {tilde(x)}",
+                        )
+        if CRED_WORD.search(p):
+            block("credential-read", f"{what} reads {shown(p)}")
+
+
+def cred_operands(name, run):
+    """The words of a command that may name a file it reads: all but a search
+    tool's pattern, sed's or awk's program, and osc's or git-obs's own config
+    file, which the tool reads itself. A recursive search with no operand
+    reads the working directory."""
+    base = SEARCH.get(name, name)
+    if base in PATTERN_OPTS:
+        valued, long_valued, given = PATTERN_OPTS[base]
+        opts, pos = parse_opts(run[1:], valued, long_valued)
+        keys = {k for k, _ in opts}
+        files = [v for k, v in opts if k in ("-f", "--file")]
+        pos = pos if keys & given else pos[1:]
+        deep = base == "rg" or name == "rgrep" or keys & {"-r", "-R", "--recursive"}
+        deep = deep or "--dereference-recursive" in keys
+        deep = deep or "recurse" in [v for k, v in opts if k in ("-d", "--directories")]
+        if base in ("grep", "rg") and deep and not pos and not files:
+            pos = ["."]
+        return [*files, *pos]
+    if name not in ("osc", "git-obs"):
+        return run[1:]
+    opt, own, names = (
+        ("--config", r"(?:^|/)\.?oscrc$|/\.config/osc/", long_names(OSC_GLOBAL)[1])
+        if name == "osc"
+        else ("--gitea-config", r"/\.config/tea/", list(GIT_OBS_LONG))
+    )
+    out, i = [], 1
+    while i < len(run):
+        k, eq, v = long_prefix(run[i], names).partition("=")
+        if k == opt and not eq and i + 1 < len(run) and re.search(own, run[i + 1]):
+            i += 2
+            continue
+        if not (k == opt and eq and re.search(own, v)):
+            out.append(run[i])
+        i += 1
+    return out
+
+
+def key_grep(name, args):
+    """Whether a grep prints only a build-* setting's lines (KEY_LINE)."""
+    if name not in ("grep", "egrep"):
+        return False
+    opts, pos = parse_opts(args, "e", ("--regexp",))
+    if any(k not in KEY_GREP_LONG and k[1:] not in KEY_GREP_FLAGS for k, _ in opts):
+        return False
+    pats = [v for k, v in opts if k in ("-e", "--regexp")] or pos[:1]
+    return bool(pats) and all(KEY_LINE.fullmatch(p) for p in pats)
+
+
+def credential_read(name, argv, run, ctx, cwd):
+    """A command that reads a credential file (cred_word): through a wrapper's
+    own words (xargs -a FILE), or its own, unless it only looks (NO_READ, find
+    without an action) or prints only a build-* setting (key_grep). Its
+    words are judged as bash's brace expansion leaves them."""
+    wrapped = [w for w in argv[: len(argv) - len(run)] if not ASSIGN.match(w)]
+    wrapped = braced(wrapped, name)
+    for w in wrapped:
+        cred_word(w, os.path.basename(wrapped[0]), False, ctx, cwd)
+    if name in NO_READ and "{" not in run[0]:
+        return
+    run = braced(run, name)
+    if not run:
+        return
+    name = os.path.basename(run[0])
+    if name in NO_READ or name == "find" and not FIND_ACTS.intersection(run):
+        return
+    if key_grep(name, run[1:]):
+        return
+    path = run[:1] if "/" in run[0] or VARIABLE.search(run[0]) else []
+    for w in path + cred_operands(name, run):
+        cred_word(w, name, name in RECURSIVE, ctx, cwd)
+
+
+def assignment_rules(words):
+    """Assignments that hand git or ssh an askpass program, or turn on osc's
+    HTTP debugging."""
+    for w in words:
+        if ASSIGN.match(w) and ASKPASS_SET.match(w):
+            block("askpass", "setting " + w.split("=", 1)[0].rstrip("+"))
+        if ASSIGN.match(w) and OSC_DEBUG_ENV.match(w):
+            block("secret-osc", "osc HTTP debugging")
+
+
+def tea_words(args):
+    """tea's subcommand words, past its options and their values."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a[:1] != "-":
+            out.append(a)
+        elif a in TEA_VALUED:
+            i += 1
+    return out
+
+
+def secret_rules(name, run, ctx, cwd):
+    """The tools' own secret printers: gh auth token|status|git-credential,
+    tea login(s) helper|git-credential|edit|e, git-obs login list and
+    gitcredentials-helper, a git-credential-* helper's get, secret-tool
+    lookup|search, and osc's (osc_secret)."""
+    args = run[1:]
+    pos = [a for a in args if a[:1] != "-"]
+    if name == "gh" and pos[:1] == ["auth"] and pos[1:2] and pos[1] in SECRET_GH:
+        block("secret-gh", "gh auth " + pos[1])
+    if name == "tea":
+        words = tea_words([TEA_LONG.sub("--", a) for a in args])
+        if words[:1] in (["login"], ["logins"]) and words[1:2]:
+            if words[1] in SECRET_TEA:
+                block("secret-tea", " ".join(["tea", *words[:2]]))
+    if name == "git-obs":
+        git_obs_secret(args)
+    if name.startswith("git-credential-") and "get" in pos:
+        block("secret-git", name + " get")
+    if name == "secret-tool" and pos[:1] in (["lookup"], ["search"]):
+        block("secret-tool", "secret-tool " + pos[0])
+    if name == "osc":
+        osc_secret(run, ctx, cwd)
+
+
+def osc_secret(run, ctx, cwd):
+    """osc printing a secret: HTTP debugging (-H, --http-debug,
+    --http-full-debug, http_debug in --setopt), config --dump-full, token,
+    config ... pass|passx, and api on a /person/<login>/token path."""
+    rest = without_message(run)
+    names = long_names(OSC_GLOBAL)[1] + ["--dump", "--dump-full"]
+    for a in rest[1:]:
+        if a == "--":
+            break
+        full = long_prefix(a, names).partition("=")[0]
+        if full in ("--http-debug", "--http-full-debug") or OSC_H.fullmatch(a):
+            block("secret-osc", "osc HTTP debugging")
+        if HTTP_DEBUG.search(a):
+            block("secret-osc", "osc HTTP debugging")
+        if full == "--dump-full":
+            block("secret-osc", "osc config --dump-full")
+    sub, sargs = osc_sub(rest)
+    if sub == "token":
+        block("secret-osc", "osc token")
+    if sub == "config" and {"pass", "passx"} & set(sargs):
+        block("secret-osc", "osc config " + ("passx" if "passx" in sargs else "pass"))
+    if sub == "api":
+        urls = [norm_urls(a) for a in [*sargs, *expansions(sargs, ctx, cwd)]]
+        if any(PERSON_TOKEN.search(u) for u in urls):
+            block("secret-osc", "osc api /person/<login>/token")
+
+
+def auth_rules(what, args, text):
+    """A credential on the command line of an HTTP tool, tea api or git-obs
+    api: a URL's userinfo, a header that carries one, a user:password or
+    bearer token option, a wget password option."""
+    if USERINFO.search(text):
+        block("auth-url", f"{what} with a password in a URL")
+    m = AUTH_HEADER.search(text)
+    if m:
+        block("auth-header", f"{what} with a credential header ({m.group(1)})")
+    if what == "curl":
+        users = ("--user", "--proxy-user", "--oauth2-bearer")
+        for k, v in parse_opts(args, CURL_VALUED, users)[0]:
+            if k in ("-u", "-U", "--user", "--proxy-user") and ":" in v:
+                block("auth-user", f"curl {k} with a password")
+            if k == "--oauth2-bearer":
+                block("auth-user", "curl --oauth2-bearer")
+    if what in HTTPIE:
+        opts = dict(parse_opts(args, "aA", ("--auth", "--auth-type"))[0])
+        auth = opts.get("-a", opts.get("--auth"))
+        bearer = opts.get("-A", opts.get("--auth-type")) == "bearer"
+        if auth is not None and (bearer or ":" in auth):
+            block("auth-user", f"{what} -a with a {'secret' if bearer else 'password'}")
+    if what == "wget":
+        for a in args:
+            k = a.partition("=")[0]
+            if k[:3] == "--p" or k[:4] in ("--ht", "--ft"):
+                if any(w.startswith(k) for w in WGET_SECRETS):
+                    block("auth-user", "wget " + k)
+
+
+def api_shown(m):
+    return re.sub(r"^.*?(?=(?:api|build|src)\.opensuse\.org)", "", m.group(0).lower())
+
+
+def direct_api(what, text):
+    """HTTP to the OBS or Gitea API past osc and git-obs, which hold the login."""
+    m = API_WORD.search(norm_urls(text))
+    if m:
+        block("api-direct", f"{what} to {api_shown(m)}")
+
+
+def credential_rules(name, argv, run, gparts, ctx, cwd):
+    """The credential rules for a command the agent runs, after the pool rules:
+    askpass and osc debug assignments, the tools' secret printers, a credential
+    on an HTTP tool's, tea api's or git-obs api's command line, and HTTP to the
+    OBS or Gitea API past osc and git-obs. gparts: git's options and
+    subcommand, as git_command() parsed them."""
+    assignment_rules(argv[: len(argv) - len(run)])
+    assignment_rules(run[1:] if name in DECLARE else ())
+    if VARIABLE.search(name):
+        return  # guess() judged it
+    if name in ("tea", "git-obs", "git", "osc") and asks_help(run[1:]):
+        return
+    secret_rules(name, run, ctx, cwd)
+    if gparts:
+        git_secrets(run, *gparts, ctx, cwd)
+    args = run[1:]
+    held = [
+        v
+        for k in re.findall(r"\$\{?(\w+)", " ".join(run))
+        for v in ctx.values.get(k, ())
+    ]
+    text = " ".join([*run, *held, *expansions(args, ctx, cwd)])
+    if name in HTTP_TOOLS:
+        auth_rules(name, args, text)
+        direct_api(name, text)
+    tea = [TEA_LONG.sub("--", a) for a in args] if name == "tea" else []
+    if tea_words(tea)[:1] == ["api"]:
+        auth_rules("tea api", args, text)
+    if name == "git-obs" and git_obs_rest(args)[:1] == ["api"]:
+        auth_rules("git-obs api", args, text)
+
+
+def check_write(path, content, ctx):
+    if STAMP.search(path.replace(os.sep, "/")):
+        block("stamp-write", f"a write to {path}", "stamp")
+    # Docs quote the wrong forms on purpose; scripts are where a POST hides.
+    if not path.lower().endswith(DOCS):
+        lines = "\n".join(code_lines(content))
+        for ln in lines.split("\n"):
+            if TEA_MERGE.search(ln):
+                block("merge-tea", "a script running a tea PR merge")
+            if TEA_CREATE.search(ln) and pool_or_unknown(ln, ctx, ctx.cwd, cmd=True):
+                block("create-tea", "a script running a tea PR create on pool")
+        lines = norm_urls(lines)
+        if (
+            DO_MERGE.search(lines)
+            or MERGE_URL.search(lines)
+            and (pool_or_unknown(lines, ctx, ctx.cwd) or not code_reads(lines))
+        ):
+            block("merge-api", "a script merging a PR")
+        if REQUEST_CREATE.search(lines):
+            block("request-api", "a script creating a request through the API")
+        if PULLS_REF.search(lines) and writes(lines):
+            if pool_or_unknown(lines, ctx, ctx.cwd):
+                block("create-api", "a script writing to pool pulls")
+
+
+def judge(ev):
+    """Why one tool-call event is refused, or None when it is allowed; an
+    Asked when it is allowed only on the user's go. Anything it raises
+    refuses the call too: the caller fails closed."""
+    inp = ev.get("tool_input") if isinstance(ev, dict) else None
+    if not isinstance(inp, dict):
+        return None
+    cwd = ev.get("cwd") if isinstance(ev.get("cwd"), str) and ev.get("cwd") else None
+    ctx = Ctx(cwd, ev.get("tool_name"), inp.get("run_in_background") is True)
+    if isinstance(ev.get("agent_type"), str) and ev["agent_type"]:
+        ctx.agent = ev["agent_type"]
+    try:
+        if isinstance(inp.get("command"), str):
+            ctx.command = inp["command"]
+            shell_pass(inp["command"], ctx, cwd, 0)
+            while ctx.traps:  # a trap's command runs last, after every write
+                text, here, depth = ctx.traps.pop(0)
+                ctx.loops = []
+                run_text(text, "shell", ctx, here, depth)
+        elif isinstance(inp.get("file_path"), str):
+            body = inp.get("content", inp.get("new_string"))
+            check_write(inp["file_path"], body if isinstance(body, str) else "", ctx)
+        gate_writers(ctx)
+    except Blocked as b:
+        return str(b)
+    if ctx.asks:
+        return Asked("pr-guard: " + " · ".join(ctx.asks))
+    return None

@@ -1,0 +1,48 @@
+# Freshness: keep the dependencies from rotting.
+#
+# Runs weekly (and on demand). It FAILS — it does not just report — on:
+#   - any outdated dependency (`cargo outdated`, failing exit code),
+#   - any `cargo audit` advisory,
+#   - any `cargo deny check` failure (licenses, advisories, sources),
+#   - any unused dependency (`cargo machete`),
+#   - a stale `Cargo.lock` (not up to date with Cargo.toml).
+#
+# This workflow is separate from test.yml on purpose: a freshness
+# failure does not block feature PRs. But it is visible (README badge)
+# and it stays red until the Dependabot PR is merged. The repo is kept
+# green by merging Dependabot PRs promptly, not by relaxing the checks.
+# If a check turns out too noisy in practice, it is relaxed deliberately
+# in a PR with a reason — never silently.
+
+name: freshness
+
+on:
+  schedule:
+    # Weekly, Mondays 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to the stable-branch HEAD (2026-11-15) so the toolchain
+      # version is reproducible; update the SHA to move it.
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+      - name: Install freshness tools
+        run: cargo install cargo-audit cargo-deny cargo-outdated cargo-machete
+      - name: Lockfile is up to date
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - name: No unused dependencies
+        run: cargo machete
+      - name: No outdated dependencies
+        run: cargo outdated --exit-code 1
+      - name: No known advisories
+        run: cargo audit
+      - name: Licenses, advisories, sources
+        run: cargo deny check
