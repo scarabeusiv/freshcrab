@@ -132,12 +132,16 @@ them by name:
 | `spec-cleaner` | the spec cleaner | `spec-cleaner -i --remove-groups --suse-copyright <spec>` (full mode, final step) |
 | `osc` | the OBS client | branch, build, commit, file SRs via the OBS API |
 | `bugwarden` | the Bugzilla helper | read bugs, post comments |
-| opensuse-packaging-skill docs | the packaging skill (unpackaged upstream docs) | read at `/usr/share/doc/freshcrab/opensuse-packaging-skill/` — `SKILL.md` first, then the `references/` section for the block in progress |
+| opensuse-packaging-skill docs | the packaging skill (fetched at build time, tag v3.24.3) | read at `/usr/share/doc/freshcrab/opensuse-packaging-skill/` — `SKILL.md` first, then the `references/` section for the block in progress |
 
-The skill docs are vendored in the repo at
-`skills/opensuse-packaging-skill/` and copied into the image at build
-time. They are the only thing in the image that is not a distro
-package.
+The skill docs are NOT in this repo. They are fetched at image build
+time from tag v3.24.3 of openSUSE/openSUSE-packaging-skill (see the
+`ARG PACKAGING_SKILL_TAG` in the Dockerfile) and copied into the image.
+They are the only thing in the image that is not a distro package.
+The tag is bumped by the weekly skill-tag-bump workflow
+(`.github/workflows/skill-tag-bump.yml`), which opens a PR when a new
+tag is released — Dependabot's docker ecosystem only tracks FROM image
+tags, so it cannot bump this one.
 
 ## Credentials
 
