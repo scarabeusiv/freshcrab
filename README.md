@@ -76,8 +76,9 @@ openSUSE repos — nothing is built from source:
 - `osc` — the OBS client.
 - `bugwarden` — the Bugzilla helper.
 - opensuse-packaging-skill docs — at
-  `/usr/share/doc/freshcrab/opensuse-packaging-skill/` (unpackaged
-  upstream docs; see `docs/runbook.md`).
+  `/usr/share/doc/freshcrab/opensuse-packaging-skill/` (fetched at
+  build time from tag v3.24.3 of openSUSE/openSUSE-packaging-skill,
+  not in the repo; see `docs/runbook.md`).
 
 The agent invokes them by name; see `worker/brief.md` and
 `docs/runbook.md`.

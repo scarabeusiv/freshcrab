@@ -1,16 +1,20 @@
 # Dockerfile for freshcrab.
 #
-# Two stages:
+# Three stages:
 #   1. builder: build the static Rust binary (cargo build --release).
-#   2. runtime: a minimal openSUSE image with the binary plus the distro
+#   2. skill: fetch the opensuse-packaging-skill docs at a tagged release.
+#   3. runtime: a minimal openSUSE image with the binary plus the distro
 #      worker tools (rpmcrab, spec-cleaner, osc, bugwarden) installed with
 #      zypper from the openSUSE repos. Nothing is built from source in the
 #      runtime stage.
 #
-# The opensuse-packaging-skill docs are not a distro package; they are
+# The opensuse-packaging-skill docs are not a distro package and are not
+# vendored in this repo; they are fetched at build time from the tagged
+# release of openSUSE/openSUSE-packaging-skill (see the skill stage) and
 # copied into the image at /usr/share/doc/freshcrab/opensuse-packaging-skill/
-# (see docs/runbook.md). The skill sources live in the repo at
-# skills/opensuse-packaging-skill/ (the docs only; no code).
+# (see docs/runbook.md). The tag is bumped by the weekly skill-tag-bump
+# workflow: Dependabot's docker ecosystem only tracks FROM image tags, not
+# a git-clone branch, so it cannot bump this tag.
 #
 # No secrets are baked into the image. OBS credentials (oscrc) and the
 # GitHub token are injected at run time via environment variables or a
@@ -28,7 +32,24 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked
 
-# --- Stage 2: runtime ------------------------------------------------------
+# --- Stage 2: fetch the packaging skill ------------------------------------
+# Shallow-clone the tagged release; only the nested skill dir
+# (skills/opensuse-packaging/ inside the collection repo) is kept. The
+# clone and its .git are discarded in this stage, so the runtime image
+# carries just the skill docs.
+FROM registry.opensuse.org/opensuse/tumbleweed:latest AS skill
+
+ARG PACKAGING_SKILL_TAG=v3.24.3
+
+RUN zypper --non-interactive refresh && \
+    zypper --non-interactive install --no-recommends git \
+    && zypper clean --all && \
+    git clone --depth 1 --branch "${PACKAGING_SKILL_TAG}" \
+        https://github.com/openSUSE/openSUSE-packaging-skill /tmp/packaging-skill && \
+    cp -r /tmp/packaging-skill/skills/opensuse-packaging /skill && \
+    rm -rf /tmp/packaging-skill
+
+# --- Stage 3: runtime ------------------------------------------------------
 FROM registry.opensuse.org/opensuse/tumbleweed:latest
 
 LABEL org.opencontainers.image.title="freshcrab"
@@ -43,8 +64,8 @@ RUN zypper --non-interactive refresh && \
 # The binary.
 COPY --from=builder /src/target/release/freshcrab /usr/local/bin/freshcrab
 
-# The opensuse-packaging-skill docs (unpackaged upstream docs).
-COPY skills/opensuse-packaging-skill /usr/share/doc/freshcrab/opensuse-packaging-skill
+# The opensuse-packaging-skill docs (fetched at build time, see the skill stage).
+COPY --from=skill /skill /usr/share/doc/freshcrab/opensuse-packaging-skill
 
 WORKDIR /app
 COPY config.yaml /app/config.yaml

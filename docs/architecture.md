@@ -188,8 +188,7 @@ docs/
   architecture.md      this file
   runbook.md           run the container, configure the package set, pause, read the queue
   assets/logo.svg      project icon (hand-built vector, rpmcrab style)
-skills/
-  opensuse-packaging-skill/   vendored skill docs (unpackaged upstream docs),
-                              copied into the container at
-                              /usr/share/doc/freshcrab/opensuse-packaging-skill/
+
+(The opensuse-packaging-skill docs are NOT in this repo: they are
+fetched at image build time from a tagged release, see the Dockerfile.)
 ```

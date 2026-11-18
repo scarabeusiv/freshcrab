@@ -1,0 +1,56 @@
+# Bump the opensuse-packaging-skill tag in the Dockerfile.
+#
+# Dependabot's docker ecosystem only tracks FROM image tags, not a
+# git-clone branch (verified against dependabot-core's docker file
+# parser, which only matches ^FROM lines), so it cannot bump the skill
+# tag. This workflow does the equivalent job: weekly, it checks the
+# latest tagged release of openSUSE/openSUSE-packaging-skill and, when
+# a new tag exists, opens a PR updating the tag in the Dockerfile (and
+# the docs that name it). The PR goes through the same CI + review gate
+# as any other change.
+name: Bump opensuse-packaging-skill tag
+
+on:
+  schedule:
+    # Weekly, Monday 07:00 UTC — same cadence as the Dependabot runs.
+    - cron: '0 7 * * MON'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check latest skill tag
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=$(gh api repos/openSUSE/openSUSE-packaging-skill/tags --paginate --jq '.[].name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          current=$(grep -oP '^ARG PACKAGING_SKILL_TAG=\K.*' Dockerfile)
+          echo "latest=${latest}" >> "${GITHUB_OUTPUT}"
+          echo "current=${current}" >> "${GITHUB_OUTPUT}"
+          echo "latest tag: ${latest}, current tag: ${current}"
+
+      - name: Open PR for new tag
+        if: steps.check.outputs.latest != steps.check.outputs.current
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest="${{ steps.check.outputs.latest }}"
+          current="${{ steps.check.outputs.current }}"
+          branch="skill-tag-bump/${latest}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${branch}"
+          current_esc=$(printf '%s' "${current}" | sed 's/[.[\*^$]/\\&/g')
+          sed -i "s/${current_esc}/${latest}/g" Dockerfile README.md docs/runbook.md
+          git add Dockerfile README.md docs/runbook.md
+          git commit -m "chore: bump opensuse-packaging-skill to ${latest}"
+          git push origin "${branch}"
+          gh pr create --base main --title "chore: bump opensuse-packaging-skill to ${latest}" --body "New tagged release ${latest} of openSUSE/openSUSE-packaging-skill (was ${current})."
