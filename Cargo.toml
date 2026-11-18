@@ -1,0 +1,20 @@
+[package]
+name = "freshcrab"
+version = "0.1.0"
+edition = "2021"
+description = "Automatic updater and validator for openSUSE Tumbleweed/Factory"
+license = "Apache-2.0"
+repository = "https://github.com/scarabeusiv/freshcrab"
+
+[lib]
+name = "freshcrab"
+path = "src/lib.rs"
+
+[[bin]]
+name = "freshcrab"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"

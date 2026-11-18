@@ -1,0 +1,182 @@
+//! Integration tests for the queue: deduplication, persistence, dry-run.
+
+use freshcrab::dry_run::DryRun;
+use freshcrab::queue::{DedupChecks, Queue};
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn tmp_path() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!(
+        "{}/freshcrab-test-queue-{nanos}.json",
+        env::temp_dir().display()
+    )
+}
+
+fn live() -> DryRun {
+    DryRun::new(false)
+}
+
+#[test]
+fn add_and_deduplicate() {
+    let path = tmp_path();
+    let mut q = Queue::open(&path).unwrap();
+    let live_run = live();
+    assert!(q
+        .add(
+            "foo",
+            "1.9",
+            "2.0",
+            "repology",
+            DedupChecks::none(),
+            &live_run
+        )
+        .is_some());
+    // In flight: a second add for the same package is skipped.
+    assert!(q
+        .add(
+            "foo",
+            "1.9",
+            "2.1",
+            "repology",
+            DedupChecks::none(),
+            &live_run
+        )
+        .is_none());
+    // Devel already new: skipped.
+    let devel = |_pkg: &str| Some("2.0".to_string());
+    assert!(q
+        .add(
+            "bar",
+            "1.9",
+            "2.0",
+            "repology",
+            DedupChecks {
+                devel_version: Some(&devel),
+                has_open_sr: None,
+            },
+            &live_run
+        )
+        .is_none());
+    // Open SR: skipped.
+    let has_sr = |_pkg: &str| true;
+    assert!(q
+        .add(
+            "baz",
+            "1.9",
+            "2.0",
+            "repology",
+            DedupChecks {
+                devel_version: None,
+                has_open_sr: Some(&has_sr),
+            },
+            &live_run
+        )
+        .is_none());
+    // Devel behind and no open SR: queued.
+    let devel_behind = |_pkg: &str| Some("1.9".to_string());
+    let no_sr = |_pkg: &str| false;
+    assert!(q
+        .add(
+            "qux",
+            "1.9",
+            "2.0",
+            "repology",
+            DedupChecks {
+                devel_version: Some(&devel_behind),
+                has_open_sr: Some(&no_sr),
+            },
+            &live_run
+        )
+        .is_some());
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn save_and_load_roundtrip() {
+    let path = tmp_path();
+    let mut q = Queue::open(&path).unwrap();
+    let live_run = live();
+    q.add(
+        "foo",
+        "1.9",
+        "2.0",
+        "repology",
+        DedupChecks::none(),
+        &live_run,
+    )
+    .unwrap();
+    q.add(
+        "bar",
+        "1.0",
+        "1.1",
+        "repology",
+        DedupChecks::none(),
+        &live_run,
+    )
+    .unwrap();
+    q.set_status("bar", "blocked", &live_run).unwrap();
+    q.save(&live_run).unwrap();
+
+    let q2 = Queue::open(&path).unwrap();
+    assert_eq!(q2.entries().len(), 2);
+    assert_eq!(q2.find("foo").unwrap().status, "pending");
+    assert_eq!(q2.find("foo").unwrap().source, "repology");
+    assert_eq!(q2.find("bar").unwrap().status, "blocked");
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn dry_run_add_and_save_write_nothing() {
+    let path = tmp_path();
+    let mut q = Queue::open(&path).unwrap();
+    let dry_run = DryRun::new(true);
+    // The dedup decision is printed, nothing is added, nothing is saved.
+    assert!(q
+        .add(
+            "foo",
+            "1.9",
+            "2.0",
+            "repology",
+            DedupChecks::none(),
+            &dry_run
+        )
+        .is_none());
+    assert!(q.entries().is_empty());
+    q.save(&dry_run).unwrap();
+    assert!(!Path::new(&path).exists());
+    assert_eq!(
+        dry_run.plan(),
+        vec![
+            "[dry-run] would: enqueue foo 1.9 -> 2.0 (source: repology)".to_string(),
+            format!("[dry-run] would: write queue state file {path}"),
+        ]
+    );
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn live_add_and_save_take_effect() {
+    let path = tmp_path();
+    let mut q = Queue::open(&path).unwrap();
+    let live_run = live();
+    assert!(q
+        .add(
+            "foo",
+            "1.9",
+            "2.0",
+            "repology",
+            DedupChecks::none(),
+            &live_run
+        )
+        .is_some());
+    q.save(&live_run).unwrap();
+    assert!(Path::new(&path).exists());
+    assert!(live_run.plan().is_empty());
+    let _ = fs::remove_file(&path);
+}
