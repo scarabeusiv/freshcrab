@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn plus_in_name_is_query_encoded() {
         // `gcc-c++` must reach Anitya as `gcc-c%2B%2B`: a raw `+` in a
-        // query value decodes as a space and mis-queries.
+        // query value decodes as a space and the query goes wrong.
         use crate::http::FakeHttpClient;
         let http = FakeHttpClient::new().with(
             "https://release-monitoring.org/api/v2/projects/?name=gcc-c%2B%2B",

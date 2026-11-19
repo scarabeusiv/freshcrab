@@ -2,6 +2,7 @@
 name = "freshcrab"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 description = "Automatic updater and validator for openSUSE Tumbleweed/Factory"
 license = "Apache-2.0"
 repository = "https://github.com/scarabeusiv/freshcrab"
@@ -17,6 +18,19 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ureq = "3"
+# TLS backend pinned explicitly (rustls) instead of relying on ureq's
+# default feature: the dependency must not silently change transport
+# under us.
+ureq = { version = "3", features = ["rustls"] }
 # File locking for the queue (flock): serializes concurrent writers.
 fs2 = "0.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+# Pedantic is informative locally; CI uses -D warnings on the default set only
+# (do not enable pedantic as warn-as-error — it blocks scaffolding with style
+# nits).
+pedantic = { level = "allow", priority = -1 }
