@@ -58,9 +58,11 @@ jobs:
             sha="${tag_sha}"
           fi
           if [ -z "${sha}" ]; then echo "could not determine commit for tag ${latest}" >&2; exit 1; fi
-          echo "latest=${latest}" >> "${GITHUB_OUTPUT}"
-          echo "current=${current}" >> "${GITHUB_OUTPUT}"
-          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "latest=${latest}"
+            echo "current=${current}"
+            echo "sha=${sha}"
+          } >> "${GITHUB_OUTPUT}"
           echo "latest tag: ${latest} (${sha}), current tag: ${current}"
 
       - name: Open PR for new tag
