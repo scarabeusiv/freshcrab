@@ -15,12 +15,36 @@
 //! + reason), but nothing is added and nothing is persisted.
 
 use crate::dry_run::DryRun;
+use crate::target::Target;
 use crate::version::is_newer;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
 pub const STATUSES: &[&str] = &["pending", "in_progress", "done", "blocked", "escalated"];
+
+/// What kind of update a queue entry is. Security (CVE-driven) updates
+/// rank above routine version bumps: the dispatcher drains security
+/// entries first (see `docs/leap-and-cve.md`). The Factory path is
+/// routine-only for now; the kind is carried so the ordering rule is
+/// already in place when CVE-driven entries arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateKind {
+    #[default]
+    Routine,
+    Security,
+}
+
+impl UpdateKind {
+    /// Ordering rank: security (0) before routine (1).
+    fn rank(self) -> u8 {
+        match self {
+            UpdateKind::Security => 0,
+            UpdateKind::Routine => 1,
+        }
+    }
+}
 
 /// One queued update.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -32,12 +56,25 @@ pub struct QueueEntry {
     #[serde(default)]
     pub source: String,
     pub status: String,
+    /// The distribution this update is for.
+    #[serde(default)]
+    pub target: Target,
+    /// Routine version bump or security (CVE-driven) update.
+    #[serde(default)]
+    pub kind: UpdateKind,
     pub created_at: String,
     pub updated_at: String,
 }
 
 impl QueueEntry {
-    pub fn new(package: &str, factory_version: &str, upstream_version: &str, source: &str) -> Self {
+    pub fn new(
+        package: &str,
+        factory_version: &str,
+        upstream_version: &str,
+        source: &str,
+        target: &Target,
+        kind: UpdateKind,
+    ) -> Self {
         let now = now_iso();
         QueueEntry {
             package: package.to_string(),
@@ -45,6 +82,8 @@ impl QueueEntry {
             upstream_version: upstream_version.to_string(),
             source: source.to_string(),
             status: "pending".to_string(),
+            target: target.clone(),
+            kind,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -184,46 +223,52 @@ impl Queue {
     /// `dedup` carries the checkers: `devel_version` maps a package to
     /// the devel project's version (or None); `has_open_sr` reports
     /// whether an open submit request targets the package. Either may be
-    /// None (that check is skipped). Returns the new entry, or None when
-    /// the package was skipped.
+    /// None (that check is skipped). Returns the entry, or None when the
+    /// package was skipped.
     ///
     /// In dry-run, the dedup rules are still evaluated and the decision is
     /// printed (would-enqueue / would-skip + reason), but nothing is
     /// added. Returns None in dry-run (nothing was enqueued).
     pub fn add(
         &mut self,
-        package: &str,
-        factory_version: &str,
-        upstream_version: &str,
-        source: &str,
+        entry: QueueEntry,
         dedup: DedupChecks<'_>,
         dry_run: &DryRun,
     ) -> Option<QueueEntry> {
-        if self.in_flight(package) {
-            dry_run.note(&format!("would-skip {package}: task already in flight"));
+        if self.in_flight(&entry.package) {
+            dry_run.note(&format!(
+                "would-skip {}: task already in flight",
+                entry.package
+            ));
             return None;
         }
         if let Some(check) = dedup.devel_version {
-            if let Some(current) = check(package) {
-                if !is_newer(upstream_version, &current) {
+            if let Some(current) = check(&entry.package) {
+                if !is_newer(&entry.upstream_version, &current) {
                     dry_run.note(&format!(
-                        "would-skip {package}: devel already has {current}"
+                        "would-skip {}: devel already has {current}",
+                        entry.package
                     ));
                     return None;
                 }
             }
         }
         if let Some(check) = dedup.has_open_sr {
-            if check(package) {
+            if check(&entry.package) {
                 dry_run.note(&format!(
-                    "would-skip {package}: open submit request already targets it"
+                    "would-skip {}: open submit request already targets it",
+                    entry.package
                 ));
                 return None;
             }
         }
-        let entry = QueueEntry::new(package, factory_version, upstream_version, source);
+        let kind_suffix = match entry.kind {
+            UpdateKind::Security => " (security)",
+            UpdateKind::Routine => "",
+        };
         if !dry_run.allow(&format!(
-            "enqueue {package} {factory_version} -> {upstream_version} (source: {source})"
+            "enqueue {} {} -> {} (source: {}){kind_suffix}",
+            entry.package, entry.factory_version, entry.upstream_version, entry.source
         )) {
             return None;
         }
@@ -231,12 +276,18 @@ impl Queue {
         Some(entry)
     }
 
-    /// Entries awaiting dispatch, in queue order.
+    /// Entries awaiting dispatch, in queue order — security (CVE-driven)
+    /// entries first, then routine version bumps (see
+    /// `docs/leap-and-cve.md`). Within a kind, insertion order is kept
+    /// (the sort is stable).
     pub fn pending(&self) -> Vec<&QueueEntry> {
-        self.entries
+        let mut pending: Vec<&QueueEntry> = self
+            .entries
             .iter()
             .filter(|e| e.status == "pending")
-            .collect()
+            .collect();
+        pending.sort_by_key(|e| e.kind.rank());
+        pending
     }
 
     /// All entries, in queue order.
@@ -276,10 +327,14 @@ mod tests {
         let mut q = Queue::open(&path).unwrap();
         let entry = q
             .add(
-                "foo",
-                "1.9",
-                "2.0",
-                "repology",
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks::none(),
                 &live(),
             )
@@ -294,10 +349,14 @@ mod tests {
         let path = tmp_path();
         let mut q = Queue::open(&path).unwrap();
         q.add(
-            "foo",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &live(),
         )
@@ -305,10 +364,14 @@ mod tests {
         // A second add while the first is pending (in flight) is skipped.
         assert!(q
             .add(
-                "foo",
-                "1.9",
-                "2.1",
-                "repology",
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.1",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks::none(),
                 &live()
             )
@@ -321,10 +384,14 @@ mod tests {
         let path = tmp_path();
         let mut q = Queue::open(&path).unwrap();
         q.add(
-            "foo",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &live(),
         )
@@ -332,10 +399,14 @@ mod tests {
         q.set_status("foo", "done", &live()).unwrap();
         assert!(q
             .add(
-                "foo",
-                "2.0",
-                "2.1",
-                "repology",
+                QueueEntry::new(
+                    "foo",
+                    "2.0",
+                    "2.1",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks::none(),
                 &live()
             )
@@ -350,10 +421,14 @@ mod tests {
         let devel = |_pkg: &str| Some("2.0".to_string());
         assert!(q
             .add(
-                "foo",
-                "1.9",
-                "2.0",
-                "repology",
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks {
                     devel_version: Some(&devel),
                     has_open_sr: None
@@ -364,10 +439,14 @@ mod tests {
         let devel_newer = |_pkg: &str| Some("2.1".to_string());
         assert!(q
             .add(
-                "foo",
-                "1.9",
-                "2.0",
-                "repology",
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks {
                     devel_version: Some(&devel_newer),
                     has_open_sr: None,
@@ -385,10 +464,14 @@ mod tests {
         let devel = |_pkg: &str| Some("1.9".to_string());
         assert!(q
             .add(
-                "foo",
-                "1.9",
-                "2.0",
-                "repology",
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks {
                     devel_version: Some(&devel),
                     has_open_sr: None
@@ -406,10 +489,14 @@ mod tests {
         let devel = |_pkg: &str| None;
         assert!(q
             .add(
-                "foo",
-                "1.9",
-                "2.0",
-                "repology",
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks {
                     devel_version: Some(&devel),
                     has_open_sr: None
@@ -427,10 +514,14 @@ mod tests {
         let has_sr = |_pkg: &str| true;
         assert!(q
             .add(
-                "foo",
-                "1.9",
-                "2.0",
-                "repology",
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks {
                     devel_version: None,
                     has_open_sr: Some(&has_sr)
@@ -448,10 +539,14 @@ mod tests {
         let has_sr = |_pkg: &str| false;
         assert!(q
             .add(
-                "foo",
-                "1.9",
-                "2.0",
-                "repology",
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks {
                     devel_version: None,
                     has_open_sr: Some(&has_sr)
@@ -467,19 +562,27 @@ mod tests {
         let path = tmp_path();
         let mut q = Queue::open(&path).unwrap();
         q.add(
-            "foo",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &live(),
         )
         .unwrap();
         q.add(
-            "bar",
-            "1.0",
-            "1.1",
-            "repology",
+            QueueEntry::new(
+                "bar",
+                "1.0",
+                "1.1",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &live(),
         )
@@ -509,19 +612,27 @@ mod tests {
         let path = tmp_path();
         let mut q = Queue::open(&path).unwrap();
         q.add(
-            "foo",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &live(),
         )
         .unwrap();
         q.add(
-            "bar",
-            "1.0",
-            "1.1",
-            "repology",
+            QueueEntry::new(
+                "bar",
+                "1.0",
+                "1.1",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &live(),
         )
@@ -537,10 +648,14 @@ mod tests {
         let path = tmp_path();
         let mut q = Queue::open(&path).unwrap();
         q.add(
-            "foo",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &live(),
         )
@@ -565,10 +680,14 @@ mod tests {
         // Would-enqueue: the decision is printed, nothing is added.
         assert!(q
             .add(
-                "foo",
-                "1.9",
-                "2.0",
-                "repology",
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks::none(),
                 &dry_run
             )
@@ -582,10 +701,14 @@ mod tests {
         let devel = |_pkg: &str| Some("2.0".to_string());
         assert!(q
             .add(
-                "bar",
-                "1.9",
-                "2.0",
-                "repology",
+                QueueEntry::new(
+                    "bar",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks {
                     devel_version: Some(&devel),
                     has_open_sr: None,
@@ -601,10 +724,14 @@ mod tests {
         let has_sr = |_pkg: &str| true;
         assert!(q
             .add(
-                "baz",
-                "1.9",
-                "2.0",
-                "repology",
+                QueueEntry::new(
+                    "baz",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks {
                     devel_version: None,
                     has_open_sr: Some(&has_sr),
@@ -626,10 +753,14 @@ mod tests {
         let mut q = Queue::open(&path).unwrap();
         let dry_run = dry();
         q.add(
-            "foo",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &live(),
         )
@@ -650,10 +781,14 @@ mod tests {
         let mut q = Queue::open(&path).unwrap();
         let dry_run = dry();
         q.add(
-            "foo",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &live(),
         )
@@ -674,10 +809,14 @@ mod tests {
         let live_run = live();
         let entry = q
             .add(
-                "foo",
-                "1.9",
-                "2.0",
-                "repology",
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
                 DedupChecks::none(),
                 &live_run,
             )
@@ -688,6 +827,98 @@ mod tests {
         assert!(live_run.plan().is_empty());
         let q2 = Queue::open(&path).unwrap();
         assert_eq!(q2.find("foo").unwrap().source, "repology");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn entry_carries_target_and_kind() {
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        let live_run = live();
+        let entry = q
+            .add(
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Security,
+                ),
+                DedupChecks::none(),
+                &live_run,
+            )
+            .unwrap();
+        assert_eq!(entry.target, Target::Factory);
+        assert_eq!(entry.kind, UpdateKind::Security);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pending_orders_security_before_routine() {
+        // Security (CVE-driven) updates are dispatched before routine
+        // version bumps; within a kind, insertion order is kept.
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        let live_run = live();
+        for (pkg, kind) in [
+            ("routine-a", UpdateKind::Routine),
+            ("routine-b", UpdateKind::Routine),
+            ("security-a", UpdateKind::Security),
+            ("security-b", UpdateKind::Security),
+        ] {
+            q.add(
+                QueueEntry::new(pkg, "1.9", "2.0", "repology", &Target::Factory, kind),
+                DedupChecks::none(),
+                &live_run,
+            )
+            .unwrap();
+        }
+        let pending: Vec<&str> = q.pending().iter().map(|e| e.package.as_str()).collect();
+        assert_eq!(
+            pending,
+            vec!["security-a", "security-b", "routine-a", "routine-b"]
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_queue_file_loads_with_factory_routine_defaults() {
+        // Queue files written before target/kind existed (no such
+        // fields) still load: the defaults are Factory / Routine.
+        let path = tmp_path();
+        let old_json = r#"[{"package": "foo", "factory_version": "1.9", "upstream_version": "2.0", "source": "repology", "status": "pending", "created_at": "1", "updated_at": "1"}]"#;
+        fs::write(&path, old_json).unwrap();
+        let q = Queue::open(&path).unwrap();
+        let entry = q.find("foo").unwrap();
+        assert_eq!(entry.target, Target::Factory);
+        assert_eq!(entry.kind, UpdateKind::Routine);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dry_run_security_plan_names_the_kind() {
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        let dry_run = dry();
+        assert!(q
+            .add(
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Security,
+                ),
+                DedupChecks::none(),
+                &dry_run
+            )
+            .is_none());
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: enqueue foo 1.9 -> 2.0 (source: repology) (security)"]
+        );
         let _ = fs::remove_file(&path);
     }
 }

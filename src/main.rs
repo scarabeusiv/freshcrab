@@ -17,7 +17,7 @@ use freshcrab::dry_run::resolve as resolve_dry_run;
 use freshcrab::factory::FactoryClient;
 use freshcrab::http::UreqClient;
 use freshcrab::obs::ObsClient;
-use freshcrab::queue::{DedupChecks, Queue};
+use freshcrab::queue::{DedupChecks, Queue, QueueEntry};
 use freshcrab::watcher::Watcher;
 use std::process::ExitCode;
 
@@ -106,6 +106,16 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // Targets: only Factory is implemented. A Leap target in the config
+    // fails fast here rather than being silently skipped (see
+    // docs/leap-and-cve.md). The per-target loop is the later Leap step.
+    for target in &config.targets {
+        if !target.is_implemented() {
+            eprintln!("target {target} is not yet implemented (see docs/leap-and-cve.md)");
+            return ExitCode::from(1);
+        }
+    }
 
     // Resolve the effective dry-run mode and log it loudly.
     let env_dry_run = std::env::var("FRESHCRAB_DRY_RUN").ok();
@@ -220,10 +230,14 @@ fn main() -> ExitCode {
             }
         };
         queue.add(
-            package,
-            &entry.factory_version,
-            &entry.upstream_version,
-            &entry.source,
+            QueueEntry::new(
+                package,
+                &entry.factory_version,
+                &entry.upstream_version,
+                &entry.source,
+                &entry.target,
+                entry.kind,
+            ),
             DedupChecks {
                 devel_version: Some(&devel_version),
                 has_open_sr: Some(&has_open_sr),

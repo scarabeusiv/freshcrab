@@ -5,6 +5,13 @@
 # To watch only a specific set, list packages under `packages` (empty
 # means: all of Factory except the exclusions).
 
+# Distributions to watch. Only `factory` is implemented. A Leap target
+# (e.g. `leap-16.0`) parses but the pipeline refuses to run it until
+# the Leap step lands — see docs/leap-and-cve.md. Do not add a Leap
+# target here until that step is done.
+targets:
+  - factory
+
 # Packages to monitor. Empty = all of Factory except the exclusions.
 packages:
 

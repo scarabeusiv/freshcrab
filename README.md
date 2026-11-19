@@ -22,6 +22,13 @@ later phase; `worker/` currently holds only the agent brief. The watcher
 runs in report-only mode by default: it queues and reports what it would
 update, and files nothing.
 
+Leap and CVE validation are a planned later step, after this
+scaffolding is reviewed — see `docs/leap-and-cve.md`. The scaffold is
+already in place (distribution targets with Leap gated off, the CVE
+validation rule and validator interface, security-first queue
+ordering), but the Leap watcher logic, the CVE data-source
+integration, and Leap SR filing are not implemented.
+
 ## Collectors (priority order)
 
 1. **Repology** (primary) — aggregates package versions across hundreds
@@ -206,6 +213,10 @@ src/
                        mutation consults (CLI > env > config)
   collectors/          Repology, Anitya, PyPI, Distrowatch, upstream check
   factory.rs           Factory version via the OBS API
+  target.rs            distribution targets (Factory / Leap) + the
+                       per-target update-policy hook
+  cve.rs               CVE validation: the changelog-carries-the-CVE rule
+                       + the validator interface (not yet implemented)
   watcher.rs           collectors + confirmation + Factory compare
   queue.rs             queue state file, deduplication
   obs.rs               OBS client for the dedup checks
@@ -216,9 +227,11 @@ tests/
   test_watcher.rs      watcher with canned fixtures (no live network)
   test_queue.rs        deduplication + persistence
   test_config.rs       config loading, validation, exclusions
+  test_cve.rs          CVE id parsing + the changelog rule + the stub
   fixtures/            canned Repology / Anitya / PyPI / Distrowatch / spec
 docs/
   architecture.md      component diagram + data flow + gate rules
+  leap-and-cve.md      Leap + CVE validation design (planned, scaffolded)
   runbook.md           run the container, configure the package set, pause, read the queue
 ```
 

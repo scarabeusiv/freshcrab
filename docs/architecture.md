@@ -145,6 +145,43 @@ the operation proceeds. The effective mode resolves as CLI flag
 (`--dry-run` / `--live`) > env var (`FRESHCRAB_DRY_RUN`) > config
 (`dry_run`, default `true`) and is logged loudly at startup.
 
+## Leap and CVE validation (planned, scaffolded)
+
+Leap and CVE validation are a later step, after the scaffolding is
+reviewed — see `docs/leap-and-cve.md` for the full design. The
+scaffold is already in the code so that step plugs into named,
+tested seams:
+
+- **Targets** (`src/target.rs`): a `Target` is `Factory` or
+  `Leap { version }`, with the OBS project and an
+  implemented/not-yet-implemented gate. Config has a `targets:`
+  list (default `[factory]`); a Leap target parses but the pipeline
+  refuses to run it. Queue entries carry their target.
+- **CVE validation** (`src/cve.rs`): the rule is that a security
+  fix's changelog (`.changes`) entry must carry the CVE reference,
+  and validation compares the changelog against the CVE list. The
+  `changelog_names_cve` check is implemented and tested; the
+  `CveValidator` trait is the interface the later step implements
+  against the CVE data source and the OBS changelog. The Factory
+  path never calls a validator. The trait also carries a
+  `has_regression_test` hook: a backport is not complete without a
+  `%check` regression test that fails on the unpatched code and
+  passes with the fix (or a documented reason why none is
+  feasible) — the changelog is the claim, the test is the proof.
+- **Security-first ordering** (`src/queue.rs`): entries carry a
+  kind — `Routine` or `Security` (CVE-driven) — and `pending()`
+  returns security entries before routine ones. The Factory path is
+  routine-only for now.
+
+Why Leap is different: stable distros backport security patches
+instead of bumping versions, so a CVE is fixed when the backported
+patch is present (the changelog names it), not when the version
+number rises. Security is the highest-priority work the system does
+(see `docs/leap-and-cve.md` for the security-first rationale: the
+queue ordering, the changelog verification, and the system itself
+staying secure — no credentials in the repo/image/fixtures, every
+SR through the review gate, no bypassing the dedup/review checks).
+
 ## Secrets
 
 No credentials are read from the repo. OBS credentials (oscrc) and the
@@ -173,8 +210,13 @@ src/
                        mutation consults (CLI > env > config)
   collectors/          Repology, Anitya, PyPI, Distrowatch, upstream check
   factory.rs           Factory version via the OBS API
+  target.rs            distribution targets (Factory / Leap) + the
+                       per-target update-policy hook
+  cve.rs               CVE validation: the changelog-carries-the-CVE rule
+                       + the validator interface (not yet implemented)
   watcher.rs           collectors + confirmation + Factory compare
-  queue.rs             queue state file, deduplication
+  queue.rs             queue state file, deduplication, security-first
+                       ordering (kind: routine / security)
   obs.rs               OBS client for the dedup checks
 worker/
   brief.md             agent brief for the update worker (later phase)
@@ -183,9 +225,11 @@ tests/
   test_watcher.rs      watcher with canned fixtures (no live network)
   test_queue.rs        deduplication + persistence
   test_config.rs       config loading, validation, exclusions
+  test_cve.rs          CVE id parsing + the changelog rule + the stub
   fixtures/            canned Repology / Anitya / PyPI / Distrowatch / spec
 docs/
   architecture.md      this file
+  leap-and-cve.md      Leap + CVE validation design (planned, scaffolded)
   runbook.md           run the container, configure the package set, pause, read the queue
   assets/logo.svg      project icon (hand-built vector, rpmcrab style)
 

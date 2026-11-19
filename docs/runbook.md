@@ -24,6 +24,12 @@ podman run --rm -v "$PWD/config.yaml:/app/config.yaml:ro" freshcrab --packages f
 Copy `config.yaml` and edit it:
 
 ```yaml
+# Distributions to watch. Only `factory` is implemented; a Leap target
+# (e.g. `leap-16.0`) parses but the pipeline refuses to run it until
+# the Leap step lands (see docs/leap-and-cve.md).
+targets:
+  - factory
+
 # Watch only these packages (empty = all of Factory except exclusions).
 packages:
   - curl
@@ -109,15 +115,21 @@ The watcher prints the queue as JSON (one entry per package behind):
     "package": "foo",
     "factory_version": "1.9",
     "upstream_version": "2.0",
-    "status": "pending"
+    "status": "pending",
+    "target": "factory",
+    "kind": "routine"
   }
 ]
 ```
 
-The persistent queue state file (`queue.json`, written by the queue
-module) holds the same entries plus `created_at` / `updated_at` and the
-full status set: `pending`, `in_progress`, `done`, `blocked`,
-`escalated`. `blocked` and `escalated` entries need a human (see
+`target` is the distribution (`factory` today; Leap targets are a
+planned later step — see `docs/leap-and-cve.md`). `kind` is
+`routine` (version bump) or `security` (CVE-driven); security
+entries are dispatched before routine ones. The persistent queue
+state file (`queue.json`, written by the queue module) holds the
+same entries plus `created_at` / `updated_at` and the full status
+set: `pending`, `in_progress`, `done`, `blocked`, `escalated`.
+`blocked` and `escalated` entries need a human (see
 `worker/brief.md` for what escalates).
 
 ## Tools in the container
