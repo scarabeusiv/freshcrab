@@ -5,7 +5,7 @@
 //! `python3-` or `python-` (see `crate::collectors::pypi_name`); the
 //! prefix is stripped for the PyPI name.
 
-use crate::collectors::{encode, Candidate, Collector};
+use crate::collectors::{encode_path, Candidate, Collector};
 use crate::http::{HttpClient, HttpError};
 use serde::Deserialize;
 
@@ -54,7 +54,7 @@ impl<'a> Collector for PypiCollector<'a> {
         // Only Python packages reach this collector; the caller maps the
         // OBS name to the PyPI name. Here the package is already the
         // PyPI name.
-        let url = format!("{PYPI_API}/{}/json", encode(package));
+        let url = format!("{PYPI_API}/{}/json", encode_path(package));
         let body = self.http.get(&url)?;
         Ok(parse_pypi_response(&body))
     }

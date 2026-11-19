@@ -5,7 +5,9 @@
 //! blocked / escalated). Before an entry is added, the deduplication
 //! checks run: skip the package when the devel project already has the
 //! new version, when an open submit request already targets the package,
-//! or when a task for the package is already in flight. The OBS-backed
+//! or when a task for the package is already in flight. When the
+//! open-SR check itself fails, the package is skipped (fail-closed)
+//! rather than queued on an unchecked dedup. The OBS-backed
 //! checkers live in `obs.rs`; the queue takes closures so the tests can
 //! inject fakes.
 //!
@@ -17,8 +19,10 @@
 use crate::dry_run::DryRun;
 use crate::target::Target;
 use crate::version::is_newer;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 
 pub const STATUSES: &[&str] = &["pending", "in_progress", "done", "blocked", "escalated"];
@@ -104,8 +108,11 @@ fn now_iso() -> String {
 /// devel project is unknown). Used by `Queue::add` for deduplication.
 pub type DevelVersionCheck<'a> = dyn Fn(&str) -> Option<String> + 'a;
 /// Reports whether an open submit request targets a package. Used by
-/// `Queue::add` for deduplication.
-pub type OpenSrCheck<'a> = dyn Fn(&str) -> bool + 'a;
+/// `Queue::add` for deduplication. Returns an error when the check
+/// itself fails (e.g. the OBS search API 401s without credentials):
+/// `Queue::add` treats that as fail-closed and skips the package
+/// rather than queueing it on an unchecked dedup.
+pub type OpenSrCheck<'a> = dyn Fn(&str) -> Result<bool, QueueError> + 'a;
 
 /// The dedup checkers for `Queue::add`. Both are optional; a missing
 /// checker skips that check.
@@ -137,17 +144,49 @@ impl std::fmt::Display for QueueError {
 impl std::error::Error for QueueError {}
 
 /// The queue, backed by a JSON state file.
+///
+/// Writers are serialized with an exclusive flock on a lock file next
+/// to the queue (`<path>.lock`), held from `open` until the Queue is
+/// dropped. flock is released when the process exits, so a crashed
+/// writer cannot leave a stale lock behind. Without it, two writers
+/// (cron + manual) racing a read-modify-write would silently lose
+/// entries (last rename wins).
 pub struct Queue {
     path: String,
     entries: Vec<QueueEntry>,
+    /// The lock file, held open for the Queue's lifetime. It is never
+    /// read — it exists only to hold the flock — so the dead-code lint
+    /// is silenced deliberately.
+    #[allow(dead_code)]
+    lock_file: Option<std::fs::File>,
 }
 
 impl Queue {
     /// Open the queue at `path`. A missing file is an empty queue.
     pub fn open(path: &str) -> Result<Self, QueueError> {
+        // Take the exclusive lock before reading: the open → add →
+        // save sequence is a read-modify-write, and the lock is what
+        // makes it atomic against a second writer. The lock is taken
+        // non-blocking (fail fast): a second writer errors out
+        // immediately instead of hanging behind the first.
+        let lock_path = format!("{path}.lock");
+        // The lock file is never written to — it exists only to hold
+        // the flock — so it is opened without truncation.
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| QueueError(format!("cannot open queue lock file {lock_path}: {e}")))?;
+        lock_file.try_lock_exclusive().map_err(|e| {
+            QueueError(format!(
+                "cannot lock queue file {path} (another writer holds it?): {e}"
+            ))
+        })?;
         let mut queue = Queue {
             path: path.to_string(),
             entries: Vec::new(),
+            lock_file: Some(lock_file),
         };
         if Path::new(path).exists() {
             queue.load()?;
@@ -173,9 +212,43 @@ impl Queue {
         }
         let text = serde_json::to_string_pretty(&self.entries)
             .map_err(|e| QueueError(format!("cannot serialize queue: {e}")))?;
-        let tmp = format!("{}.tmp", self.path);
-        fs::write(&tmp, format!("{text}\n"))
-            .map_err(|e| QueueError(format!("cannot write queue file {}: {e}", tmp)))?;
+        // A unique tmp name (pid + nanoseconds, created with O_EXCL)
+        // so two writers can never share a tmp file, and fsync before
+        // the atomic rename so a crash cannot leave a torn queue file.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let mut tmp = String::new();
+        let mut file = None;
+        for attempt in 0..10 {
+            tmp = format!("{path}.{pid}.{nanos}.{attempt}.tmp", path = self.path);
+            match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+                Ok(f) => {
+                    file = Some(f);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(QueueError(format!("cannot write queue file {tmp}: {e}")));
+                }
+            }
+        }
+        let mut file = match file {
+            Some(f) => f,
+            None => {
+                return Err(QueueError(format!(
+                    "cannot allocate a unique tmp queue file for {}",
+                    self.path
+                )));
+            }
+        };
+        file.write_all(format!("{text}\n").as_bytes())
+            .map_err(|e| QueueError(format!("cannot write queue file {tmp}: {e}")))?;
+        file.sync_all()
+            .map_err(|e| QueueError(format!("cannot fsync queue file {tmp}: {e}")))?;
+        drop(file);
         fs::rename(&tmp, &self.path)
             .map_err(|e| QueueError(format!("cannot replace queue file {}: {e}", self.path)))?;
         Ok(())
@@ -187,11 +260,13 @@ impl Queue {
     }
 
     /// True when a task for `package` is already pending or running.
+    /// Checks every entry, not just the first: once a non-pending
+    /// entry (blocked / done) exists for a package, `find` would return
+    /// that one and miss a later pending duplicate.
     pub fn in_flight(&self, package: &str) -> bool {
-        match self.find(package) {
-            Some(entry) => entry.status == "pending" || entry.status == "in_progress",
-            None => false,
-        }
+        self.entries
+            .iter()
+            .any(|e| e.package == package && (e.status == "pending" || e.status == "in_progress"))
     }
 
     /// Set the status of the entry for `package`. In dry-run, prints what
@@ -202,11 +277,14 @@ impl Queue {
         status: &str,
         dry_run: &DryRun,
     ) -> Result<(), QueueError> {
-        if !STATUSES.contains(&status) {
-            return Err(QueueError(format!("unknown queue status: {status:?}")));
-        }
+        // The dry-run guard comes first: in dry-run an invalid status
+        // is a would-do, not an error (the guard records the plan and
+        // returns Ok). Validation applies in live mode only.
         if !dry_run.allow(&format!("set {package} status to {status}")) {
             return Ok(());
+        }
+        if !STATUSES.contains(&status) {
+            return Err(QueueError(format!("unknown queue status: {status:?}")));
         }
         let entry = self
             .entries
@@ -225,6 +303,12 @@ impl Queue {
     /// whether an open submit request targets the package. Either may be
     /// None (that check is skipped). Returns the entry, or None when the
     /// package was skipped.
+    ///
+    /// When the open-SR check itself errors, the package is skipped
+    /// (fail-closed) rather than queued on an unchecked dedup. When an
+    /// entry for the package already exists (done, blocked, or
+    /// escalated), it is refreshed in place instead of pushing a
+    /// duplicate — one entry per package, always.
     ///
     /// In dry-run, the dedup rules are still evaluated and the decision is
     /// printed (would-enqueue / would-skip + reason), but nothing is
@@ -254,18 +338,56 @@ impl Queue {
             }
         }
         if let Some(check) = dedup.has_open_sr {
-            if check(&entry.package) {
-                dry_run.note(&format!(
-                    "would-skip {}: open submit request already targets it",
-                    entry.package
-                ));
-                return None;
+            match check(&entry.package) {
+                Ok(true) => {
+                    dry_run.note(&format!(
+                        "would-skip {}: open submit request already targets it",
+                        entry.package
+                    ));
+                    return None;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // Fail closed: the dedup check could not run (the
+                    // OBS search API 401s without credentials, and no
+                    // credentials are plumbed yet — that is the filing
+                    // phase's work). Queueing anyway would file a
+                    // duplicate submit request, so skip the package
+                    // and say so loudly instead of treating the failed
+                    // check as "no open SR".
+                    eprintln!(
+                        "warning: open-SR check failed for {}: {e}; skipping (fail-closed)",
+                        entry.package
+                    );
+                    return None;
+                }
             }
         }
         let kind_suffix = match entry.kind {
             UpdateKind::Security => " (security)",
             UpdateKind::Routine => "",
         };
+        // One entry per package: when an entry already exists (done,
+        // blocked, or escalated — not in flight, or `in_flight` above
+        // would have skipped), refresh it in place instead of pushing
+        // a duplicate. A duplicate pending entry would also make
+        // `set_status` act on the wrong (first) entry.
+        if let Some(existing) = self.entries.iter_mut().find(|e| e.package == entry.package) {
+            if !dry_run.allow(&format!(
+                "update {} {} -> {} (source: {}){kind_suffix}",
+                entry.package, entry.factory_version, entry.upstream_version, entry.source
+            )) {
+                return None;
+            }
+            existing.factory_version = entry.factory_version;
+            existing.upstream_version = entry.upstream_version;
+            existing.source = entry.source;
+            existing.target = entry.target;
+            existing.kind = entry.kind;
+            existing.status = "pending".to_string();
+            existing.updated_at = now_iso();
+            return Some(existing.clone());
+        }
         if !dry_run.allow(&format!(
             "enqueue {} {} -> {} (source: {}){kind_suffix}",
             entry.package, entry.factory_version, entry.upstream_version, entry.source
@@ -311,13 +433,20 @@ mod tests {
     }
 
     fn tmp_path() -> String {
+        // A process-wide counter (not just the clock) makes the path
+        // unique: parallel tests can otherwise share a nanosecond and
+        // collide on the same queue file.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         format!(
-            "{}/freshcrab-test-queue-{nanos}.json",
-            env::temp_dir().display()
+            "{}/freshcrab-test-queue-{}-{n}-{nanos}.json",
+            env::temp_dir().display(),
+            std::process::id()
         )
     }
 
@@ -511,7 +640,7 @@ mod tests {
     fn open_sr_is_skipped() {
         let path = tmp_path();
         let mut q = Queue::open(&path).unwrap();
-        let has_sr = |_pkg: &str| true;
+        let has_sr = |_pkg: &str| Ok(true);
         assert!(q
             .add(
                 QueueEntry::new(
@@ -536,7 +665,7 @@ mod tests {
     fn no_open_sr_is_queued() {
         let path = tmp_path();
         let mut q = Queue::open(&path).unwrap();
-        let has_sr = |_pkg: &str| false;
+        let has_sr = |_pkg: &str| Ok(false);
         assert!(q
             .add(
                 QueueEntry::new(
@@ -590,6 +719,8 @@ mod tests {
         q.set_status("bar", "blocked", &live()).unwrap();
         q.save(&live()).unwrap();
 
+        // The first Queue holds the flock; drop it before reopening.
+        drop(q);
         let q2 = Queue::open(&path).unwrap();
         assert_eq!(q2.entries().len(), 2);
         let foo = q2.find("foo").unwrap();
@@ -721,7 +852,7 @@ mod tests {
             "[dry-run] would-skip bar: devel already has 2.0"
         );
         // Would-skip (open SR): the reason is printed.
-        let has_sr = |_pkg: &str| true;
+        let has_sr = |_pkg: &str| Ok(true);
         assert!(q
             .add(
                 QueueEntry::new(
@@ -825,6 +956,8 @@ mod tests {
         q.save(&live_run).unwrap();
         assert!(Path::new(&path).exists());
         assert!(live_run.plan().is_empty());
+        // The first Queue holds the flock; drop it before reopening.
+        drop(q);
         let q2 = Queue::open(&path).unwrap();
         assert_eq!(q2.find("foo").unwrap().source, "repology");
         let _ = fs::remove_file(&path);
@@ -918,6 +1051,178 @@ mod tests {
         assert_eq!(
             dry_run.plan(),
             vec!["[dry-run] would: enqueue foo 1.9 -> 2.0 (source: repology) (security)"]
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn blocked_then_requeue_twice_updates_in_place() {
+        // A blocked entry re-queued twice stays a single entry: the
+        // re-add refreshes it in place instead of pushing duplicates
+        // (which also made `set_status` act on the wrong entry).
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        let live_run = live();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live_run,
+        )
+        .unwrap();
+        q.set_status("foo", "blocked", &live_run).unwrap();
+        // First re-queue: the blocked entry is refreshed, not duplicated.
+        let entry = q
+            .add(
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.1",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
+                DedupChecks::none(),
+                &live_run,
+            )
+            .unwrap();
+        assert_eq!(entry.upstream_version, "2.1");
+        assert_eq!(entry.status, "pending");
+        assert_eq!(q.entries().len(), 1);
+        // Second re-queue after blocking again: still one entry.
+        q.set_status("foo", "blocked", &live_run).unwrap();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.2",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live_run,
+        )
+        .unwrap();
+        assert_eq!(q.entries().len(), 1);
+        assert_eq!(q.find("foo").unwrap().upstream_version, "2.2");
+        assert_eq!(q.find("foo").unwrap().status, "pending");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn corrupt_queue_json_is_error() {
+        let path = tmp_path();
+        fs::write(&path, "not json").unwrap();
+        assert!(Queue::open(&path).is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_sr_check_error_is_fail_closed() {
+        // When the open-SR dedup check itself fails (e.g. the OBS
+        // search API 401s without credentials), the package is skipped
+        // rather than queued on an unchecked dedup.
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        let has_sr = |_pkg: &str| -> Result<bool, QueueError> {
+            Err(QueueError("open-SR check failed".to_string()))
+        };
+        assert!(q
+            .add(
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
+                DedupChecks {
+                    devel_version: None,
+                    has_open_sr: Some(&has_sr)
+                },
+                &live()
+            )
+            .is_none());
+        assert!(q.entries().is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dry_run_update_in_place_prints_decision_writes_nothing() {
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        let live_run = live();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live_run,
+        )
+        .unwrap();
+        q.set_status("foo", "done", &live_run).unwrap();
+        let dry_run = dry();
+        assert!(q
+            .add(
+                QueueEntry::new(
+                    "foo",
+                    "2.0",
+                    "2.1",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
+                DedupChecks::none(),
+                &dry_run
+            )
+            .is_none());
+        assert_eq!(q.find("foo").unwrap().upstream_version, "2.0");
+        assert_eq!(q.find("foo").unwrap().status, "done");
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: update foo 2.0 -> 2.1 (source: repology)"]
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dry_run_set_status_invalid_status_is_ok() {
+        // In dry-run an invalid status is a would-do, not an error:
+        // the guard records the plan and returns Ok.
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        let dry_run = dry();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        assert!(q.set_status("foo", "bogus", &dry_run).is_ok());
+        assert_eq!(q.find("foo").unwrap().status, "pending");
+        assert_eq!(
+            dry_run.plan(),
+            vec!["[dry-run] would: set foo status to bogus"]
         );
         let _ = fs::remove_file(&path);
     }

@@ -40,8 +40,9 @@ integration, and Leap SR filing are not implemented.
 
 Freshmeat is defunct (shut down in 2014) and is deliberately not used. A
 candidate version is confirmed before queueing when it comes from
-Repology with status `newest`, when at least two collectors agree, or
-when a direct upstream check confirms it. See `docs/architecture.md`.
+Repology with status `newest` in at least two distinct repos, when at
+least two collectors agree, or when a direct upstream check confirms
+it. See `docs/architecture.md`.
 
 ## Run it (container)
 
@@ -69,8 +70,9 @@ Actions secrets; in the container they are injected via environment
 variables or a mounted file (see `docs/runbook.md`). The Factory and
 devel-project reads use the OBS public API and need no credentials. The
 open-submit-request dedup check uses the OBS search API, which has no
-public equivalent — without OBS credentials it warns and proceeds (the
-worker re-checks before filing).
+public equivalent — without OBS credentials the check fails and the
+package is skipped (fail-closed) instead of being queued on an
+unchecked dedup; credential plumbing is the filing phase's work.
 
 ## Tools in the container
 

@@ -74,8 +74,8 @@ The mode resolves as CLI flag > env var > config file:
 | Source | How |
 |---|---|
 | CLI flag | `--dry-run` (force on) / `--live` (force off) |
-| Env var | `FRESHCRAB_DRY_RUN=true|false` |
-| Config | `dry_run:` in `config.yaml` (default `true`) |
+| Env var | `FRESHCRAB_DRY_RUN=true|false` (also accepts `1`/`0`/`yes`/`no`; an empty value is unset) |
+| Config | `dry_run:` in `config.yaml` (default `true`; only `true`/`false` — the config file does not accept `yes`/`no`) |
 
 The effective mode is logged loudly at startup:
 
@@ -148,7 +148,9 @@ them by name:
 
 The skill docs are NOT in this repo. They are fetched at image build
 time from tag v3.24.3 of openSUSE/openSUSE-packaging-skill (see the
-`ARG PACKAGING_SKILL_TAG` in the Dockerfile) and copied into the image.
+`ARG PACKAGING_SKILL_TAG` / `ARG PACKAGING_SKILL_SHA` in the Dockerfile —
+the build verifies the clone matches the pinned SHA, so a tag that moves
+fails the build instead of silently changing the image) and copied into the image.
 They are the only thing in the image that is not a distro package.
 The tag is bumped by the weekly skill-tag-bump workflow
 (`.github/workflows/skill-tag-bump.yml`), which opens a PR when a new
@@ -169,8 +171,9 @@ The watcher and queue mostly need no credentials in report-only mode:
 the Factory and devel-project reads use the OBS public API
 (`/public/source/...`). The open-submit-request dedup check uses the
 OBS search API, which has no public equivalent and returns 401 without
-credentials — without OBS credentials it warns and proceeds, treating
-the check as "no open SR" (the worker re-checks before filing).
+credentials — without OBS credentials the check fails and the package
+is skipped (fail-closed) instead of being queued on an unchecked
+dedup; credential plumbing is the filing phase's work.
 
 ## Run the tests
 

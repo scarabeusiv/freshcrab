@@ -60,11 +60,14 @@ impl Target {
     }
 }
 
-/// A Leap release number: digits and dots, e.g. `"16.0"`, `"15.6"`.
+/// A Leap release number: `major.minor`, e.g. `"16.0"`, `"15.6"`.
+/// A bare major (`"16"`) is a typo, not a release, so it is rejected.
 fn is_leap_version(version: &str) -> bool {
-    !version.is_empty()
-        && version.chars().all(|c| c.is_ascii_digit() || c == '.')
-        && version.chars().any(|c| c.is_ascii_digit())
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 2
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 impl fmt::Display for Target {
@@ -146,7 +149,10 @@ mod tests {
         assert!(Target::parse("sles").is_err());
         assert!(Target::parse("leap").is_err());
         assert!(Target::parse("leap-").is_err());
+        assert!(Target::parse("leap-16").is_err());
         assert!(Target::parse("leap-16.x").is_err());
+        assert!(Target::parse("leap-16.").is_err());
+        assert!(Target::parse("leap-16.0.1").is_err());
         assert!(Target::parse("").is_err());
     }
 

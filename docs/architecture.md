@@ -94,8 +94,9 @@ needs a second source.
 
 A candidate version is queued only when it is confirmed:
 
-- the Repology candidate has status `newest` (it aggregates many
-  sources, so `newest` is multi-source by construction), or
+- the Repology candidate has status `newest` in at least two distinct
+  repos (a single `newest` entry is a max, not a consensus, so it does
+  not confirm on its own), or
 - at least two collectors agree on the same version (RPM version
   equality), or
 - a direct upstream check confirms the version.
@@ -189,8 +190,9 @@ GitHub token are injected via environment variables / mounted secrets
 (GitHub Actions secrets in CI, a mounted file in the container). The
 Factory and devel-project reads use the OBS public API and need no
 credentials; the open-submit-request dedup check uses the OBS search
-API, which has no public equivalent — without credentials it warns and
-proceeds (fail-open; the worker re-checks before filing).
+API, which has no public equivalent — without credentials it fails and
+the package is skipped (fail-closed) instead of being queued on an
+unchecked dedup; credential plumbing is the filing phase's work.
 
 ## Layout
 

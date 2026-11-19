@@ -106,12 +106,16 @@ pub fn resolve(cli: Option<bool>, env: Option<String>, config: bool) -> Result<D
         return Ok(DryRun::new(flag));
     }
     if let Some(value) = env {
-        match parse_env_bool(&value) {
-            Some(parsed) => return Ok(DryRun::new(parsed)),
-            None => {
-                return Err(format!(
-                    "invalid FRESHCRAB_DRY_RUN value: {value:?} (expected true/false/1/0/yes/no)"
-                ));
+        // An empty env var is unset: fall back to the config value
+        // instead of hard-failing on an empty string.
+        if !value.trim().is_empty() {
+            match parse_env_bool(&value) {
+                Some(parsed) => return Ok(DryRun::new(parsed)),
+                None => {
+                    return Err(format!(
+                        "invalid FRESHCRAB_DRY_RUN value: {value:?} (expected true/false/1/0/yes/no)"
+                    ));
+                }
             }
         }
     }
@@ -174,6 +178,15 @@ mod tests {
     #[test]
     fn resolve_invalid_env_is_error() {
         assert!(resolve(None, Some("maybe".to_string()), true).is_err());
+    }
+
+    #[test]
+    fn resolve_empty_env_falls_back_to_config() {
+        // An empty env var is unset, not an error.
+        assert!(resolve(None, Some("".to_string()), true).unwrap().enabled());
+        assert!(!resolve(None, Some("   ".to_string()), false)
+            .unwrap()
+            .enabled());
     }
 
     #[test]

@@ -79,18 +79,27 @@ pub enum CveValidation {
 
 /// The primary check: does the changelog text reference this CVE?
 ///
-/// Case-insensitive on the id. The match must not be a prefix of a
-/// longer number, so `CVE-2026-123` does not match a changelog that
-/// names `CVE-2026-1234`. Returns false for an empty changelog.
+/// Case-insensitive on the id. The match must be a standalone id: a
+/// digit right after means the changelog names a longer number that
+/// merely starts with this id (`CVE-2026-123` does not match a
+/// changelog that names `CVE-2026-1234`), and an alphanumeric right
+/// before means the match is part of a longer token (`XCVE-2026-12345`
+/// does not match `CVE-2026-12345`). Returns false for an empty
+/// changelog.
 pub fn changelog_names_cve(changelog: &str, cve: &CveId) -> bool {
     let haystack = changelog.to_ascii_lowercase();
     let needle = cve.as_str().to_ascii_lowercase();
     let mut start = 0;
     while let Some(pos) = haystack[start..].find(&needle) {
-        let after = start + pos + needle.len();
-        // A digit right after the match means the changelog names a
-        // longer CVE number that merely starts with this id.
-        if after >= haystack.len() || !haystack.as_bytes()[after].is_ascii_digit() {
+        let match_start = start + pos;
+        let after = match_start + needle.len();
+        // Leading boundary: the char before must not be alphanumeric.
+        let leading_ok =
+            match_start == 0 || !haystack.as_bytes()[match_start - 1].is_ascii_alphanumeric();
+        // Trailing boundary: a digit right after means the changelog
+        // names a longer CVE number that merely starts with this id.
+        let trailing_ok = after >= haystack.len() || !haystack.as_bytes()[after].is_ascii_digit();
+        if leading_ok && trailing_ok {
             return true;
         }
         start = after;
@@ -221,6 +230,16 @@ mod tests {
         // But the full id does match.
         let full = CveId::parse("CVE-2026-01234").unwrap();
         assert!(changelog_names_cve(changelog, &full));
+    }
+
+    #[test]
+    fn changelog_names_cve_no_leading_collision() {
+        // "XCVE-..." is a longer token, not the CVE id.
+        let cve = CveId::parse("CVE-2026-12345").unwrap();
+        assert!(!changelog_names_cve("- Fix XCVE-2026-12345.\n", &cve));
+        // A non-alphanumeric before the id is a boundary: it matches.
+        assert!(changelog_names_cve("- Fix (CVE-2026-12345).\n", &cve));
+        assert!(changelog_names_cve("- Fix CVE-2026-12345.\n", &cve));
     }
 
     #[test]

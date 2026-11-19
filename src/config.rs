@@ -132,8 +132,13 @@ fn parse_scalar(raw: &str) -> Result<Value, ConfigError> {
     if raw == "false" {
         return Ok(Value::Bool(false));
     }
-    if let Ok(n) = raw.parse::<i64>() {
-        return Ok(Value::Int(n));
+    // Integers are plain digits with an optional `-`; a leading `+`
+    // is rejected (Rust's parser accepts it, the config subset does
+    // not — `+3` would otherwise parse as 3).
+    if !raw.starts_with('+') {
+        if let Ok(n) = raw.parse::<i64>() {
+            return Ok(Value::Int(n));
+        }
     }
     // Quoted string.
     if raw.len() >= 2
@@ -421,6 +426,9 @@ mod tests {
         assert!(load_config_text("concurrency: -1\n").is_err());
         assert!(load_config_text("concurrency: three\n").is_err());
         assert!(load_config_text("concurrency: true\n").is_err());
+        // A leading `+` is not a config integer (Rust's parser would
+        // accept it; the subset does not).
+        assert!(load_config_text("concurrency: +3\n").is_err());
     }
 
     #[test]

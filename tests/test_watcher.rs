@@ -14,7 +14,7 @@ fn fixture(name: &str) -> String {
 }
 
 fn watcher_for(foo_spec_version: &str, distrowatch_html: &str) -> Watcher<'static> {
-    let repology = r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#;
+    let repology = r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#;
     let http = FakeHttpClient::new()
         .with("https://repology.org/api/v1/project/foo", repology)
         .with(
@@ -93,7 +93,7 @@ fn dry_run_watcher_prints_would_queue_and_writes_nothing() {
     // WOULD queue; the queue state is untouched (there is no queue file
     // here at all — the watcher never writes one).
     let dry_run = DryRun::new(true);
-    let repology = r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#;
+    let repology = r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#;
     let http = FakeHttpClient::new()
         .with("https://repology.org/api/v1/project/foo", repology)
         .with(

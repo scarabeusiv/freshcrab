@@ -5,7 +5,7 @@
 //! `items` array; each item has a `version` field holding the latest known
 //! version. No authentication is needed for these read-only queries.
 
-use crate::collectors::{encode, Candidate, Collector};
+use crate::collectors::{encode_query, Candidate, Collector};
 use crate::http::{HttpClient, HttpError};
 use serde::Deserialize;
 
@@ -57,7 +57,10 @@ impl<'a> Collector for AnityaCollector<'a> {
     }
 
     fn latest_version(&self, package: &str) -> Result<Option<Candidate>, HttpError> {
-        let url = format!("{ANITYA_API}/projects/?name={}", encode(package));
+        // The name goes into a query value (`?name=`), where `+`
+        // decodes as a space — so it uses the query encoder, not the
+        // path encoder (which keeps `+` raw).
+        let url = format!("{ANITYA_API}/projects/?name={}", encode_query(package));
         let body = self.http.get(&url)?;
         Ok(parse_anitya_response(&body))
     }
@@ -97,5 +100,19 @@ mod tests {
     #[test]
     fn invalid_json_is_none() {
         assert!(parse_anitya_response("not json").is_none());
+    }
+
+    #[test]
+    fn plus_in_name_is_query_encoded() {
+        // `gcc-c++` must reach Anitya as `gcc-c%2B%2B`: a raw `+` in a
+        // query value decodes as a space and mis-queries.
+        use crate::http::FakeHttpClient;
+        let http = FakeHttpClient::new().with(
+            "https://release-monitoring.org/api/v2/projects/?name=gcc-c%2B%2B",
+            r#"{"items": [{"name": "gcc-c++", "version": "14.2"}]}"#,
+        );
+        let collector = AnityaCollector::new(&http);
+        let candidate = collector.latest_version("gcc-c++").unwrap().unwrap();
+        assert_eq!(candidate.version, "14.2");
     }
 }

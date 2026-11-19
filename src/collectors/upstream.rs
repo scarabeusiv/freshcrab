@@ -71,11 +71,13 @@ impl<'a> UpstreamChecker for GithubReleasesChecker<'a> {
     fn confirm(&self, _package: &str, version: &str) -> Result<bool, HttpError> {
         // The repo is caller-supplied config; validate its shape before
         // interpolating it into the URL (a `?` or `/` in it would rewrite
-        // the request).
+        // the request). Dot-only segments (`.`, `..`) are rejected too:
+        // they pass the charset check but are not repository names.
         let segments: Vec<&str> = self.repo.split('/').collect();
         let valid = segments.len() == 2
             && segments.iter().all(|seg| {
                 !seg.is_empty()
+                    && !seg.chars().all(|ch| ch == '.')
                     && seg
                         .chars()
                         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
@@ -117,6 +119,11 @@ mod tests {
         let checker = GithubReleasesChecker::new(&http, "owner/repo?per_page=1");
         assert!(checker.confirm("foo", "2.0").is_err());
         let checker = GithubReleasesChecker::new(&http, "not-a-repo");
+        assert!(checker.confirm("foo", "2.0").is_err());
+        // Dot-only segments are not repository names.
+        let checker = GithubReleasesChecker::new(&http, "owner/..");
+        assert!(checker.confirm("foo", "2.0").is_err());
+        let checker = GithubReleasesChecker::new(&http, "../repo");
         assert!(checker.confirm("foo", "2.0").is_err());
         // A well-formed repo builds the expected URL and reaches the
         // HTTP client: a canned release list for that URL confirms.
