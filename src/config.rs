@@ -5,7 +5,7 @@
 //! integer, boolean) and top-level `key:` followed by `  - item` string
 //! lists. The parser is hand-written and strict: anything outside the
 //! subset is rejected, so a bad config fails fast instead of being
-//! silently mis-read. No YAML library is pulled in (standard library
+//! silently misread. No YAML library is pulled in (standard library
 //! only); the rest of the crate uses serde_json for JSON APIs.
 
 use crate::target::Target;

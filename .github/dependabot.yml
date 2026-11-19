@@ -34,6 +34,12 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 100
+    # dtolnay/rust-toolchain is pinned to a commit on its stable branch
+    # (see test.yml); commits on the toolchain branches are
+    # garbage-collected upstream, so dependabot must not "helpfully"
+    # move it.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"
 
   # Container base image (Dockerfile).
   - package-ecosystem: "docker"
