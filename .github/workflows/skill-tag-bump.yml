@@ -5,9 +5,10 @@
 # parser, which only matches ^FROM lines), so it cannot bump the skill
 # tag. This workflow does the equivalent job: weekly, it checks the
 # latest tagged release of openSUSE/openSUSE-packaging-skill and, when
-# a new tag exists, opens a PR updating the tag in the Dockerfile (and
-# the docs that name it). The PR goes through the same CI + review gate
-# as any other change.
+# a new tag exists, opens a PR updating the tag (and the pinned commit
+# SHA, which the Dockerfile build verifies the clone against) in the
+# Dockerfile and the docs that name it. The PR goes through the same CI
+# + review gate as any other change.
 name: Bump opensuse-packaging-skill tag
 
 on:
@@ -20,36 +21,70 @@ permissions:
   contents: write
   pull-requests: write
 
+# One bump at a time; a superseded run is cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   bump:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Check latest skill tag
         id: check
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           latest=$(gh api repos/openSUSE/openSUSE-packaging-skill/tags --paginate --jq '.[].name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
           current=$(grep -oP '^ARG PACKAGING_SKILL_TAG=\K.*' Dockerfile)
+          # Fail loudly when either side is empty: an empty latest (a
+          # failed tag listing) would otherwise compare unequal to the
+          # current tag and open a PR that deletes the tag everywhere.
+          if [ -z "${latest}" ]; then echo "could not determine latest skill tag" >&2; exit 1; fi
+          if [ -z "${current}" ]; then echo "could not determine current skill tag" >&2; exit 1; fi
+          # Resolve the commit the new tag points to (peeling an
+          # annotated tag): the Dockerfile pins the SHA alongside the
+          # tag, and the build verifies the clone matches it.
+          ref_json=$(gh api "repos/openSUSE/openSUSE-packaging-skill/git/refs/tags/${latest}")
+          tag_sha=$(printf '%s' "${ref_json}" | jq -r '.object.sha')
+          tag_type=$(printf '%s' "${ref_json}" | jq -r '.object.type')
+          if [ "${tag_type}" = "tag" ]; then
+            sha=$(gh api "repos/openSUSE/openSUSE-packaging-skill/git/tags/${tag_sha}" --jq '.object.sha')
+          else
+            sha="${tag_sha}"
+          fi
+          if [ -z "${sha}" ]; then echo "could not determine commit for tag ${latest}" >&2; exit 1; fi
           echo "latest=${latest}" >> "${GITHUB_OUTPUT}"
           echo "current=${current}" >> "${GITHUB_OUTPUT}"
-          echo "latest tag: ${latest}, current tag: ${current}"
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+          echo "latest tag: ${latest} (${sha}), current tag: ${current}"
 
       - name: Open PR for new tag
         if: steps.check.outputs.latest != steps.check.outputs.current
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           latest="${{ steps.check.outputs.latest }}"
           current="${{ steps.check.outputs.current }}"
+          sha="${{ steps.check.outputs.sha }}"
           branch="skill-tag-bump/${latest}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "${branch}"
+          # Anchor the replacements: the Dockerfile ARG lines only (not
+          # every occurrence of the tag), and the "tag <version>" mention
+          # in the docs (not arbitrary occurrences).
           current_esc=$(printf '%s' "${current}" | sed 's/[.[\*^$]/\\&/g')
-          sed -i "s/${current_esc}/${latest}/g" Dockerfile README.md docs/runbook.md
+          sed -i "s/^ARG PACKAGING_SKILL_TAG=${current_esc}$/ARG PACKAGING_SKILL_TAG=${latest}/" Dockerfile
+          sed -i "s/^ARG PACKAGING_SKILL_SHA=[0-9a-f]*$/ARG PACKAGING_SKILL_SHA=${sha}/" Dockerfile
+          sed -i "s/tag ${current_esc}/tag ${latest}/g" README.md docs/runbook.md
+          grep -q "^ARG PACKAGING_SKILL_TAG=${latest}$" Dockerfile || { echo "tag update failed" >&2; exit 1; }
+          grep -q "^ARG PACKAGING_SKILL_SHA=${sha}$" Dockerfile || { echo "SHA update failed" >&2; exit 1; }
           git add Dockerfile README.md docs/runbook.md
           git commit -m "chore: bump opensuse-packaging-skill to ${latest}"
           git push origin "${branch}"

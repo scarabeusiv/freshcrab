@@ -69,6 +69,11 @@ pub struct Watcher<'a> {
     dry_run: &'a DryRun,
     target: Target,
     policy: Box<dyn UpdatePolicy + 'a>,
+    /// The CVE validator, consulted only for non-Factory targets
+    /// (Leap). The Factory path never calls it, so it is unread until
+    /// the Leap step lands — the dead-code lint is silenced deliberately
+    /// (it is the Leap extension point, not dead code).
+    #[allow(dead_code)]
     cve_validator: Option<Box<dyn CveValidator + 'a>>,
 }
 
@@ -117,6 +122,26 @@ impl<'a> Watcher<'a> {
     /// prints what it WOULD queue and returns the entry (the caller
     /// decides whether to persist it; the queue also consults dry-run).
     pub fn check_package(&self, package: &str) -> Result<Option<QueueEntry>, HttpError> {
+        // Leap targets are not implemented yet: fail loudly before any
+        // network I/O, so no rate-limited collector requests are burned
+        // (and no package names disclosed) for a target that will be
+        // refused. The Leap step consults the CVE validator here (see
+        // `docs/leap-and-cve.md`) to decide whether a CVE is already
+        // fixed by a backport. The Factory path never reaches this
+        // branch, so it never calls a validator.
+        if self.target.is_leap() {
+            return Err(HttpError(
+                "Leap targets are not implemented yet (see docs/leap-and-cve.md)".to_string(),
+            ));
+        }
+
+        // Fetch the Factory version first: when the spec is unavailable
+        // (404), the collector calls below are wasted work.
+        let factory_version = match self.factory.get_version(package)? {
+            Some(version) => version,
+            None => return Ok(None),
+        };
+
         let collectors = collectors_for(self.http, package);
         let candidates = crate::collectors::collect(package, &collectors);
         let upstream_ref = self.upstream.as_deref();
@@ -125,24 +150,6 @@ impl<'a> Watcher<'a> {
             None => return Ok(None),
         };
         let upstream_version = candidate.version.clone();
-
-        let factory_version = match self.factory.get_version(package)? {
-            Some(version) => version,
-            None => return Ok(None),
-        };
-
-        // Leap targets are not implemented yet: fail loudly rather than
-        // silently treating a Leap package like a Factory one. The Leap
-        // step consults the CVE validator here (see
-        // `docs/leap-and-cve.md`) to decide whether a CVE is already
-        // fixed by a backport. The Factory path never reaches this
-        // branch, so it never calls a validator.
-        if self.target.is_leap() {
-            let _ = self.cve_validator.as_deref();
-            return Err(HttpError(
-                "Leap targets are not implemented yet (see docs/leap-and-cve.md)".to_string(),
-            ));
-        }
 
         if self
             .policy
@@ -173,15 +180,21 @@ impl<'a> Watcher<'a> {
         }
     }
 
-    /// Check a list of packages. Returns the queue entries found.
-    pub fn check_packages(&self, packages: &[&str]) -> Result<Vec<QueueEntry>, HttpError> {
+    /// Check a list of packages. Returns the queue entries found. A
+    /// package whose check fails (e.g. the Factory spec 404s) is logged
+    /// and skipped; one bad package no longer aborts the whole run.
+    pub fn check_packages(&self, packages: &[&str]) -> Vec<QueueEntry> {
         let mut entries = Vec::new();
         for package in packages {
-            if let Some(entry) = self.check_package(package)? {
-                entries.push(entry);
+            match self.check_package(package) {
+                Ok(Some(entry)) => entries.push(entry),
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("warning: check failed for {package}: {e}; skipping");
+                }
             }
         }
-        Ok(entries)
+        entries
     }
 }
 
@@ -248,7 +261,7 @@ mod tests {
         let http = FakeHttpClient::new()
             .with(
                 "https://repology.org/api/v1/project/foo",
-                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#,
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#,
             )
             .with(
                 "https://release-monitoring.org/api/v2/projects/?name=foo",
@@ -275,7 +288,7 @@ mod tests {
         let http = FakeHttpClient::new()
             .with(
                 "https://repology.org/api/v1/project/foo",
-                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#,
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#,
             )
             .with(
                 "https://release-monitoring.org/api/v2/projects/?name=foo",
@@ -322,7 +335,7 @@ mod tests {
         let http = FakeHttpClient::new()
             .with(
                 "https://repology.org/api/v1/project/foo",
-                r#"[{"repo": "fedora_41", "version": "1.0~rc1", "status": "newest"}]"#,
+                r#"[{"repo": "fedora_41", "version": "1.0~rc1", "status": "newest"}, {"repo": "debian_12", "version": "1.0~rc1", "status": "newest"}]"#,
             )
             .with(
                 "https://release-monitoring.org/api/v2/projects/?name=foo",
@@ -349,7 +362,7 @@ mod tests {
         let http = FakeHttpClient::new()
             .with(
                 "https://repology.org/api/v1/project/foo",
-                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#,
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#,
             )
             .with(
                 "https://release-monitoring.org/api/v2/projects/?name=foo",
@@ -379,7 +392,7 @@ mod tests {
         let http = FakeHttpClient::new()
             .with(
                 "https://repology.org/api/v1/project/foo",
-                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#,
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#,
             )
             .with(
                 "https://release-monitoring.org/api/v2/projects/?name=foo",
@@ -404,7 +417,7 @@ mod tests {
         let http = FakeHttpClient::new()
             .with(
                 "https://repology.org/api/v1/project/foo",
-                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#,
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#,
             )
             .with(
                 "https://release-monitoring.org/api/v2/projects/?name=foo",
@@ -459,7 +472,7 @@ mod tests {
         let http = FakeHttpClient::new()
             .with(
                 "https://repology.org/api/v1/project/foo",
-                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#,
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#,
             )
             .with(
                 "https://release-monitoring.org/api/v2/projects/?name=foo",
@@ -510,7 +523,7 @@ mod tests {
         let http = FakeHttpClient::new()
             .with(
                 "https://repology.org/api/v1/project/foo",
-                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#,
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#,
             )
             .with(
                 "https://release-monitoring.org/api/v2/projects/?name=foo",
@@ -537,7 +550,7 @@ mod tests {
         let http = FakeHttpClient::new()
             .with(
                 "https://repology.org/api/v1/project/foo",
-                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#,
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#,
             )
             .with(
                 "https://release-monitoring.org/api/v2/projects/?name=foo",
@@ -557,5 +570,59 @@ mod tests {
         });
         let err = watcher.check_package("foo").unwrap_err();
         assert!(err.0.contains("not implemented"));
+    }
+
+    #[test]
+    fn single_anitya_only_is_not_queued() {
+        // A single non-multi-source collector (Anitya alone) does not
+        // confirm: it needs a second collector agreeing or an upstream
+        // check.
+        let http = FakeHttpClient::new()
+            .with("https://repology.org/api/v1/project/foo", "[]")
+            .with(
+                "https://release-monitoring.org/api/v2/projects/?name=foo",
+                r#"{"items": [{"name": "foo", "version": "2.0"}]}"#,
+            )
+            .with(
+                "https://distrowatch.com/table.php?distribution=opensuse",
+                "<html></html>",
+            )
+            .with(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
+                "Name: foo\nVersion: 1.9\n",
+            );
+        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let watcher = watcher_with_http(http, live());
+        assert!(watcher.check_package("foo").unwrap().is_none());
+    }
+
+    #[test]
+    fn check_packages_skips_failed_package_and_continues() {
+        // One bad package (its Factory spec is unavailable) is logged
+        // and skipped; the good package behind it is still checked.
+        // "bad" has no canned spec URL, so its check errors; "good"
+        // has every URL canned.
+        let http = FakeHttpClient::new()
+            .with(
+                "https://repology.org/api/v1/project/good",
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#,
+            )
+            .with(
+                "https://release-monitoring.org/api/v2/projects/?name=good",
+                r#"{"items": []}"#,
+            )
+            .with(
+                "https://distrowatch.com/table.php?distribution=opensuse",
+                "<html></html>",
+            )
+            .with(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/good/good.spec",
+                "Name: good\nVersion: 1.9\n",
+            );
+        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let watcher = watcher_with_http(http, live());
+        let entries = watcher.check_packages(&["bad", "good"]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].package, "good");
     }
 }

@@ -7,15 +7,20 @@
 //! `incorrect`, `untrusted`, `ignored`).
 //!
 //! The collector takes the highest version (by RPM comparison) among
-//! entries with status `newest`; when no entry is `newest`, it falls back
-//! to the highest version among release statuses (`unique`, `outdated`,
-//! `legacy`, `rolling`). Development, incorrect, untrusted, and ignored
-//! entries are never used.
+//! entries with status `newest`, but only when at least two distinct
+//! repos report that version: `newest` is a max, not a consensus, so
+//! one inflated repo entry must not confirm on its own. A single
+//! `newest` repo returns the candidate as not-multi-source, so the
+//! confirmation rule falls through to agreement with another collector
+//! or to the direct upstream check. When no entry is `newest`, it falls
+//! back to the highest version among release statuses (`unique`,
+//! `outdated`, `legacy`, `rolling`). Development, incorrect, untrusted,
+//! and ignored entries are never used.
 //!
 //! Rate limit: 1 request per second. Every request identifies itself with
 //! a User-Agent linking to the project repository (see `crate::http`).
 
-use crate::collectors::{encode, Candidate, Collector};
+use crate::collectors::{encode_path, Candidate, Collector};
 use crate::http::{HttpClient, HttpError};
 use crate::version::rpmvercmp;
 use serde::Deserialize;
@@ -32,6 +37,8 @@ const RELEASE_STATUSES: &[&str] = &["newest", "unique", "outdated", "legacy", "r
 
 #[derive(Debug, Deserialize)]
 struct RepologyPackage {
+    #[serde(default)]
+    repo: String,
     version: String,
     #[serde(default)]
     status: String,
@@ -45,13 +52,24 @@ pub fn parse_repology_response(body: &str) -> Option<Candidate> {
         return None;
     }
 
-    // Prefer the highest version among `newest` entries.
+    // Prefer the highest version among `newest` entries — but only
+    // when at least two distinct repos report that version. A single
+    // `newest` entry is a max, not a consensus: one inflated repo entry
+    // must not confirm on its own. With a single newest repo the
+    // candidate is returned as not-multi-source, so the confirmation
+    // rule falls through to agreement with another collector or to the
+    // direct upstream check.
     let newest: Vec<&RepologyPackage> = packages.iter().filter(|p| p.status == "newest").collect();
     if let Some(best) = max_version(&newest) {
+        let repos: std::collections::HashSet<&str> = newest
+            .iter()
+            .filter(|p| rpmvercmp(&p.version, &best) == std::cmp::Ordering::Equal)
+            .map(|p| p.repo.as_str())
+            .collect();
         return Some(Candidate {
             collector: "repology",
             version: best,
-            multi_source: true,
+            multi_source: repos.len() >= 2,
         });
     }
 
@@ -121,7 +139,7 @@ impl<'a> Collector for RepologyCollector<'a> {
 
     fn latest_version(&self, package: &str) -> Result<Option<Candidate>, HttpError> {
         self.pace();
-        let url = format!("{REPOLOGY_API}/project/{}", encode(package));
+        let url = format!("{REPOLOGY_API}/project/{}", encode_path(package));
         let body = self.http.get(&url)?;
         Ok(parse_repology_response(&body))
     }
@@ -170,6 +188,45 @@ mod tests {
     #[test]
     fn empty_response_is_none() {
         assert!(parse_repology_response("[]").is_none());
+    }
+
+    #[test]
+    fn single_newest_repo_does_not_confirm() {
+        // Hostile: one repo at `newest` is a max, not a consensus.
+        // The candidate is returned, but not multi-source, so the
+        // confirmation rule falls through to agreement / upstream.
+        let body = r#"[
+            {"repo": "opensuse_tumbleweed", "version": "1.9", "status": "outdated"},
+            {"repo": "fedora_41", "version": "2.0", "status": "newest"}
+        ]"#;
+        let candidate = parse_repology_response(body).unwrap();
+        assert_eq!(candidate.version, "2.0");
+        assert!(!candidate.multi_source);
+    }
+
+    #[test]
+    fn two_newest_repos_confirm() {
+        // Two distinct repos at the same `newest` version: multi-source.
+        let body = r#"[
+            {"repo": "fedora_41", "version": "2.0", "status": "newest"},
+            {"repo": "debian_12", "version": "2.0", "status": "newest"}
+        ]"#;
+        let candidate = parse_repology_response(body).unwrap();
+        assert_eq!(candidate.version, "2.0");
+        assert!(candidate.multi_source);
+    }
+
+    #[test]
+    fn two_newest_repos_at_different_versions_do_not_confirm() {
+        // Two `newest` entries, but only one repo at the max version:
+        // still a single source for the max.
+        let body = r#"[
+            {"repo": "fedora_41", "version": "2.0", "status": "newest"},
+            {"repo": "debian_12", "version": "1.9", "status": "newest"}
+        ]"#;
+        let candidate = parse_repology_response(body).unwrap();
+        assert_eq!(candidate.version, "2.0");
+        assert!(!candidate.multi_source);
     }
 
     #[test]

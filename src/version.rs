@@ -155,9 +155,10 @@ fn take_segment(chars: &[char], pos: &mut usize) -> (String, bool) {
 fn parse_epoch(version: &str) -> (u64, &str) {
     if let Some((epoch, rest)) = version.split_once(':') {
         if !epoch.is_empty() && epoch.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(n) = epoch.parse::<u64>() {
-                return (n, rest);
-            }
+            // A huge epoch saturates to u64::MAX (it sorts above every
+            // real epoch) instead of falling through to 0, which would
+            // sort it below everything.
+            return (epoch.parse::<u64>().unwrap_or(u64::MAX), rest);
         }
     }
     (0, version)
@@ -174,11 +175,13 @@ pub fn compare_evr(a: &str, b: &str) -> Ordering {
         return epoch_a.cmp(&epoch_b);
     }
 
-    let (version_a, release_a) = match rest_a.split_once('-') {
+    // The release is split on the LAST `-`: the version is everything
+    // before it, the release everything after (RPM's parseEVR rule).
+    let (version_a, release_a) = match rest_a.rsplit_once('-') {
         Some((v, r)) => (v, r),
         None => (rest_a, ""),
     };
-    let (version_b, release_b) = match rest_b.split_once('-') {
+    let (version_b, release_b) = match rest_b.rsplit_once('-') {
         Some((v, r)) => (v, r),
         None => (rest_b, ""),
     };
@@ -284,5 +287,45 @@ mod tests {
         assert!(is_newer("1.10", "1.9"));
         assert!(!is_newer("1.0~rc1", "1.0"));
         assert!(!is_newer("1.0", "1.0"));
+    }
+
+    #[test]
+    fn empty_versions() {
+        assert_eq!(rpmvercmp("", ""), Ordering::Equal);
+        assert_eq!(rpmvercmp("", "1.0"), Ordering::Less);
+        assert_eq!(rpmvercmp("1.0", ""), Ordering::Greater);
+        assert!(!is_newer("", "1.0"));
+        // A real version is newer than an absent (empty) one.
+        assert!(is_newer("1.0", ""));
+    }
+
+    #[test]
+    fn tilde_only_sorts_before_everything() {
+        assert_eq!(rpmvercmp("~", "1.0"), Ordering::Less);
+        assert_eq!(rpmvercmp("1.0~", "1.0"), Ordering::Less);
+        assert_eq!(rpmvercmp("~", "~"), Ordering::Equal);
+    }
+
+    #[test]
+    fn huge_epoch_saturates_to_max() {
+        // A 21-digit epoch overflows u64: it saturates to MAX (sorts
+        // above every real epoch) instead of wrapping to 0.
+        assert_eq!(
+            compare_evr("99999999999999999999999:1.0", "1:9.9"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_evr("99999999999999999999999:1.0", "18446744073709551615:1.0"),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn multi_dash_release_splits_on_last_dash() {
+        // The release is after the LAST `-`: "1.0-2-1" is version
+        // "1.0-2", release "1".
+        assert_eq!(compare_evr("1.0-2-1", "1.0-1-9"), Ordering::Greater);
+        assert_eq!(compare_evr("1.0-1-2", "1.0-1-1"), Ordering::Greater);
+        assert_eq!(compare_evr("1.0-1", "1.0-1"), Ordering::Equal);
     }
 }

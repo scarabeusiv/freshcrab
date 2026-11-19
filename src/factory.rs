@@ -5,8 +5,11 @@
 //! plain `/source/...` endpoint returns 401 without them (verified live),
 //! which is why the public namespace is used here.
 
+use crate::collectors::{encode_path, valid_obs_name};
 use crate::http::{HttpClient, HttpError};
 
+// The OBS API base and the Factory project, shared with `obs.rs`
+// (which imports them from here so there is exactly one definition).
 pub const OBS_API: &str = "https://api.opensuse.org";
 pub const FACTORY_PROJECT: &str = "openSUSE:Factory";
 
@@ -35,7 +38,11 @@ impl<'a> FactoryClient<'a> {
 
     /// Return the raw spec text for `package` on Factory.
     pub fn get_spec(&self, package: &str) -> Result<String, HttpError> {
-        let url = format!("{OBS_API}/public/source/{FACTORY_PROJECT}/{package}/{package}.spec");
+        if !valid_obs_name(package) {
+            return Err(HttpError(format!("invalid OBS package name: {package:?}")));
+        }
+        let encoded = encode_path(package);
+        let url = format!("{OBS_API}/public/source/{FACTORY_PROJECT}/{encoded}/{encoded}.spec");
         self.http.get(&url)
     }
 

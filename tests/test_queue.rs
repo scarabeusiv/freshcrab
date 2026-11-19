@@ -9,13 +9,20 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn tmp_path() -> String {
+    // A process-wide counter (not just the clock) makes the path
+    // unique: parallel tests can otherwise share a nanosecond and
+    // collide on the same queue file.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     format!(
-        "{}/freshcrab-test-queue-{nanos}.json",
-        env::temp_dir().display()
+        "{}/freshcrab-test-queue-{}-{n}-{nanos}.json",
+        env::temp_dir().display(),
+        std::process::id()
     )
 }
 
@@ -77,7 +84,7 @@ fn add_and_deduplicate() {
         )
         .is_none());
     // Open SR: skipped.
-    let has_sr = |_pkg: &str| true;
+    let has_sr = |_pkg: &str| Ok(true);
     assert!(q
         .add(
             QueueEntry::new(
@@ -97,7 +104,7 @@ fn add_and_deduplicate() {
         .is_none());
     // Devel behind and no open SR: queued.
     let devel_behind = |_pkg: &str| Some("1.9".to_string());
-    let no_sr = |_pkg: &str| false;
+    let no_sr = |_pkg: &str| Ok(false);
     assert!(q
         .add(
             QueueEntry::new(
@@ -152,6 +159,8 @@ fn save_and_load_roundtrip() {
     q.set_status("bar", "blocked", &live_run).unwrap();
     q.save(&live_run).unwrap();
 
+    // The first Queue holds the flock; drop it before reopening.
+    drop(q);
     let q2 = Queue::open(&path).unwrap();
     assert_eq!(q2.entries().len(), 2);
     assert_eq!(q2.find("foo").unwrap().status, "pending");
@@ -265,6 +274,8 @@ fn entry_carries_target_and_kind() {
     assert_eq!(entry.kind, UpdateKind::Security);
     // Persisted and reloaded, the target and kind survive.
     q.save(&live_run).unwrap();
+    // The first Queue holds the flock; drop it before reopening.
+    drop(q);
     let q2 = Queue::open(&path).unwrap();
     let reloaded = q2.find("foo").unwrap();
     assert_eq!(reloaded.target, Target::Factory);

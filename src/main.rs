@@ -17,7 +17,7 @@ use freshcrab::dry_run::resolve as resolve_dry_run;
 use freshcrab::factory::FactoryClient;
 use freshcrab::http::UreqClient;
 use freshcrab::obs::ObsClient;
-use freshcrab::queue::{DedupChecks, Queue, QueueEntry};
+use freshcrab::queue::{DedupChecks, Queue, QueueEntry, QueueError};
 use freshcrab::watcher::Watcher;
 use std::process::ExitCode;
 
@@ -129,7 +129,11 @@ fn main() -> ExitCode {
     dry_run.log_mode();
 
     if config.kill_switch {
-        println!("kill switch is on: pipeline paused, nothing queued.");
+        // The human message goes to stderr; stdout stays valid JSON
+        // (an empty report) so `freshcrab | jq` does not break exactly
+        // when the pipeline is paused.
+        eprintln!("kill switch is on: pipeline paused, nothing queued.");
+        println!("[]");
         return ExitCode::from(0);
     }
 
@@ -144,13 +148,7 @@ fn main() -> ExitCode {
                 .map(|s| s.as_str())
                 .filter(|p| config.watched(p))
                 .collect();
-            match watcher.check_packages(&in_scope) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    eprintln!("watcher error: {e}");
-                    return ExitCode::from(1);
-                }
-            }
+            watcher.check_packages(&in_scope)
         }
         None => {
             if !config.packages.is_empty() {
@@ -160,13 +158,7 @@ fn main() -> ExitCode {
                     .map(|s| s.as_str())
                     .filter(|p| config.watched(p))
                     .collect();
-                match watcher.check_packages(&in_scope) {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        eprintln!("watcher error: {e}");
-                        return ExitCode::from(1);
-                    }
-                }
+                watcher.check_packages(&in_scope)
             } else {
                 // Broad default: all of Factory except the exclusions.
                 let all = match factory.list_packages() {
@@ -181,13 +173,7 @@ fn main() -> ExitCode {
                     .map(|s| s.as_str())
                     .filter(|p| config.watched(p))
                     .collect();
-                match watcher.check_packages(&in_scope) {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        eprintln!("watcher error: {e}");
-                        return ExitCode::from(1);
-                    }
-                }
+                watcher.check_packages(&in_scope)
             }
         }
     };
@@ -213,8 +199,9 @@ fn main() -> ExitCode {
     let obs = ObsClient::new(&http);
     for entry in &entries {
         let package = entry.package.as_str();
-        // The OBS dedup checks are best-effort reads: on error, log loudly
-        // and fail open (the worker re-checks before filing).
+        // The devel-version check is a public-API read: on error, log
+        // loudly and skip that check (fail-open for this check only —
+        // a transient hiccup must not drop the package).
         let devel_version = |pkg: &str| match obs.devel_version(pkg) {
             Ok(version) => version,
             Err(e) => {
@@ -222,12 +209,15 @@ fn main() -> ExitCode {
                 None
             }
         };
-        let has_open_sr = |pkg: &str| match obs.has_open_sr(pkg) {
-            Ok(found) => found,
-            Err(e) => {
-                eprintln!("warning: open-SR check failed for {pkg}: {e}");
-                false
-            }
+        // The open-SR check is fail-closed: on error it returns Err and
+        // `Queue::add` skips the package instead of queueing it on an
+        // unchecked dedup. The search API 401s without OBS credentials,
+        // and no credentials are plumbed yet (that is the filing
+        // phase's work) — so an error here is the normal no-credentials
+        // case, and skipping is the safe answer until then.
+        let has_open_sr = |pkg: &str| -> Result<bool, QueueError> {
+            obs.has_open_sr(pkg)
+                .map_err(|e| QueueError(format!("open-SR check failed for {pkg}: {e}")))
         };
         queue.add(
             QueueEntry::new(

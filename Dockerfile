@@ -14,7 +14,10 @@
 # copied into the image at /usr/share/doc/freshcrab/opensuse-packaging-skill/
 # (see docs/runbook.md). The tag is bumped by the weekly skill-tag-bump
 # workflow: Dependabot's docker ecosystem only tracks FROM image tags, not
-# a git-clone branch, so it cannot bump this tag.
+# a git-clone branch, so it cannot bump this tag. The commit SHA is
+# pinned alongside the tag and the build verifies the clone matches it,
+# so a mutable tag that moves fails the build instead of silently
+# changing what the image contains.
 #
 # No secrets are baked into the image. OBS credentials (oscrc) and the
 # GitHub token are injected at run time via environment variables or a
@@ -40,12 +43,19 @@ RUN cargo build --release --locked
 FROM registry.opensuse.org/opensuse/tumbleweed:latest AS skill
 
 ARG PACKAGING_SKILL_TAG=v3.24.3
+# The commit the tag points to, pinned alongside it and verified below.
+ARG PACKAGING_SKILL_SHA=57f5e9ddd0eacecc9bf21eb6dc60ac99acf21d64
 
 RUN zypper --non-interactive refresh && \
     zypper --non-interactive install --no-recommends git \
     && zypper clean --all && \
     git clone --depth 1 --branch "${PACKAGING_SKILL_TAG}" \
         https://github.com/openSUSE/openSUSE-packaging-skill /tmp/packaging-skill && \
+    actual_sha=$(git -C /tmp/packaging-skill rev-parse HEAD); \
+    if [ "${actual_sha}" != "${PACKAGING_SKILL_SHA}" ]; then \
+        echo "skill tag ${PACKAGING_SKILL_TAG} resolved to ${actual_sha}, expected ${PACKAGING_SKILL_SHA} (tag moved? bump it via the skill-tag-bump workflow)" >&2; \
+        exit 1; \
+    fi; \
     cp -r /tmp/packaging-skill/skills/opensuse-packaging /skill && \
     rm -rf /tmp/packaging-skill
 
