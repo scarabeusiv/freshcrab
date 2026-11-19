@@ -132,6 +132,13 @@ set: `pending`, `in_progress`, `done`, `blocked`, `escalated`.
 `blocked` and `escalated` entries need a human (see
 `worker/brief.md` for what escalates).
 
+Only one writer runs at a time: the queue takes an exclusive lock on
+`<queue>.lock`, held until the process exits. A second writer (a
+manual run racing the scheduled one, or the same process opening the
+queue twice) fails fast with a lock error and exits 1 — that run is
+skipped, not partial, and nothing is lost. Just re-run it; the next
+scheduled run picks the packages up.
+
 ## Tools in the container
 
 All worker tools are the distro versions, installed with zypper from

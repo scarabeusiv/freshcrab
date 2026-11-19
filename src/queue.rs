@@ -143,6 +143,32 @@ impl std::fmt::Display for QueueError {
 
 impl std::error::Error for QueueError {}
 
+/// One entry per package: keep the most recently updated entry for
+/// each package (latest `updated_at`, later position wins ties).
+/// Order follows first appearance, so a compacted file stays stable.
+fn compact(entries: Vec<QueueEntry>) -> Vec<QueueEntry> {
+    use std::collections::HashMap;
+    let mut best: HashMap<&str, usize> = HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let key = e.package.as_str();
+        let ts = e.updated_at.parse::<u64>().unwrap_or(0);
+        match best.get(key) {
+            Some(&j) => {
+                let prev = entries[j].updated_at.parse::<u64>().unwrap_or(0);
+                if ts >= prev {
+                    best.insert(key, i);
+                }
+            }
+            None => {
+                best.insert(key, i);
+                order.push(key);
+            }
+        }
+    }
+    order.iter().map(|key| entries[best[key]].clone()).collect()
+}
+
 /// The queue, backed by a JSON state file.
 ///
 /// Writers are serialized with an exclusive flock on a lock file next
@@ -151,6 +177,13 @@ impl std::error::Error for QueueError {}
 /// writer cannot leave a stale lock behind. Without it, two writers
 /// (cron + manual) racing a read-modify-write would silently lose
 /// entries (last rename wins).
+///
+/// The lock is fail-fast, not queued: a second writer gets an error
+/// immediately instead of waiting. A failed open means that run is
+/// skipped, not partial — re-run it (the next scheduled run picks
+/// the packages up). The lock is per file descriptor, so the same
+/// process must drop its `Queue` before opening the same path again;
+/// a second open in one process errors the same way.
 pub struct Queue {
     path: String,
     entries: Vec<QueueEntry>,
@@ -163,6 +196,11 @@ pub struct Queue {
 
 impl Queue {
     /// Open the queue at `path`. A missing file is an empty queue.
+    ///
+    /// The exclusive lock is held until the returned `Queue` is
+    /// dropped, and flock is per file descriptor: opening the same
+    /// path twice in one process fails on the second open, so drop
+    /// the first `Queue` before reopening (the tests pin this).
     pub fn open(path: &str) -> Result<Self, QueueError> {
         // Take the exclusive lock before reading: the open → add →
         // save sequence is a read-modify-write, and the lock is what
@@ -200,7 +238,14 @@ impl Queue {
             .map_err(|e| QueueError(format!("cannot read queue file {}: {e}", self.path)))?;
         let entries: Vec<QueueEntry> = serde_json::from_str(&text)
             .map_err(|e| QueueError(format!("invalid queue file {}: {e}", self.path)))?;
-        self.entries = entries;
+        // Compact duplicates left by older versions: before the
+        // in-place refresh, `add` pushed a new entry per run, so a
+        // file written by an older version can hold several entries
+        // for one package. Keep the most recently updated entry per
+        // package (latest `updated_at`, later position wins ties) and
+        // drop the rest, so the file converges to one entry per
+        // package on the next save.
+        self.entries = compact(entries);
         Ok(())
     }
 
@@ -241,7 +286,7 @@ impl Queue {
                 }
             }
         }
-        let mut file = match file {
+        let file = match file {
             Some(f) => f,
             None => {
                 return Err(QueueError(format!(
@@ -250,13 +295,48 @@ impl Queue {
                 )));
             }
         };
+        // Write, fsync, rename, then fsync the parent directory so
+        // the rename itself is durable. Any failure removes the tmp
+        // file instead of leaving an orphan behind.
+        if let Err(e) = Self::persist(&self.path, &text, &tmp, file) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Write `text` to `tmp`, fsync it, atomically rename it over
+    /// `path`, then fsync the parent directory so the rename itself
+    /// survives a crash. Owns the tmp file handle; the caller removes
+    /// `tmp` when this returns an error.
+    fn persist(
+        path: &str,
+        text: &str,
+        tmp: &str,
+        mut file: std::fs::File,
+    ) -> Result<(), QueueError> {
         file.write_all(format!("{text}\n").as_bytes())
             .map_err(|e| QueueError(format!("cannot write queue file {tmp}: {e}")))?;
         file.sync_all()
             .map_err(|e| QueueError(format!("cannot fsync queue file {tmp}: {e}")))?;
         drop(file);
-        fs::rename(&tmp, &self.path)
-            .map_err(|e| QueueError(format!("cannot replace queue file {}: {e}", self.path)))?;
+        fs::rename(tmp, path)
+            .map_err(|e| QueueError(format!("cannot replace queue file {path}: {e}")))?;
+        // A crash before the directory entry is flushed can roll the
+        // rename back, so fsync the parent directory too ("." when the
+        // queue path has no parent component).
+        let parent = Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| {
+                QueueError(format!(
+                    "cannot fsync queue directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
         Ok(())
     }
 
@@ -1231,5 +1311,116 @@ mod tests {
             vec!["[dry-run] would: set foo status to bogus"]
         );
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reopen_in_same_process_fails_until_dropped() {
+        // flock is per file descriptor: a second Queue::open on the
+        // same path in one process errors until the first Queue is
+        // dropped. This pins the footgun so a future caller sees it.
+        let path = tmp_path();
+        let q = Queue::open(&path).unwrap();
+        let err = match Queue::open(&path) {
+            Ok(_) => panic!("second open unexpectedly succeeded"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("cannot lock queue file"),
+            "unexpected error: {err}"
+        );
+        drop(q);
+        assert!(Queue::open(&path).is_ok());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_compacts_pre_fix_duplicates() {
+        // A file written before the in-place refresh can hold several
+        // entries per package; opening it keeps only the most
+        // recently updated entry, and the next save persists that.
+        let path = tmp_path();
+        let text = r#"[
+          {"package":"foo","factory_version":"1.9","upstream_version":"2.0","source":"repology","status":"pending","target":"factory","kind":"routine","created_at":"100","updated_at":"100"},
+          {"package":"bar","factory_version":"1.0","upstream_version":"1.1","source":"repology","status":"pending","target":"factory","kind":"routine","created_at":"100","updated_at":"100"},
+          {"package":"foo","factory_version":"2.0","upstream_version":"2.1","source":"repology","status":"done","target":"factory","kind":"routine","created_at":"100","updated_at":"200"}
+        ]"#;
+        fs::write(&path, text).unwrap();
+        let q = Queue::open(&path).unwrap();
+        assert_eq!(q.entries().len(), 2);
+        let foo = q.find("foo").unwrap();
+        assert_eq!(foo.status, "done");
+        assert_eq!(foo.upstream_version, "2.1");
+        assert_eq!(foo.updated_at, "200");
+        // A save persists the compacted form.
+        q.save(&live()).unwrap();
+        drop(q);
+        let q2 = Queue::open(&path).unwrap();
+        assert_eq!(q2.entries().len(), 2);
+        assert_eq!(q2.find("foo").unwrap().status, "done");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Temp files the queue's save step may leave behind for `path`.
+    fn orphan_tmps(path: &str) -> Vec<std::path::PathBuf> {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let base = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .map(|n| {
+                                let n = n.to_string_lossy();
+                                n.starts_with(&format!("{base}.")) && n.ends_with(".tmp")
+                            })
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn save_leaves_no_orphan_tmp() {
+        // Success path: no tmp file remains next to the queue.
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        q.save(&live()).unwrap();
+        assert!(orphan_tmps(&path).is_empty());
+        drop(q);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_save_cleans_up_its_tmp() {
+        // Force the rename to fail (the queue path becomes a directory
+        // after opening): the tmp file must not be left behind.
+        let path = tmp_path();
+        let q = Queue::open(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(q.save(&live()).is_err());
+        assert!(orphan_tmps(&path).is_empty());
+        drop(q);
+        let _ = fs::remove_dir(&path);
     }
 }
