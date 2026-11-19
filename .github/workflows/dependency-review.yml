@@ -35,6 +35,11 @@ jobs:
           # rust-cache is a CI-only action; its licence (LGPL-3.0-only
           # — plain LGPL-3.0 text, no "or later" grant, verified
           # against the repo's LICENSE) does not affect the Apache-2.0
-          # project, so allow it explicitly, qualified to that
-          # licence only.
-          allow-dependencies-licenses: 'pkg:githubactions/Swatinem/rust-cache, LGPL-3.0-only'
+          # project, so exclude it from license checks. NOTE: this
+          # input takes bare PURLs only — the action (v5.0.0) splits
+          # on commas and parses each entry as a PURL, so a
+          # `purl, SPDX` qualifier fails config parsing (proven by
+          # the CI failure on the qualified form). The allow is
+          # therefore per-package, not per-licence; that is accepted
+          # because the action is CI-only and never linked.
+          allow-dependencies-licenses: 'pkg:githubactions/Swatinem/rust-cache'
