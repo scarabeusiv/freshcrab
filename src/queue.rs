@@ -223,7 +223,13 @@ impl Queue {
         let mut tmp = String::new();
         let mut file = None;
         for attempt in 0..10 {
-            tmp = format!("{path}.{pid}.{nanos}.{attempt}.tmp", path = self.path);
+            tmp = format!(
+                "{path}.{pid}.{nanos}.{attempt}.tmp",
+                path = self.path,
+                pid = pid,
+                nanos = nanos,
+                attempt = attempt
+            );
             match OpenOptions::new().write(true).create_new(true).open(&tmp) {
                 Ok(f) => {
                     file = Some(f);
