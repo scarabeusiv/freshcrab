@@ -8,6 +8,7 @@
 //! silently mis-read. No YAML library is pulled in (standard library
 //! only); the rest of the crate uses serde_json for JSON APIs.
 
+use crate::target::Target;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -36,6 +37,7 @@ enum Value {
 const KNOWN_KEYS: &[&str] = &[
     "packages",
     "exclusions",
+    "targets",
     "concurrency",
     "daily_sr_cap",
     "kill_switch",
@@ -48,6 +50,11 @@ const KNOWN_KEYS: &[&str] = &[
 pub struct Config {
     pub packages: Vec<String>,
     pub exclusions: Vec<String>,
+    /// Distributions to watch. Only Factory is implemented; a Leap
+    /// target parses but the pipeline refuses to run it until the Leap
+    /// step lands (see `docs/leap-and-cve.md` and `Target::is_implemented`).
+    /// Default: `[Factory]`.
+    pub targets: Vec<Target>,
     pub concurrency: u32,
     pub daily_sr_cap: u32,
     pub kill_switch: bool,
@@ -64,6 +71,7 @@ impl Default for Config {
         Config {
             packages: Vec::new(),
             exclusions: Vec::new(),
+            targets: vec![Target::Factory],
             concurrency: 3,
             daily_sr_cap: 10,
             kill_switch: false,
@@ -246,6 +254,26 @@ fn require_list(map: &HashMap<String, Value>, name: &str) -> Result<Vec<String>,
     }
 }
 
+fn require_targets(map: &HashMap<String, Value>) -> Result<Vec<Target>, ConfigError> {
+    match map.get("targets") {
+        None => Ok(vec![Target::Factory]),
+        Some(Value::List(items)) => {
+            if items.is_empty() {
+                return Err(ConfigError(
+                    "targets: must list at least one target".to_string(),
+                ));
+            }
+            let mut targets = Vec::new();
+            for item in items {
+                targets
+                    .push(Target::parse(item).map_err(|e| ConfigError(format!("targets: {e}")))?);
+            }
+            Ok(targets)
+        }
+        Some(_) => Err(ConfigError("targets: expected a list".to_string())),
+    }
+}
+
 fn require_int(map: &HashMap<String, Value>, name: &str, minimum: i64) -> Result<i64, ConfigError> {
     match map.get(name) {
         None => Ok(match name {
@@ -294,6 +322,7 @@ fn validate(map: HashMap<String, Value>) -> Result<Config, ConfigError> {
     Ok(Config {
         packages: require_list(&map, "packages")?,
         exclusions: require_list(&map, "exclusions")?,
+        targets: require_targets(&map)?,
         concurrency: require_int(&map, "concurrency", 1)? as u32,
         daily_sr_cap: require_int(&map, "daily_sr_cap", 0)? as u32,
         kill_switch: require_bool(&map, "kill_switch", false)?,
@@ -340,6 +369,40 @@ mod tests {
         assert_eq!(cfg.daily_sr_cap, 20);
         assert!(cfg.kill_switch);
         assert!(!cfg.report_only);
+    }
+
+    #[test]
+    fn targets_default_is_factory() {
+        let cfg = load_config_text("").unwrap();
+        assert_eq!(cfg.targets, vec![Target::Factory]);
+    }
+
+    #[test]
+    fn targets_parse() {
+        let cfg = load_config_text("targets:\n  - factory\n").unwrap();
+        assert_eq!(cfg.targets, vec![Target::Factory]);
+
+        // A Leap target parses — it is present in the config shape but
+        // not implemented; the pipeline refuses to run it (see
+        // Target::is_implemented and docs/leap-and-cve.md).
+        let cfg = load_config_text("targets:\n  - factory\n  - leap-16.0\n").unwrap();
+        assert_eq!(
+            cfg.targets,
+            vec![
+                Target::Factory,
+                Target::Leap {
+                    version: "16.0".to_string()
+                }
+            ]
+        );
+        assert!(!cfg.targets[1].is_implemented());
+    }
+
+    #[test]
+    fn targets_rejected() {
+        assert!(load_config_text("targets: factory\n").is_err());
+        assert!(load_config_text("targets:\n").is_err());
+        assert!(load_config_text("targets:\n  - sles\n").is_err());
     }
 
     #[test]
@@ -414,6 +477,7 @@ mod tests {
         assert!(cfg.exclusions.contains(&"gcc".to_string()));
         assert!(cfg.exclusions.contains(&"qemu".to_string()));
         assert!(cfg.exclusions.contains(&"kernel".to_string()));
+        assert_eq!(cfg.targets, vec![Target::Factory]);
         assert!(cfg.report_only);
         assert!(!cfg.kill_switch);
     }

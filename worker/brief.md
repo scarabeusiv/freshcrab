@@ -97,6 +97,35 @@ mode is the only mode that branches, commits, builds, or files.
 When escalating, report: the package, the version, the exact blocker,
 and the evidence (build log line, rpmcrab finding, or diff hunk).
 
+## Leap (later phase — not active yet)
+
+Leap work is a later step, after the scaffolding is reviewed (see
+`docs/leap-and-cve.md`). When it lands, the Leap worker differs from
+the Factory worker above in the *kind* of change, not in the gates:
+
+- **Backport patch, not version bump.** Apply the upstream fix as a
+  patch to the Leap version (bump only the release number). The SR
+  goes to the Leap maintenance process (maintenance incident /
+  update project for that release), not to the devel project.
+- **The `.changes` entry must name the CVE.** Every security-fix
+  changelog entry carries the CVE reference it fixes. This is the
+  checkable rule the CVE validator enforces: if the changelog for
+  the version does not name the CVE, the CVE is not fixed in that
+  version, and the submission does not go in.
+- **Add a `%check` CVE regression test.** The backport is not
+  complete without a `%check` regression test that exercises the
+  CVE behaviour — it must FAIL on the unpatched code and PASS with
+  the backport applied. The changelog is the claim; the test is the
+  proof. If no test is feasible (a race condition, an environment
+  the test cannot construct), document why in the SR text and the
+  `.changes` entry instead of skipping silently — "no test" without
+  a stated reason is a gap, not a judgment call.
+- **Same gates.** spec-cleaner full mode, rpmcrab 0E/0W, pre-filing
+  adversarial audit for every product the spec builds for, one
+  `.changes` entry per SR. A CVE with no clean backport, a patch
+  that does not apply, or a fix that changes behaviour escalates to
+  a human.
+
 ## Rules
 
 - Commits are authored as Tomáš Chvátal <tomas.chvatal@gmail.com>.

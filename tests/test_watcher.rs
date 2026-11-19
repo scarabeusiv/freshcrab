@@ -4,6 +4,8 @@
 use freshcrab::dry_run::DryRun;
 use freshcrab::factory::FactoryClient;
 use freshcrab::http::FakeHttpClient;
+use freshcrab::queue::UpdateKind;
+use freshcrab::target::Target;
 use freshcrab::watcher::Watcher;
 use std::fs;
 
@@ -41,6 +43,9 @@ fn behind_on_factory_is_queued() {
     assert_eq!(entry.factory_version, "1.9");
     assert_eq!(entry.upstream_version, "2.0");
     assert_eq!(entry.source, "repology");
+    // The Factory path carries its target and is routine-only.
+    assert_eq!(entry.target, Target::Factory);
+    assert_eq!(entry.kind, UpdateKind::Routine);
 }
 
 #[test]

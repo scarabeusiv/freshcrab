@@ -15,10 +15,12 @@
 
 use crate::collectors::upstream::UpstreamChecker;
 use crate::collectors::{confirmed_candidate, pypi_name, Candidate, Collector};
+use crate::cve::CveValidator;
 use crate::dry_run::DryRun;
 use crate::factory::FactoryClient;
 use crate::http::{HttpClient, HttpError};
-use crate::version::is_newer;
+use crate::queue::UpdateKind;
+use crate::target::{FactoryPolicy, Target, UpdatePolicy};
 use serde::Serialize;
 
 /// A package that is behind its upstream release and needs an update.
@@ -30,6 +32,10 @@ pub struct QueueEntry {
     /// The collector that confirmed the upstream version.
     pub source: String,
     pub status: String,
+    /// The distribution this update is for.
+    pub target: Target,
+    /// Routine version bump or security (CVE-driven) update.
+    pub kind: UpdateKind,
 }
 
 impl QueueEntry {
@@ -40,6 +46,8 @@ impl QueueEntry {
             upstream_version: upstream_version.to_string(),
             source: source.to_string(),
             status: "pending".to_string(),
+            target: Target::Factory,
+            kind: UpdateKind::Routine,
         }
     }
 }
@@ -48,11 +56,20 @@ impl QueueEntry {
 /// package, because PyPI needs the mapped PyPI name), the Factory client,
 /// an optional upstream checker for direct confirmation, and the dry-run
 /// mode (in dry-run it prints what it WOULD queue and writes nothing).
+///
+/// The target, the update policy, and the CVE validator are extension
+/// points for the Leap step (see `docs/leap-and-cve.md`): the target
+/// defaults to Factory, the policy defaults to the Factory version
+/// comparison, and there is no CVE validator. A Leap watcher will be
+/// built with `with_target` / `with_policy` / `with_cve_validator`.
 pub struct Watcher<'a> {
     http: &'a dyn HttpClient,
     factory: FactoryClient<'a>,
     upstream: Option<Box<dyn UpstreamChecker + 'a>>,
     dry_run: &'a DryRun,
+    target: Target,
+    policy: Box<dyn UpdatePolicy + 'a>,
+    cve_validator: Option<Box<dyn CveValidator + 'a>>,
 }
 
 impl<'a> Watcher<'a> {
@@ -67,7 +84,32 @@ impl<'a> Watcher<'a> {
             factory,
             upstream,
             dry_run,
+            target: Target::Factory,
+            policy: Box::new(FactoryPolicy),
+            cve_validator: None,
         }
+    }
+
+    /// Set the distribution target (Factory by default). Only Factory is
+    /// implemented; a Leap target here is for the later Leap step.
+    pub fn with_target(mut self, target: Target) -> Self {
+        self.target = target;
+        self
+    }
+
+    /// Replace the update policy (Factory version comparison by
+    /// default). The Leap step plugs in a backport-aware policy here.
+    pub fn with_policy(mut self, policy: Box<dyn UpdatePolicy + 'a>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Attach a CVE validator. It is consulted only for non-Factory
+    /// targets (Leap): for Factory the version comparison alone
+    /// decides, so the Factory path never calls a validator.
+    pub fn with_cve_validator(mut self, validator: Box<dyn CveValidator + 'a>) -> Self {
+        self.cve_validator = Some(validator);
+        self
     }
 
     /// Check one package. Returns a QueueEntry, or None when it is up to
@@ -89,16 +131,41 @@ impl<'a> Watcher<'a> {
             None => return Ok(None),
         };
 
-        if is_newer(&upstream_version, &factory_version) {
-            let entry = QueueEntry::new(
+        // Leap targets are not implemented yet: fail loudly rather than
+        // silently treating a Leap package like a Factory one. The Leap
+        // step consults the CVE validator here (see
+        // `docs/leap-and-cve.md`) to decide whether a CVE is already
+        // fixed by a backport. The Factory path never reaches this
+        // branch, so it never calls a validator.
+        if self.target.is_leap() {
+            let _ = self.cve_validator.as_deref();
+            return Err(HttpError(
+                "Leap targets are not implemented yet (see docs/leap-and-cve.md)".to_string(),
+            ));
+        }
+
+        if self
+            .policy
+            .needs_update(&factory_version, &upstream_version)
+        {
+            let mut entry = QueueEntry::new(
                 package,
                 &factory_version,
                 &upstream_version,
                 candidate.collector,
             );
+            entry.target = self.target.clone();
+            let kind_suffix = match entry.kind {
+                UpdateKind::Security => " (security)",
+                UpdateKind::Routine => "",
+            };
             self.dry_run.note(&format!(
-                "would queue: {} {} -> {} (source: {})",
-                entry.package, entry.factory_version, entry.upstream_version, entry.source
+                "would queue: {} {} -> {} (source: {}){}",
+                entry.package,
+                entry.factory_version,
+                entry.upstream_version,
+                entry.source,
+                kind_suffix
             ));
             Ok(Some(entry))
         } else {
@@ -330,5 +397,165 @@ mod tests {
         let watcher = watcher_with_http(http, dry_run);
         assert!(watcher.check_package("foo").unwrap().is_some());
         assert!(dry_run.plan().is_empty());
+    }
+
+    #[test]
+    fn check_package_entry_carries_factory_target_and_routine_kind() {
+        let http = FakeHttpClient::new()
+            .with(
+                "https://repology.org/api/v1/project/foo",
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#,
+            )
+            .with(
+                "https://release-monitoring.org/api/v2/projects/?name=foo",
+                r#"{"items": []}"#,
+            )
+            .with(
+                "https://distrowatch.com/table.php?distribution=opensuse",
+                "<html></html>",
+            )
+            .with(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
+                "Name: foo\nVersion: 1.9\n",
+            );
+        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let watcher = watcher_with_http(http, live());
+        let entry = watcher.check_package("foo").unwrap().unwrap();
+        assert_eq!(entry.target, Target::Factory);
+        assert_eq!(entry.kind, UpdateKind::Routine);
+    }
+
+    /// A policy that always says an update is needed.
+    struct AlwaysUpdate;
+
+    impl UpdatePolicy for AlwaysUpdate {
+        fn needs_update(&self, _current: &str, _candidate: &str) -> bool {
+            true
+        }
+    }
+
+    /// A policy that never says an update is needed.
+    struct NeverUpdate;
+
+    impl UpdatePolicy for NeverUpdate {
+        fn needs_update(&self, _current: &str, _candidate: &str) -> bool {
+            false
+        }
+    }
+
+    fn watcher_with_policy(
+        http: &'static dyn HttpClient,
+        dry_run: &'static DryRun,
+        policy: Box<dyn UpdatePolicy + 'static>,
+    ) -> Watcher<'static> {
+        Watcher::new(http, FactoryClient::new(http), None, dry_run).with_policy(policy)
+    }
+
+    #[test]
+    fn custom_policy_is_honoured() {
+        // An up-to-date package is queued when the policy says so, and
+        // a behind package is not queued when the policy says otherwise:
+        // the version comparison is behind the policy hook.
+        let http = FakeHttpClient::new()
+            .with(
+                "https://repology.org/api/v1/project/foo",
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#,
+            )
+            .with(
+                "https://release-monitoring.org/api/v2/projects/?name=foo",
+                r#"{"items": []}"#,
+            )
+            .with(
+                "https://distrowatch.com/table.php?distribution=opensuse",
+                "<html></html>",
+            )
+            .with(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
+                "Name: foo\nVersion: 2.0\n",
+            );
+        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let watcher = watcher_with_policy(http, live(), Box::new(AlwaysUpdate));
+        assert!(watcher.check_package("foo").unwrap().is_some());
+        let watcher = watcher_with_policy(http, live(), Box::new(NeverUpdate));
+        assert!(watcher.check_package("foo").unwrap().is_none());
+    }
+
+    /// A validator that panics if called: the Factory path must never
+    /// call a CVE validator, so attaching one must not change the
+    /// Factory outcome.
+    struct PanickingValidator;
+
+    impl CveValidator for PanickingValidator {
+        fn validate(
+            &self,
+            _package: &str,
+            _version: &str,
+            _cve: &crate::cve::CveId,
+        ) -> Result<crate::cve::CveValidation, crate::cve::CveError> {
+            panic!("CVE validator must not be called on the Factory path")
+        }
+
+        fn has_regression_test(
+            &self,
+            _package: &str,
+            _version: &str,
+            _cve: &crate::cve::CveId,
+        ) -> Result<bool, crate::cve::CveError> {
+            panic!("CVE validator must not be called on the Factory path")
+        }
+    }
+
+    #[test]
+    fn factory_path_does_not_call_cve_validator() {
+        let http = FakeHttpClient::new()
+            .with(
+                "https://repology.org/api/v1/project/foo",
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#,
+            )
+            .with(
+                "https://release-monitoring.org/api/v2/projects/?name=foo",
+                r#"{"items": []}"#,
+            )
+            .with(
+                "https://distrowatch.com/table.php?distribution=opensuse",
+                "<html></html>",
+            )
+            .with(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
+                "Name: foo\nVersion: 1.9\n",
+            );
+        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let watcher =
+            watcher_with_http(http, live()).with_cve_validator(Box::new(PanickingValidator));
+        // Would panic if the Factory path consulted the validator.
+        let entry = watcher.check_package("foo").unwrap().unwrap();
+        assert_eq!(entry.package, "foo");
+    }
+
+    #[test]
+    fn leap_target_fails_loudly() {
+        let http = FakeHttpClient::new()
+            .with(
+                "https://repology.org/api/v1/project/foo",
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}]"#,
+            )
+            .with(
+                "https://release-monitoring.org/api/v2/projects/?name=foo",
+                r#"{"items": []}"#,
+            )
+            .with(
+                "https://distrowatch.com/table.php?distribution=opensuse",
+                "<html></html>",
+            )
+            .with(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
+                "Name: foo\nVersion: 1.9\n",
+            );
+        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let watcher = watcher_with_http(http, live()).with_target(Target::Leap {
+            version: "16.0".to_string(),
+        });
+        let err = watcher.check_package("foo").unwrap_err();
+        assert!(err.0.contains("not implemented"));
     }
 }

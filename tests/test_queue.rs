@@ -1,7 +1,8 @@
 //! Integration tests for the queue: deduplication, persistence, dry-run.
 
 use freshcrab::dry_run::DryRun;
-use freshcrab::queue::{DedupChecks, Queue};
+use freshcrab::queue::{DedupChecks, Queue, QueueEntry, UpdateKind};
+use freshcrab::target::Target;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -29,10 +30,14 @@ fn add_and_deduplicate() {
     let live_run = live();
     assert!(q
         .add(
-            "foo",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &live_run
         )
@@ -40,10 +45,14 @@ fn add_and_deduplicate() {
     // In flight: a second add for the same package is skipped.
     assert!(q
         .add(
-            "foo",
-            "1.9",
-            "2.1",
-            "repology",
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.1",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &live_run
         )
@@ -52,10 +61,14 @@ fn add_and_deduplicate() {
     let devel = |_pkg: &str| Some("2.0".to_string());
     assert!(q
         .add(
-            "bar",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "bar",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks {
                 devel_version: Some(&devel),
                 has_open_sr: None,
@@ -67,10 +80,14 @@ fn add_and_deduplicate() {
     let has_sr = |_pkg: &str| true;
     assert!(q
         .add(
-            "baz",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "baz",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks {
                 devel_version: None,
                 has_open_sr: Some(&has_sr),
@@ -83,10 +100,14 @@ fn add_and_deduplicate() {
     let no_sr = |_pkg: &str| false;
     assert!(q
         .add(
-            "qux",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "qux",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks {
                 devel_version: Some(&devel_behind),
                 has_open_sr: Some(&no_sr),
@@ -103,19 +124,27 @@ fn save_and_load_roundtrip() {
     let mut q = Queue::open(&path).unwrap();
     let live_run = live();
     q.add(
-        "foo",
-        "1.9",
-        "2.0",
-        "repology",
+        QueueEntry::new(
+            "foo",
+            "1.9",
+            "2.0",
+            "repology",
+            &Target::Factory,
+            UpdateKind::Routine,
+        ),
         DedupChecks::none(),
         &live_run,
     )
     .unwrap();
     q.add(
-        "bar",
-        "1.0",
-        "1.1",
-        "repology",
+        QueueEntry::new(
+            "bar",
+            "1.0",
+            "1.1",
+            "repology",
+            &Target::Factory,
+            UpdateKind::Routine,
+        ),
         DedupChecks::none(),
         &live_run,
     )
@@ -139,10 +168,14 @@ fn dry_run_add_and_save_write_nothing() {
     // The dedup decision is printed, nothing is added, nothing is saved.
     assert!(q
         .add(
-            "foo",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &dry_run
         )
@@ -167,10 +200,14 @@ fn live_add_and_save_take_effect() {
     let live_run = live();
     assert!(q
         .add(
-            "foo",
-            "1.9",
-            "2.0",
-            "repology",
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
             DedupChecks::none(),
             &live_run
         )
@@ -178,5 +215,59 @@ fn live_add_and_save_take_effect() {
     q.save(&live_run).unwrap();
     assert!(Path::new(&path).exists());
     assert!(live_run.plan().is_empty());
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn pending_orders_security_before_routine() {
+    // Security (CVE-driven) updates are dispatched before routine
+    // version bumps; within a kind, insertion order is kept.
+    let path = tmp_path();
+    let mut q = Queue::open(&path).unwrap();
+    let live_run = live();
+    for (pkg, kind) in [
+        ("routine-a", UpdateKind::Routine),
+        ("security-a", UpdateKind::Security),
+        ("routine-b", UpdateKind::Routine),
+    ] {
+        q.add(
+            QueueEntry::new(pkg, "1.9", "2.0", "repology", &Target::Factory, kind),
+            DedupChecks::none(),
+            &live_run,
+        )
+        .unwrap();
+    }
+    let pending: Vec<&str> = q.pending().iter().map(|e| e.package.as_str()).collect();
+    assert_eq!(pending, vec!["security-a", "routine-a", "routine-b"]);
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn entry_carries_target_and_kind() {
+    let path = tmp_path();
+    let mut q = Queue::open(&path).unwrap();
+    let live_run = live();
+    let entry = q
+        .add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Security,
+            ),
+            DedupChecks::none(),
+            &live_run,
+        )
+        .unwrap();
+    assert_eq!(entry.target, Target::Factory);
+    assert_eq!(entry.kind, UpdateKind::Security);
+    // Persisted and reloaded, the target and kind survive.
+    q.save(&live_run).unwrap();
+    let q2 = Queue::open(&path).unwrap();
+    let reloaded = q2.find("foo").unwrap();
+    assert_eq!(reloaded.target, Target::Factory);
+    assert_eq!(reloaded.kind, UpdateKind::Security);
     let _ = fs::remove_file(&path);
 }
