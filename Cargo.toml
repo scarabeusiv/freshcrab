@@ -18,10 +18,11 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# TLS backend pinned explicitly (rustls) instead of relying on ureq's
-# default feature: the dependency must not silently change transport
-# under us.
-ureq = { version = "3", features = ["rustls"] }
+# TLS backend pinned explicitly: default features off, rustls on,
+# so the transport cannot silently change if ureq's defaults move.
+# gzip stays on (it was a default) so compressed collector responses
+# keep working.
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 # File locking for the queue (flock): serializes concurrent writers.
 fs2 = "0.4"
 

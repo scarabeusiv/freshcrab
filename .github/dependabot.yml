@@ -37,7 +37,8 @@ updates:
     # dtolnay/rust-toolchain is pinned to a commit on its stable branch
     # (see test.yml); commits on the toolchain branches are
     # garbage-collected upstream, so dependabot must not "helpfully"
-    # move it.
+    # move it. A monthly workflow (.github/workflows/toolchain-pin.yml)
+    # nudges a re-pin before the SHA is GC'd.
     ignore:
       - dependency-name: "dtolnay/rust-toolchain"
 

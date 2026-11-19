@@ -39,6 +39,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           latest=$(gh api repos/openSUSE/openSUSE-packaging-skill/tags --paginate --jq '.[].name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
           current=$(grep -oP '^ARG PACKAGING_SKILL_TAG=\K.*' Dockerfile)
           # Fail loudly when either side is empty: an empty latest (a
@@ -52,12 +53,19 @@ jobs:
           ref_json=$(gh api "repos/openSUSE/openSUSE-packaging-skill/git/refs/tags/${latest}")
           tag_sha=$(printf '%s' "${ref_json}" | jq -r '.object.sha')
           tag_type=$(printf '%s' "${ref_json}" | jq -r '.object.type')
+          # The tag object must be a 40-hex SHA: a failed `gh api` call
+          # (or a JSON error body) makes `jq -r` print the literal
+          # string "null", which an empty check would pass.
+          if ! [[ "${tag_sha}" =~ ^[0-9a-f]{40}$ ]]; then echo "could not determine tag object for ${latest} (got: ${tag_sha})" >&2; exit 1; fi
           if [ "${tag_type}" = "tag" ]; then
             sha=$(gh api "repos/openSUSE/openSUSE-packaging-skill/git/tags/${tag_sha}" --jq '.object.sha')
           else
             sha="${tag_sha}"
           fi
-          if [ -z "${sha}" ]; then echo "could not determine commit for tag ${latest}" >&2; exit 1; fi
+          # The SHA must be a 40-hex commit: without this, a "null"
+          # from `jq -r` would be written to GITHUB_OUTPUT and the
+          # workflow would open a PR pinning SHA=null.
+          if ! [[ "${sha}" =~ ^[0-9a-f]{40}$ ]]; then echo "could not determine commit for tag ${latest} (got: ${sha})" >&2; exit 1; fi
           {
             echo "latest=${latest}"
             echo "current=${current}"
@@ -71,9 +79,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           latest="${{ steps.check.outputs.latest }}"
           current="${{ steps.check.outputs.current }}"
           sha="${{ steps.check.outputs.sha }}"
+          # Re-validate the SHA the check step resolved: never pin a
+          # non-commit value into the Dockerfile.
+          if ! [[ "${sha}" =~ ^[0-9a-f]{40}$ ]]; then echo "refusing to pin non-SHA value: ${sha}" >&2; exit 1; fi
           branch="skill-tag-bump/${latest}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -84,9 +96,18 @@ jobs:
           current_esc=$(printf '%s' "${current}" | sed 's/[.[\*^$]/\\&/g')
           sed -i "s/^ARG PACKAGING_SKILL_TAG=${current_esc}$/ARG PACKAGING_SKILL_TAG=${latest}/" Dockerfile
           sed -i "s/^ARG PACKAGING_SKILL_SHA=[0-9a-f]*$/ARG PACKAGING_SKILL_SHA=${sha}/" Dockerfile
-          sed -i "s/tag ${current_esc}/tag ${latest}/g" README.md docs/runbook.md
+          # Scope the docs replacements to the two live tag mentions
+          # (the "tag <version> of openSUSE/openSUSE-packaging-skill"
+          # phrase and the "(fetched at build time, tag <version>)"
+          # phrase): a global `s/tag X/tag Y/g` would also rewrite a
+          # historical mention of the current tag.
+          sed -i "s|tag ${current_esc} of openSUSE/openSUSE-packaging-skill|tag ${latest} of openSUSE/openSUSE-packaging-skill|g" README.md docs/runbook.md
+          sed -i "s|(fetched at build time, tag ${current_esc})|(fetched at build time, tag ${latest})|" docs/runbook.md
           grep -q "^ARG PACKAGING_SKILL_TAG=${latest}$" Dockerfile || { echo "tag update failed" >&2; exit 1; }
           grep -q "^ARG PACKAGING_SKILL_SHA=${sha}$" Dockerfile || { echo "SHA update failed" >&2; exit 1; }
+          grep -F -q "tag ${latest} of openSUSE/openSUSE-packaging-skill" README.md || { echo "README tag update failed" >&2; exit 1; }
+          grep -F -q "tag ${latest} of openSUSE/openSUSE-packaging-skill" docs/runbook.md || { echo "runbook tag update failed" >&2; exit 1; }
+          grep -F -q "(fetched at build time, tag ${latest})" docs/runbook.md || { echo "runbook skill-phrase update failed" >&2; exit 1; }
           git add Dockerfile README.md docs/runbook.md
           git commit -m "chore: bump opensuse-packaging-skill to ${latest}"
           git push origin "${branch}"

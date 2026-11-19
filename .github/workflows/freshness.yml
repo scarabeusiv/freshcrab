@@ -22,6 +22,12 @@ on:
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
+# Weekly + manual: never run two freshness checks at once; do not
+# cancel a running one (it is a long audit, not a PR check).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
