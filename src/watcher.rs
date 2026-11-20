@@ -22,6 +22,42 @@ use crate::http::{HttpClient, HttpError};
 use crate::queue::UpdateKind;
 use crate::target::{FactoryPolicy, Target, UpdatePolicy};
 use serde::Serialize;
+use std::fmt;
+
+/// Error from checking one package.
+///
+/// The Leap refusal is a distinct variant, not an [`HttpError`]: a
+/// target that is not implemented yet is not an HTTP failure, and
+/// returning it as one hid that distinction from the caller.
+#[derive(Debug)]
+pub enum WatchError {
+    /// An HTTP request failed (collector, Factory, or OBS read).
+    Http(HttpError),
+    /// The target is not implemented yet (Leap): the check is refused
+    /// before any network I/O. The Leap step consults the CVE
+    /// validator here (see `docs/leap-and-cve.md`).
+    LeapNotImplemented,
+}
+
+impl fmt::Display for WatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WatchError::Http(e) => write!(f, "{e}"),
+            WatchError::LeapNotImplemented => write!(
+                f,
+                "Leap targets are not implemented yet (see docs/leap-and-cve.md)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WatchError {}
+
+impl From<HttpError> for WatchError {
+    fn from(e: HttpError) -> Self {
+        WatchError::Http(e)
+    }
+}
 
 /// A package that is behind its upstream release and needs an update.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -121,7 +157,7 @@ impl<'a> Watcher<'a> {
     /// date, unconfirmed, or when a version is unavailable. In dry-run,
     /// prints what it WOULD queue and returns the entry (the caller
     /// decides whether to persist it; the queue also consults dry-run).
-    pub fn check_package(&self, package: &str) -> Result<Option<QueueEntry>, HttpError> {
+    pub fn check_package(&self, package: &str) -> Result<Option<QueueEntry>, WatchError> {
         // Leap targets are not implemented yet: fail loudly before any
         // network I/O, so no rate-limited collector requests are burned
         // (and no package names disclosed) for a target that will be
@@ -130,9 +166,7 @@ impl<'a> Watcher<'a> {
         // fixed by a backport. The Factory path never reaches this
         // branch, so it never calls a validator.
         if self.target.is_leap() {
-            return Err(HttpError::Other(
-                "Leap targets are not implemented yet (see docs/leap-and-cve.md)".to_string(),
-            ));
+            return Err(WatchError::LeapNotImplemented);
         }
 
         // Fetch the Factory version first: when the spec is unavailable
@@ -569,7 +603,7 @@ mod tests {
             version: "16.0".to_string(),
         });
         let err = watcher.check_package("foo").unwrap_err();
-        assert!(format!("{err}").contains("not implemented"));
+        assert!(matches!(err, WatchError::LeapNotImplemented));
     }
 
     #[test]
