@@ -233,7 +233,7 @@ src/
                        + the validator interface (not yet implemented)
   watcher.rs           collectors + confirmation + Factory compare
   queue.rs             queue state file, deduplication
-  obs.rs               OBS client for the dedup checks + filing a submit
+  geectl (dependency)  OBS client for the dedup checks + filing a submit
                        request (POST /request?cmd=create)
   dispatcher.rs        picks pending entries (security first, concurrency
                        limit, daily SR cap), drives the worker, applies
@@ -242,8 +242,6 @@ src/
                        resolution, dedup re-check, branch project, update
                        plan (.changes entry + SR description, CVE rules),
                        the executor trait + DryRunExecutor
-  sr.rs                SR payload (validated OBS request XML) + the
-                       filing step, gated by the single dry-run guard
 worker/
   brief.md             agent brief for the update worker (the live executor step)
 tests/

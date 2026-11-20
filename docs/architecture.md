@@ -77,7 +77,7 @@ OBS, validates it, and submits the update to the devel project.
    `home:{OBS username}`), builds the update plan (one `.changes`
    entry, the SR description) enforcing the changelog rules (a security
    entry must name its CVE), builds the SR payload
-   (`src/sr.rs` — validated, well-formed OBS request XML), executes
+   (geectl's `SrPayload` — validated, well-formed OBS request XML), executes
    the update steps through the executor, and files the SR to the devel
    project via the OBS API. The executor is the `UpdateExecutor` trait:
    this phase ships only the `DryRunExecutor` (dry-run: logs the
@@ -239,7 +239,7 @@ src/
   queue.rs             queue state file, deduplication, security-first
                        ordering (kind: routine / security); filed SR ids
                        and the daily-cap count
-  obs.rs               OBS client for the dedup checks + filing a submit
+  geectl (dependency)  OBS client for the dedup checks + filing a submit
                        request (POST /request?cmd=create)
   dispatcher.rs        picks pending entries (security first, concurrency
                        limit, daily SR cap), drives the worker, applies
@@ -248,8 +248,6 @@ src/
                        resolution, dedup re-check, branch project, update
                        plan (.changes entry + SR description, CVE rules),
                        the executor trait + DryRunExecutor
-  sr.rs                SR payload (validated OBS request XML) + the
-                       filing step, gated by the single dry-run guard
 worker/
   brief.md             agent brief for the update worker (the live
                        executor step)
