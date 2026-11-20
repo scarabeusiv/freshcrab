@@ -130,7 +130,7 @@ impl<'a> Watcher<'a> {
         // fixed by a backport. The Factory path never reaches this
         // branch, so it never calls a validator.
         if self.target.is_leap() {
-            return Err(HttpError(
+            return Err(HttpError::Other(
                 "Leap targets are not implemented yet (see docs/leap-and-cve.md)".to_string(),
             ));
         }
@@ -569,7 +569,7 @@ mod tests {
             version: "16.0".to_string(),
         });
         let err = watcher.check_package("foo").unwrap_err();
-        assert!(err.0.contains("not implemented"));
+        assert!(format!("{err}").contains("not implemented"));
     }
 
     #[test]

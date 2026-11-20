@@ -39,7 +39,9 @@ impl<'a> FactoryClient<'a> {
     /// Return the raw spec text for `package` on Factory.
     pub fn get_spec(&self, package: &str) -> Result<String, HttpError> {
         if !valid_obs_name(package) {
-            return Err(HttpError(format!("invalid OBS package name: {package:?}")));
+            return Err(HttpError::Other(format!(
+                "invalid OBS package name: {package:?}"
+            )));
         }
         let encoded = encode_path(package);
         let url = format!("{OBS_API}/public/source/{FACTORY_PROJECT}/{encoded}/{encoded}.spec");
