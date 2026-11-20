@@ -16,6 +16,7 @@
 pub mod collectors;
 pub mod config;
 pub mod cve;
+pub mod dispatcher;
 pub mod dry_run;
 pub mod factory;
 pub mod http;
