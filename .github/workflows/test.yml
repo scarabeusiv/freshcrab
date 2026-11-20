@@ -115,7 +115,7 @@ jobs:
       # code or a dev-dependency otherwise passes here and only bites a
       # contributor. --locked is intentional: the check runs against the
       # exact locked dependency set, so a failure is a real MSRV break
-      # (the lockfile is version 4, readable by cargo 1.88).
+      # (the lockfile is version 4, readable by cargo 1.99.1).
       - name: cargo check at MSRV
         run: |
           export RUSTUP_TOOLCHAIN="${{ steps.msrv.outputs.value }}"
