@@ -1,15 +1,15 @@
 # Monthly re-pin nudge for the dtolnay/rust-toolchain SHA pin.
 #
-# test.yml and freshness.yml pin dtolnay/rust-toolchain to a commit on
-# its stable branch (Dependabot must not move it — see
+# test.yml, freshness.yml, and release.yml pin dtolnay/rust-toolchain
+# to a commit on its stable branch (Dependabot must not move it — see
 # dependabot.yml). Commits on the toolchain branches are
 # garbage-collected upstream, so a stale pin silently breaks every
 # Rust job at once. This workflow runs monthly and fails loudly when
 # the pin is gone (GC'd) or older than 45 days, so it is re-pinned
 # before it breaks. When it fails, re-pin: take the current stable
 # HEAD (`gh api repos/dtolnay/rust-toolchain/commits/stable --jq .sha`)
-# and update the SHA in test.yml AND freshness.yml (they must match),
-# plus the date in the pin comments.
+# and update the SHA in test.yml, freshness.yml, AND release.yml (they
+# must match), plus the date in the pin comments.
 name: toolchain-pin
 
 on:
@@ -43,7 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           # The pin must be one SHA everywhere it is used.
-          pinned=$(grep -hoP 'dtolnay/rust-toolchain@\K[0-9a-f]{40}' .github/workflows/test.yml .github/workflows/freshness.yml | sort -u)
+          pinned=$(grep -hoP 'dtolnay/rust-toolchain@\K[0-9a-f]{40}' .github/workflows/test.yml .github/workflows/freshness.yml .github/workflows/release.yml | sort -u)
           count=$(printf '%s\n' "${pinned}" | grep -c .)
           if [ "${count}" -ne 1 ]; then echo "expected one dtolnay pin, found ${count}: ${pinned}" >&2; exit 1; fi
           sha="${pinned}"
@@ -61,6 +61,6 @@ jobs:
           echo "pinned dtolnay SHA ${sha} is ${age_days} days old (committed ${commit_date})"
           if [ "${age_days}" -gt 45 ]; then
             head_sha=$(gh api repos/dtolnay/rust-toolchain/commits/stable --jq '.sha')
-            echo "pin is older than 45 days; re-pin test.yml and freshness.yml to the current stable HEAD ${head_sha}" >&2
+            echo "pin is older than 45 days; re-pin test.yml, freshness.yml, and release.yml to the current stable HEAD ${head_sha}" >&2
             exit 1
           fi
