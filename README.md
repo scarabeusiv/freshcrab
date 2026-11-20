@@ -16,11 +16,19 @@ already in flight.
 
 ## Status
 
-Scaffolding: the watcher and the queue are implemented and tested. The
-dispatcher and the worker execution (invoking an agent from CI) are a
-later phase; `worker/` currently holds only the agent brief. The watcher
-runs in report-only mode by default: it queues and reports what it would
-update, and files nothing.
+Scaffolding: the watcher and the queue are implemented and tested, and
+the dispatcher and the worker are implemented too: with `report_only:
+false` the dispatcher picks pending entries (security first, within
+the concurrency limit and the daily SR cap), the worker re-checks the
+deduplication rules, builds the update plan (one `.changes` entry, the
+SR description) and the exact SR payload, and files the submit request
+to the devel project. Dry-run is the default: the plan and the exact
+SR payload are logged and nothing is filed. What is NOT yet there is
+the live update executor — the agent/CI step that actually performs
+the branch, bump, spec-cleaner, OBS build, rpmcrab and audit steps.
+Until it exists, live mode refuses to file (the entries escalate
+instead), so no SR is ever filed on a plan that was not executed.
+`worker/` holds the agent brief for that step.
 
 Leap and CVE validation are a planned later step, after this
 scaffolding is reviewed — see `docs/leap-and-cve.md`. The scaffold is
@@ -72,7 +80,9 @@ devel-project reads use the OBS public API and need no credentials. The
 open-submit-request dedup check uses the OBS search API, which has no
 public equivalent — without OBS credentials the check fails and the
 package is skipped (fail-closed) instead of being queued on an
-unchecked dedup; credential plumbing is the filing phase's work.
+unchecked dedup. The credentials are read from the `OSC_USERNAME` /
+`OSC_PASSWORD` environment variables; filing a submit request needs
+them too (the OBS API accepts HTTP Basic auth with oscrc credentials).
 
 ## Tools in the container
 
@@ -95,19 +105,20 @@ The agent invokes them by name; see `worker/brief.md` and
 ## Dry-run
 
 Dry-run is the default in this phase, and it is global: one mode
-governs the watcher, the queue, and (later) the worker. In dry-run
-nothing is written or filed — the watcher polls the collectors and
-prints what it WOULD queue, the queue evaluates the dedup rules and
+governs the watcher, the queue, the dispatcher, and the worker. In
+dry-run nothing is written or filed — the watcher polls the collectors
+and prints what it WOULD queue, the queue evaluates the dedup rules and
 prints the decision for each candidate (would-enqueue / would-skip +
-reason), and the worker prints the full plan and takes no action. The
-effective mode is logged loudly at startup, so it is always obvious
-which mode is running.
+reason), the dispatcher logs the would-do plan for each entry, and the
+worker prints the full plan and takes no action. The effective mode is
+logged loudly at startup, so it is always obvious which mode is running.
 
 ```sh
 # Dry-run (default): prints the would-do plan, writes nothing.
 podman run --rm -v "$PWD/config.yaml:/app/config.yaml:ro" freshcrab --packages foo bar
 
-# Live: writes the queue state file (still files no SR in this phase).
+# Live: writes the queue state file; with a live executor the dispatcher files SRs
+# (the shipped executor refuses live, so nothing is filed until that step lands).
 podman run --rm -v "$PWD/config.yaml:/app/config.yaml:ro" freshcrab --live --packages foo bar
 ```
 
@@ -184,8 +195,8 @@ disabled), delete head branches on merge, auto-merge allowed.
 - `packages`: the set to monitor. Empty means all of Factory except
   `exclusions`.
 - `exclusions`: packages never auto-updated (hand-maintained or special).
-- `concurrency`: how many workers run at once (later phase).
-- `daily_sr_cap`: maximum submit requests filed per day (later phase).
+- `concurrency`: the per-run batch — how many queued entries one dispatch run handles.
+- `daily_sr_cap`: maximum submit requests filed per day.
 - `kill_switch`: when `true`, the pipeline pauses entirely.
 
 See `docs/runbook.md` for the full reference.
@@ -221,15 +232,28 @@ src/
                        + the validator interface (not yet implemented)
   watcher.rs           collectors + confirmation + Factory compare
   queue.rs             queue state file, deduplication
-  obs.rs               OBS client for the dedup checks
+  obs.rs               OBS client for the dedup checks + filing a submit
+                       request (POST /request?cmd=create)
+  dispatcher.rs        picks pending entries (security first, concurrency
+                       limit, daily SR cap), drives the worker, applies
+                       outcomes to the queue, prints the dispatch report
+  worker.rs            one queue entry through the pipeline: devel
+                       resolution, dedup re-check, branch project, update
+                       plan (.changes entry + SR description, CVE rules),
+                       the executor trait + DryRunExecutor
+  sr.rs                SR payload (validated OBS request XML) + the
+                       filing step, gated by the single dry-run guard
 worker/
-  brief.md             agent brief for the update worker (later phase)
+  brief.md             agent brief for the update worker (the live executor step)
 tests/
   test_version.rs      version comparison contract
   test_watcher.rs      watcher with canned fixtures (no live network)
   test_queue.rs        deduplication + persistence
   test_config.rs       config loading, validation, exclusions
   test_cve.rs          CVE id parsing + the changelog rule + the stub
+  test_sr.rs           SR filing: dry-run logs the exact payload and
+                       files nothing; live POSTs the XML and returns the
+                       request id; no credentials fails closed
   fixtures/            canned Repology / Anitya / PyPI / Distrowatch / spec
 docs/
   architecture.md      component diagram + data flow + gate rules

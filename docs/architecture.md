@@ -27,17 +27,17 @@ OBS, validates it, and submits the update to the devel project.
    │ Distrowatch │           ▼
    │  (signal)   │  ┌──────────────────┐
    └─────────────┘  │      Queue       │
-   ┌─────────────┐  │  state file +    │      (later phase)
+   ┌─────────────┐  │  state file +    │
    │  Upstream   │  │  deduplication   │  ┌──────────────────┐
    │  (confirm)  │  └────────┬────────┘  │    Dispatcher    │
    └─────────────┘           │           │  picks entries,   │
-                             ▼           │  spawns a worker  │
+                             ▼           │  drives a worker  │
                     ┌──────────────────┐ └────────┬─────────┘
                     │  queue.json      │          │
                     │  (pending / in   │          ▼
                     │   progress / done)│  ┌──────────────────┐
                     └──────────────────┘  │      Worker      │
-                                            │  agent + brief   │
+                                            │  plan + payload  │
                                             │  branch, bump,   │
                                             │  clean, build,   │
                                             │  validate, file  │
@@ -64,15 +64,30 @@ OBS, validates it, and submits the update to the devel project.
    the deduplication checks run: skip when the devel project already
    has the new version, when an open submit request already targets
    the package, or when a task for the package is already in flight.
-3. **Dispatcher** (later phase). Picks pending entries (respecting the
-   concurrency limit and the daily SR cap) and spawns one worker per
-   package.
-4. **Worker** (later phase). An agent following `worker/brief.md`:
-   branch from the devel project, bump Version + tarball + one
-   `.changes` entry, spec-cleaner full mode, OBS build, rpmcrab 0E/0W,
-   pre-filing adversarial audit, file the SR to the devel project via
-   the OBS API. Escalates to a human on build failure, unfixable
-   findings, a spec logic change, or a conflicting SR.
+3. **Dispatcher** (`src/dispatcher.rs`). Picks pending entries
+   (security first, respecting the concurrency limit and the daily SR
+   cap) and drives one worker per package. Applies the outcome to the
+   queue status (`done` when the SR was filed or the update was already
+   handled, `escalated` when a human must look, unchanged when the run
+   was a dry-run plan) and saves the queue. Runs only when
+   `report_only` is false.
+4. **Worker** (`src/worker.rs`). For one queue entry: resolves the
+   devel project, re-checks the deduplication rules (fail-closed),
+   resolves the branch project (`home_project` from config, else
+   `home:{OBS username}`), builds the update plan (one `.changes`
+   entry, the SR description) enforcing the changelog rules (a security
+   entry must name its CVE), builds the SR payload
+   (`src/sr.rs` — validated, well-formed OBS request XML), executes
+   the update steps through the executor, and files the SR to the devel
+   project via the OBS API. The executor is the `UpdateExecutor` trait:
+   this phase ships only the `DryRunExecutor` (dry-run: logs the
+   would-do steps and returns `Planned`; live: refuses, so no SR is
+   ever filed on a plan that was not executed). The live executor — the
+   agent/CI step that actually performs the branch, bump,
+   spec-cleaner, OBS build, rpmcrab and audit steps, following
+   `worker/brief.md` — is a later step. Escalates to a human on build
+   failure, unfixable findings, a spec logic change, or a conflicting
+   SR.
 
 ## Collectors (priority order)
 
@@ -136,7 +151,7 @@ in pure Rust in `src/version.rs` — never a naive string compare:
 ## Dry-run
 
 Dry-run is the default in this phase, and it is global: one mode
-governs the watcher, the queue, and the worker. Every mutating
+governs the watcher, the queue, the dispatcher, and the worker. Every mutating
 operation goes through the single dry-run guard (`src/dry_run.rs`:
 `DryRun::allow`) before any write, API call, or external action. Reads
 are not gated (the watcher still polls the collectors; the queue still
@@ -192,7 +207,11 @@ Factory and devel-project reads use the OBS public API and need no
 credentials; the open-submit-request dedup check uses the OBS search
 API, which has no public equivalent — without credentials it fails and
 the package is skipped (fail-closed) instead of being queued on an
-unchecked dedup; credential plumbing is the filing phase's work.
+unchecked dedup. The credentials are read from the `OSC_USERNAME` /
+`OSC_PASSWORD` environment variables; the search uses them (HTTP Basic
+auth) when present, and filing a submit request requires them (the OBS
+API accepts HTTP Basic auth with oscrc credentials). The values are
+never logged.
 
 ## Layout
 
@@ -218,16 +237,31 @@ src/
                        + the validator interface (not yet implemented)
   watcher.rs           collectors + confirmation + Factory compare
   queue.rs             queue state file, deduplication, security-first
-                       ordering (kind: routine / security)
-  obs.rs               OBS client for the dedup checks
+                       ordering (kind: routine / security); filed SR ids
+                       and the daily-cap count
+  obs.rs               OBS client for the dedup checks + filing a submit
+                       request (POST /request?cmd=create)
+  dispatcher.rs        picks pending entries (security first, concurrency
+                       limit, daily SR cap), drives the worker, applies
+                       outcomes to the queue, prints the dispatch report
+  worker.rs            one queue entry through the pipeline: devel
+                       resolution, dedup re-check, branch project, update
+                       plan (.changes entry + SR description, CVE rules),
+                       the executor trait + DryRunExecutor
+  sr.rs                SR payload (validated OBS request XML) + the
+                       filing step, gated by the single dry-run guard
 worker/
-  brief.md             agent brief for the update worker (later phase)
+  brief.md             agent brief for the update worker (the live
+                       executor step)
 tests/
   test_version.rs      version comparison contract
   test_watcher.rs      watcher with canned fixtures (no live network)
   test_queue.rs        deduplication + persistence
   test_config.rs       config loading, validation, exclusions
   test_cve.rs          CVE id parsing + the changelog rule + the stub
+  test_sr.rs           SR filing: dry-run logs the exact payload and
+                       files nothing; live POSTs the XML and returns the
+                       request id; no credentials fails closed
   fixtures/            canned Repology / Anitya / PyPI / Distrowatch / spec
 docs/
   architecture.md      this file
