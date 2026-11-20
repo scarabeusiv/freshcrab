@@ -25,6 +25,9 @@ serde_json = "1"
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 # File locking for the queue (flock): serializes concurrent writers.
 fs2 = "0.4"
+# Base64 for the HTTP Basic auth header. Already a transitive
+# dependency via ureq (same version), so this adds no new crate.
+base64 = "0.23"
 
 [lints.rust]
 unsafe_code = "forbid"
