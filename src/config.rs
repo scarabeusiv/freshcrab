@@ -8,6 +8,7 @@
 //! silently misread. No YAML library is pulled in (standard library
 //! only); the rest of the crate uses serde_json for JSON APIs.
 
+use crate::collectors::valid_obs_name;
 use crate::target::Target;
 use std::collections::HashMap;
 use std::fmt;
@@ -43,6 +44,7 @@ const KNOWN_KEYS: &[&str] = &[
     "kill_switch",
     "report_only",
     "dry_run",
+    "home_project",
 ];
 
 /// Validated configuration.
@@ -58,12 +60,23 @@ pub struct Config {
     pub concurrency: u32,
     pub daily_sr_cap: u32,
     pub kill_switch: bool,
+    /// Report-only mode: the watcher runs and the dispatcher does not.
+    /// This gates ONLY the dispatcher — the watcher still enqueues, and
+    /// in live mode the queue state file is still written (the queue is
+    /// the watcher's staging state, not a filing). `dry_run` is the flag
+    /// that prevents all writes. Default: true.
     pub report_only: bool,
     /// Dry-run mode: when true, nothing is written or filed; components
     /// print what they WOULD do. Default true in this phase (the watcher
     /// is report-only anyway). Overridable by `--dry-run` / `--live` and
     /// by the `FRESHCRAB_DRY_RUN` env var.
     pub dry_run: bool,
+    /// The OBS home project the worker branches into (e.g.
+    /// `home:scarabeus_iv`). Empty (the default) means "derive it from
+    /// the OBS username" (`home:{OSC_USERNAME}`). The worker needs a
+    /// branch project to build an SR payload; without it, live filing
+    /// escalates and dry-run planning notes the gap.
+    pub home_project: String,
 }
 
 impl Default for Config {
@@ -77,6 +90,7 @@ impl Default for Config {
             kill_switch: false,
             report_only: true,
             dry_run: true,
+            home_project: String::new(),
         }
     }
 }
@@ -310,6 +324,14 @@ fn require_bool(
     }
 }
 
+fn require_string(map: &HashMap<String, Value>, name: &str) -> Result<String, ConfigError> {
+    match map.get(name) {
+        None => Ok(String::new()),
+        Some(Value::Str(s)) => Ok(s.clone()),
+        Some(_) => Err(ConfigError(format!("{name}: expected a string"))),
+    }
+}
+
 /// Validate a parsed map into a Config.
 fn validate(map: HashMap<String, Value>) -> Result<Config, ConfigError> {
     let unknown: Vec<&str> = map
@@ -333,7 +355,32 @@ fn validate(map: HashMap<String, Value>) -> Result<Config, ConfigError> {
         kill_switch: require_bool(&map, "kill_switch", false)?,
         report_only: require_bool(&map, "report_only", true)?,
         dry_run: require_bool(&map, "dry_run", true)?,
+        home_project: validate_home_project(require_string(&map, "home_project")?)?,
     })
+}
+
+/// Validate the `home_project` value at config load (fail early, not
+/// at filing time): empty means "derive it from the OBS username";
+/// otherwise it must be exactly `home:<name>` where `<name>` is a valid
+/// OBS name with no colon. A stray `:` (e.g. `home:foo:bar`) or a
+/// missing name would only fail at the OBS API, after the update was
+/// built. A whitespace-only value is treated as unset.
+fn validate_home_project(raw: String) -> Result<String, ConfigError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let Some(name) = trimmed.strip_prefix("home:") else {
+        return Err(ConfigError(format!(
+            "invalid home_project {raw:?}: expected \"home:<username>\" (or empty to derive it from OSC_USERNAME)"
+        )));
+    };
+    if name.is_empty() || name.contains(':') || !valid_obs_name(name) {
+        return Err(ConfigError(format!(
+            "invalid home_project {raw:?}: expected \"home:<username>\" with a valid OBS username"
+        )));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Load and validate the config file at `path`.
@@ -488,5 +535,36 @@ mod tests {
         assert_eq!(cfg.targets, vec![Target::Factory]);
         assert!(cfg.report_only);
         assert!(!cfg.kill_switch);
+    }
+
+    #[test]
+    fn home_project_parses() {
+        // Default: empty (derive from the OBS username).
+        let cfg = load_config_text("").unwrap();
+        assert_eq!(cfg.home_project, "");
+        let cfg = load_config_text("home_project: home:scarabeus_iv\n").unwrap();
+        assert_eq!(cfg.home_project, "home:scarabeus_iv");
+        // Not a string: rejected.
+        assert!(load_config_text("home_project: 42\n").is_err());
+        // Whitespace-only (quoted) is treated as unset.
+        assert_eq!(
+            load_config_text("home_project: \"   \"\n")
+                .unwrap()
+                .home_project,
+            ""
+        );
+        // Surrounding whitespace is trimmed.
+        assert_eq!(
+            load_config_text("home_project:   home:scarabeus_iv  \n")
+                .unwrap()
+                .home_project,
+            "home:scarabeus_iv"
+        );
+        // A second colon, a missing name, a missing home: prefix, or a
+        // name with a space all fail at config load, not at the API.
+        assert!(load_config_text("home_project: home:foo:bar\n").is_err());
+        assert!(load_config_text("home_project: home:\n").is_err());
+        assert!(load_config_text("home_project: scarabeus_iv\n").is_err());
+        assert!(load_config_text("home_project: home:foo bar\n").is_err());
     }
 }

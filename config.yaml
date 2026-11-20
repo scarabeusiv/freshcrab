@@ -26,10 +26,12 @@ exclusions:
   - python3
   - perl
 
-# How many workers run at once (later phase; the watcher ignores it).
+# How many workers run at once (the dispatcher takes at most this many
+# queued entries per run).
 concurrency: 4
 
-# Maximum submit requests filed per day (later phase).
+# Maximum submit requests filed per day (the dispatcher stops when
+# this many SRs were filed today).
 daily_sr_cap: 20
 
 # Kill switch: when true, the pipeline pauses entirely.
@@ -39,7 +41,16 @@ kill_switch: false
 report_only: true
 
 # Dry-run mode: when true, nothing is written or filed anywhere — the
-# watcher, queue and (later) worker only print what they WOULD do.
+# watcher, queue, dispatcher and worker only print what they WOULD do.
 # Default true in this phase. Overridable by --dry-run / --live on the
 # command line and by the FRESHCRAB_DRY_RUN env var.
 dry_run: true
+
+# The OBS home project the worker branches into (e.g.
+# home:scarabeus_iv). Empty means: derive it from the OBS username
+# (home:{OSC_USERNAME}). The worker needs a branch project to build an
+# SR payload; without one, live filing escalates and dry-run planning
+# notes the gap. Set this (or OSC_USERNAME) before running with
+# report_only: false.
+home_project: ""
+
