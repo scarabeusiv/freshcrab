@@ -528,6 +528,7 @@ mod tests {
             target: Target::Factory,
             changes_entry: "- Update to version 2.0.\n".to_string(),
             description: "Update foo to 2.0".to_string(),
+            cves: Vec::new(),
             cve_regression_test: None,
         };
         assert!(SrPayload::from_plan(&plan).is_err());

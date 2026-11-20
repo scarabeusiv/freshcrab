@@ -8,8 +8,8 @@
 //! or when a task for the package is already in flight. When the
 //! open-SR check itself fails, the package is skipped (fail-closed)
 //! rather than queued on an unchecked dedup. The OBS-backed
-//! checkers live in `obs.rs`; the queue takes closures so the tests can
-//! inject fakes.
+//! checkers live in the geectl OBS client; the queue takes closures so
+//! the tests can inject fakes.
 //!
 //! In dry-run mode every mutation goes through the dry-run guard
 //! (`crate::dry_run::DryRun`): the dedup rules are still evaluated (reads
@@ -23,10 +23,10 @@
 //! human clears it.
 
 use crate::dry_run::DryRun;
-use crate::http::HttpError;
 use crate::target::Target;
 use crate::version::is_newer;
 use fs2::FileExt;
+use geectl::error::{ErrorKind, GeectlError};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -149,11 +149,11 @@ pub type DevelVersionCheck<'a> = dyn Fn(&str) -> Option<String> + 'a;
 /// `Queue::add` for deduplication. Returns an error when the check
 /// itself fails: a non-auth failure (e.g. a transport error) is
 /// fail-closed — `Queue::add` skips the package rather than queueing
-/// it on an unchecked dedup — but an auth rejection
-/// ([`HttpError::AuthRejected`], e.g. the OBS search API 401s on
+/// it on an unchecked dedup — but an auth failure
+/// ([`ErrorKind::AuthFailed`], e.g. the OBS search API 401s on
 /// rotated credentials) propagates out of `Queue::add` so the run
 /// fails loudly instead of silently skipping every candidate.
-pub type OpenSrCheck<'a> = dyn Fn(&str) -> Result<bool, HttpError> + 'a;
+pub type OpenSrCheck<'a> = dyn Fn(&str) -> Result<bool, GeectlError> + 'a;
 
 /// The dedup checkers for `Queue::add`. Both are optional; a missing
 /// checker skips that check.
@@ -432,9 +432,9 @@ impl Queue {
     /// package was skipped.
     ///
     /// When the open-SR check itself errors with anything but an auth
-    /// rejection, the package is skipped (fail-closed) rather than
-    /// queued on an unchecked dedup. An auth rejection
-    /// ([`HttpError::AuthRejected`]) is returned as an error instead:
+    /// failure, the package is skipped (fail-closed) rather than
+    /// queued on an unchecked dedup. An auth failure
+    /// ([`ErrorKind::AuthFailed`]) is returned as an error instead:
     /// with rotated or expired credentials every candidate would
     /// otherwise be skipped one by one and the run would exit 0 with
     /// an empty batch — the exact silent failure the typed rejection
@@ -450,7 +450,7 @@ impl Queue {
         entry: QueueEntry,
         dedup: DedupChecks<'_>,
         dry_run: &DryRun,
-    ) -> Result<Option<QueueEntry>, HttpError> {
+    ) -> Result<Option<QueueEntry>, GeectlError> {
         if self.in_flight(&entry.package) {
             dry_run.note(&format!(
                 "would-skip {}: task already in flight",
@@ -499,11 +499,11 @@ impl Queue {
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    // An auth rejection (rotated or expired OBS
+                    // An auth failure (rotated or expired OBS
                     // credentials) is not a per-package skip: it
                     // would strike every candidate, so propagate it
                     // and let the caller fail the run loudly.
-                    if e.is_auth_rejected() {
+                    if e.kind() == ErrorKind::AuthFailed {
                         return Err(e);
                     }
                     // Fail closed: the dedup check could not run (the
@@ -1428,8 +1428,11 @@ mod tests {
         // rather than queued on an unchecked dedup.
         let path = tmp_path();
         let mut q = Queue::open(&path).unwrap();
-        let has_sr = |_pkg: &str| -> Result<bool, HttpError> {
-            Err(HttpError::Other("open-SR check failed".to_string()))
+        let has_sr = |_pkg: &str| -> Result<bool, GeectlError> {
+            Err(GeectlError::new(
+                ErrorKind::NetworkError,
+                "open-SR check failed",
+            ))
         };
         assert!(q
             .add(
@@ -1463,8 +1466,8 @@ mod tests {
         // `open_sr_check_error_is_fail_closed`).
         let path = tmp_path();
         let mut q = Queue::open(&path).unwrap();
-        let has_sr = |_pkg: &str| -> Result<bool, HttpError> {
-            Err(HttpError::AuthRejected("http status: 401".to_string()))
+        let has_sr = |_pkg: &str| -> Result<bool, GeectlError> {
+            Err(GeectlError::new(ErrorKind::AuthFailed, "http status: 401"))
         };
         let err = q
             .add(
@@ -1483,7 +1486,7 @@ mod tests {
                 &live(),
             )
             .unwrap_err();
-        assert!(err.is_auth_rejected());
+        assert_eq!(err.kind(), ErrorKind::AuthFailed);
         assert!(q.entries().is_empty());
         let _ = fs::remove_file(&path);
     }
@@ -1973,7 +1976,7 @@ mod tests {
             called.set(true);
             Some("1.9".to_string())
         };
-        let has_open_sr = |_pkg: &str| -> Result<bool, HttpError> {
+        let has_open_sr = |_pkg: &str| -> Result<bool, GeectlError> {
             called.set(true);
             Ok(false)
         };

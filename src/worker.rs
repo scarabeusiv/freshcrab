@@ -13,9 +13,9 @@
 //!    the update, including the one `.changes` entry and the SR
 //!    description — and enforces the changelog rules (a security entry
 //!    must name its CVE; see `docs/leap-and-cve.md`),
-//! 5. builds the [`SrPayload`](crate::sr::SrPayload) for the submission,
+//! 5. builds the [`SrPayload`](geectl::obs::SrPayload) for the submission,
 //! 6. executes the update steps through the [`UpdateExecutor`], and
-//! 7. files the SR through [`SrFiling`](crate::sr::SrFiling).
+//! 7. files the SR through [`SrFiling`](geectl::obs::SrFiling).
 //!
 //! The update steps themselves (branch, bump, spec-cleaner, OBS build,
 //! rpmcrab, adversarial audit) are performed by the executor. This
@@ -35,12 +35,12 @@
 
 use crate::cve::{changelog_names_cve, CveId};
 use crate::dry_run::DryRun;
-use crate::http::HttpError;
-use crate::obs::{ObsClient, ObsCredentials};
 use crate::queue::{QueueEntry, UpdateKind};
-use crate::sr::{SrError, SrFiling, SrPayload};
 use crate::target::Target;
 use crate::version::is_newer;
+use geectl::auth::Credentials;
+use geectl::error::{ErrorKind, GeectlError};
+use geectl::obs::{ObsClient, SrFiling, SrPayload};
 use std::fmt;
 
 /// The packager identity used for `.changes` entries (see
@@ -63,7 +63,9 @@ pub struct UpdatePlan {
     /// The OBS home project the branch lives in. None when it could not
     /// be resolved (no `home_project` in config, no OBS credentials):
     /// the plan is still built and logged, but no SR payload can be
-    /// built from it (see `SrPayload::from_plan`).
+    /// built from it — an unresolved branch project is an error, not a
+    /// placeholder (see `payload_from_plan`): a payload with a made-up
+    /// source project would file to the wrong place.
     pub branch_project: Option<String>,
     pub kind: UpdateKind,
     pub target: Target,
@@ -71,6 +73,10 @@ pub struct UpdatePlan {
     pub changes_entry: String,
     /// The SR description text.
     pub description: String,
+    /// The CVEs this submission claims to fix (empty for routine
+    /// bumps). Carried so the SR payload can enforce the
+    /// changelog-CVE rule at build time (see `payload_from_plan`).
+    pub cves: Vec<CveId>,
     /// The `%check` CVE regression-test requirement, for security
     /// entries: add a test that fails on the unpatched code and passes
     /// with the fix, or document why none is feasible. None for routine
@@ -148,11 +154,11 @@ impl UpdateExecutor for DryRunExecutor {
     }
 }
 
-/// Map an OBS-call failure to the outcome: an auth rejection is a
+/// Map an OBS-call failure to the outcome: an auth failure is a
 /// run-level failure ([`WorkerOutcome::AuthRejected`]), anything else
 /// escalates the package.
-fn obs_failure(e: &HttpError, reason: String) -> WorkerOutcome {
-    if e.is_auth_rejected() {
+fn obs_failure(e: &GeectlError, reason: String) -> WorkerOutcome {
+    if e.kind() == ErrorKind::AuthFailed {
         WorkerOutcome::AuthRejected { reason }
     } else {
         WorkerOutcome::Escalated { reason }
@@ -208,7 +214,7 @@ impl std::error::Error for WorkerError {}
 pub struct Worker<'a> {
     obs: &'a ObsClient<'a>,
     executor: &'a dyn UpdateExecutor,
-    credentials: Option<&'a ObsCredentials>,
+    credentials: Option<&'a Credentials>,
     /// The OBS home project from config (empty = unset; see
     /// `resolve_branch_project`).
     home_project: String,
@@ -219,7 +225,7 @@ impl<'a> Worker<'a> {
     pub fn new(
         obs: &'a ObsClient<'a>,
         executor: &'a dyn UpdateExecutor,
-        credentials: Option<&'a ObsCredentials>,
+        credentials: Option<&'a Credentials>,
         home_project: &str,
         dry_run: &'a DryRun,
     ) -> Self {
@@ -296,12 +302,12 @@ impl<'a> Worker<'a> {
         // a planned outcome with a clear note (the plan is still
         // logged); in live mode it is an escalation (nothing may be
         // filed without a source project).
-        let payload = match SrPayload::from_plan(&plan) {
+        let payload = match payload_from_plan(&plan) {
             Ok(payload) => Some(payload),
             Err(e) => {
                 if self.dry_run.live() {
                     return WorkerOutcome::Escalated {
-                        reason: e.message().to_string(),
+                        reason: e.to_string(),
                     };
                 }
                 self.dry_run
@@ -331,19 +337,37 @@ impl<'a> Worker<'a> {
                         reason: "cannot file: no SR payload was built".to_string(),
                     };
                 };
-                let filing = SrFiling::new(self.obs, self.dry_run);
-                match filing.file(&payload) {
+                // The filing runs through geectl's own DryRun (built
+                // from the worker's mode). Its dry-run lines are merged
+                // back into freshcrab's plan below, so `DryRun::plan()`
+                // consumers see the filing detail alongside the
+                // executor/queue notes (in live mode the geectl plan
+                // is empty: the merge is a no-op).
+                let geectl_dry = geectl::obs::DryRun::new(self.dry_run.enabled());
+                let filing = SrFiling::new(self.obs, &geectl_dry);
+                let result = filing.file(&payload);
+                self.dry_run.merge_plan(&geectl_dry.plan());
+                match result {
                     Ok(Some(sr_id)) => WorkerOutcome::Filed { sr_id, plan },
                     Ok(None) => WorkerOutcome::Planned {
                         plan,
                         payload: Some(payload),
                     },
-                    Err(SrError::AuthRejected(reason)) => WorkerOutcome::AuthRejected {
-                        reason: format!("SR filing failed: {reason}"),
-                    },
-                    Err(SrError::Other(reason)) => WorkerOutcome::Escalated {
-                        reason: format!("SR filing failed: {reason}"),
-                    },
+                    Err(e) => {
+                        // Preserve the variant: an auth failure at
+                        // filing time must stay distinguishable so the
+                        // dispatcher fails the run loudly instead of
+                        // escalating the package.
+                        if e.kind() == ErrorKind::AuthFailed {
+                            WorkerOutcome::AuthRejected {
+                                reason: format!("SR filing failed: {e}"),
+                            }
+                        } else {
+                            WorkerOutcome::Escalated {
+                                reason: format!("SR filing failed: {e}"),
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -356,8 +380,10 @@ impl<'a> Worker<'a> {
         if !self.home_project.trim().is_empty() {
             return Some(self.home_project.trim().to_string());
         }
-        self.credentials
-            .map(|creds| format!("home:{}", creds.username))
+        match self.credentials {
+            Some(Credentials::Basic { username, .. }) => Some(format!("home:{username}")),
+            _ => None,
+        }
     }
 
     /// Build the update plan for `entry`. Enforces the changelog rules:
@@ -431,9 +457,42 @@ impl<'a> Worker<'a> {
             target: entry.target.clone(),
             changes_entry,
             description,
+            cves,
             cve_regression_test,
         })
     }
+}
+
+/// Build a geectl SR payload from an update plan. The branch project
+/// must be resolved (see `UpdatePlan::branch_project`); an unresolved
+/// branch project is an error, not a placeholder — a payload with a
+/// made-up source project would file to the wrong place. The CVEs are
+/// converted to geectl's `CveId` (already validated by `build_plan`,
+/// so the conversion cannot fail in practice) and the payload
+/// enforces the changelog-CVE rule and the never-Factory target rule
+/// itself.
+fn payload_from_plan(plan: &UpdatePlan) -> Result<SrPayload, GeectlError> {
+    let source_project = plan.branch_project.clone().ok_or_else(|| {
+        GeectlError::new(
+            ErrorKind::InvalidInput,
+            "cannot build an SR payload: the branch project is unresolved \
+             (set home_project in config.yaml or OSC_USERNAME/OSC_PASSWORD)",
+        )
+    })?;
+    let cves: Vec<geectl::obs::CveId> = plan
+        .cves
+        .iter()
+        .map(|c| geectl::obs::CveId::parse(c.as_str()))
+        .collect::<Result<Vec<_>, _>>()?;
+    SrPayload::new(
+        &source_project,
+        &plan.package,
+        &plan.devel_project,
+        &plan.package,
+        &plan.description,
+        &plan.changes_entry,
+        &cves,
+    )
 }
 
 /// Build the one `.changes` entry for a submission. The entry is dated
@@ -525,7 +584,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use crate::http::FakeHttpClient;
-    use crate::obs::{search_url, ObsClient};
+    use geectl::auth::Credentials;
+    use geectl::obs::ObsClient;
 
     fn entry(package: &str) -> QueueEntry {
         QueueEntry::new(
@@ -538,9 +598,42 @@ mod tests {
         )
     }
 
+    /// The OBS search URL for `package`, from a throwaway geectl
+    /// client (the URL is a pure function of the package, so no canned
+    /// response is needed to build it).
+    fn search_url_for(package: &str) -> String {
+        let probe = FakeHttpClient::new();
+        let obs = ObsClient::new(&probe);
+        obs.search_url(package).unwrap()
+    }
+
+    /// An OBS client with credentials, for tests that need the
+    /// authenticated endpoints (the open-SR search, filing).
+    fn obs_with_creds(http: &FakeHttpClient) -> ObsClient<'_> {
+        ObsClient::with_credentials(
+            http,
+            Credentials::Basic {
+                username: "scarabeus_iv".to_string(),
+                password: "secret".to_string(),
+            },
+        )
+        .unwrap()
+    }
+
     /// A canned OBS backend for one package: a devel project, a devel
     /// spec at the given version, and an open-SR search result.
     fn http_for_foo(devel_version: &str, open_sr_matches: u32) -> FakeHttpClient {
+        let search_body = if open_sr_matches == 0 {
+            "<collection matches=\"0\"></collection>".to_string()
+        } else {
+            // A full request element with a submit action: geectl's
+            // open-SR check counts only requests that carry one, so a
+            // bare self-closing `<request id="..."/>` would read as
+            // empty and the skip would silently stop happening.
+            format!(
+                "<collection matches=\"{open_sr_matches}\"><request id=\"1398492\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\"/><target project=\"devel:languages:python\" package=\"foo\"/></action></request></collection>"
+            )
+        };
         FakeHttpClient::new()
             .with(
                 "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
@@ -550,10 +643,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
                 &format!("Name: foo\nVersion: {devel_version}\n"),
             )
-            .with(
-                &search_url("foo").unwrap(),
-                &format!("<collection matches=\"{open_sr_matches}\"></collection>"),
-            )
+            .with(&search_url_for("foo"), &search_body)
     }
 
     #[test]
@@ -646,7 +736,7 @@ mod tests {
         let http = FakeHttpClient::new();
         let obs = ObsClient::new(&http);
         let executor = DryRunExecutor;
-        let creds = ObsCredentials {
+        let creds = Credentials::Basic {
             username: "someone".to_string(),
             password: "secret".to_string(),
         };
@@ -681,7 +771,7 @@ mod tests {
     fn run_skips_when_open_sr_exists() {
         let dry = DryRun::new(true);
         let http = http_for_foo("1.9", 1);
-        let obs = ObsClient::new(&http);
+        let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
@@ -705,14 +795,8 @@ mod tests {
                 "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
                 "Name: foo\nVersion: 1.9\n",
             )
-            .with_status(&search_url("foo").unwrap(), 401, "unauthorized");
-        let obs = ObsClient::with_credentials(
-            &http,
-            ObsCredentials {
-                username: "scarabeus_iv".to_string(),
-                password: "secret".to_string(),
-            },
-        );
+            .with_status(&search_url_for("foo"), 401, "unauthorized");
+        let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
@@ -736,7 +820,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
                 "Name: foo\nVersion: 1.9\n",
             );
-        let obs = ObsClient::new(&http);
+        let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
@@ -761,13 +845,7 @@ mod tests {
             401,
             "unauthorized",
         );
-        let obs = ObsClient::with_credentials(
-            &http,
-            ObsCredentials {
-                username: "scarabeus_iv".to_string(),
-                password: "secret".to_string(),
-            },
-        );
+        let obs = obs_with_creds(&http);
         let executor = CompletedExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
@@ -798,15 +876,15 @@ mod tests {
     fn run_dry_run_plans_with_payload() {
         let dry = DryRun::new(true);
         let http = http_for_foo("1.9", 0);
-        let obs = ObsClient::new(&http);
+        let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&entry("foo")) {
             WorkerOutcome::Planned { plan, payload } => {
                 assert_eq!(plan.package, "foo");
                 let payload = payload.expect("payload built in dry-run");
-                assert_eq!(payload.target_project, "devel:languages:python");
-                assert_eq!(payload.source_project, "home:scarabeus_iv");
+                assert_eq!(payload.target_project(), "devel:languages:python");
+                assert_eq!(payload.source_project(), "home:scarabeus_iv");
                 assert!(payload.validate_xml().is_ok());
                 // The dry-run plan records the would-do steps.
                 assert!(dry
@@ -819,10 +897,46 @@ mod tests {
     }
 
     #[test]
+    fn run_dry_run_with_completed_executor_merges_filing_plan() {
+        struct CompletedExecutor;
+        impl UpdateExecutor for CompletedExecutor {
+            fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
+                Ok(Execution::Completed)
+            }
+        }
+        let dry = DryRun::new(true);
+        let http = http_for_foo("1.9", 0);
+        let obs = obs_with_creds(&http);
+        let executor = CompletedExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        match worker.run(&entry("foo")) {
+            WorkerOutcome::Planned { plan, .. } => {
+                assert_eq!(plan.package, "foo");
+            }
+            other => panic!("expected Planned, got {other:?}"),
+        }
+        // The filing's dry-run lines live in freshcrab's plan, not
+        // only in geectl's: the would-file line and the payload detail.
+        let plan = dry.plan();
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("would: file submit request for foo")),
+            "filing line missing from plan: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("source: home:scarabeus_iv/foo")),
+            "filing detail missing from plan: {plan:?}"
+        );
+        // And nothing was posted (dry-run files nothing).
+        assert!(http.posted().is_empty());
+    }
+
+    #[test]
     fn run_live_without_live_executor_escalates() {
         let dry = DryRun::new(false);
         let http = http_for_foo("1.9", 0);
-        let obs = ObsClient::new(&http);
+        let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
@@ -846,13 +960,7 @@ mod tests {
             "https://api.opensuse.org/request?cmd=create",
             "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
         );
-        let obs = ObsClient::with_credentials(
-            &http,
-            ObsCredentials {
-                username: "scarabeus_iv".to_string(),
-                password: "secret".to_string(),
-            },
-        );
+        let obs = obs_with_creds(&http);
         let executor = CompletedExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&entry("foo")) {
@@ -870,6 +978,14 @@ mod tests {
         assert_eq!(posted[0].0, "https://api.opensuse.org/request?cmd=create");
         assert!(posted[0].1.contains("<action type=\"submit\">"));
         assert!(posted[0].1.contains("devel:languages:python"));
+        // The filed SR carries the cleanup default: the source branch
+        // dies on accept.
+        assert!(posted[0]
+            .1
+            .contains("<options><sourceupdate>cleanup</sourceupdate></options>"));
+        // Filing runs its own dedup check in live mode: the open-SR
+        // search was fetched with credentials too.
+        assert!(http.authed_gets().contains(&search_url_for("foo")));
     }
 
     #[test]
@@ -907,7 +1023,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
                 "Name: foo\nVersion: 1.9\n",
             );
-        let obs = ObsClient::new(&http);
+        let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&entry("foo")) {
@@ -916,5 +1032,49 @@ mod tests {
             }
             other => panic!("expected Escalated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_live_without_credentials_escalates_at_open_sr_check() {
+        // No credentials: the worker's own open-SR re-check refuses
+        // before any request (geectl requires credentials up front),
+        // so the run escalates fail-closed there and never reaches
+        // filing — nothing is posted. The filing-level no-creds
+        // fail-closed is covered by tests/test_sr.rs.
+        struct CompletedExecutor;
+        impl UpdateExecutor for CompletedExecutor {
+            fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
+                Ok(Execution::Completed)
+            }
+        }
+        let dry = DryRun::new(false);
+        let http = http_for_foo("1.9", 0);
+        let obs = ObsClient::new(&http);
+        let executor = CompletedExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        match worker.run(&entry("foo")) {
+            WorkerOutcome::Escalated { reason } => {
+                assert!(reason.contains("open-SR check failed"), "{reason}");
+            }
+            other => panic!("expected Escalated, got {other:?}"),
+        }
+        assert!(http.posted().is_empty());
+    }
+
+    #[test]
+    fn payload_from_plan_without_branch_project_errors() {
+        let dry = DryRun::new(true);
+        let http = FakeHttpClient::new();
+        let obs = ObsClient::new(&http);
+        let executor = DryRunExecutor;
+        let worker = Worker::new(&obs, &executor, None, "", &dry);
+        let plan = worker
+            .build_plan(&entry("foo"), "devel:languages:python", None)
+            .unwrap();
+        let err = payload_from_plan(&plan).unwrap_err();
+        assert!(
+            format!("{err}").contains("branch project is unresolved"),
+            "{err}"
+        );
     }
 }

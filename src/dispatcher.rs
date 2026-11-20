@@ -259,10 +259,11 @@ mod tests {
     use super::*;
     use crate::dry_run::DryRun;
     use crate::http::FakeHttpClient;
-    use crate::obs::{search_url, ObsClient, ObsCredentials};
     use crate::queue::{DedupChecks, QueueEntry, UpdateKind};
     use crate::target::Target;
     use crate::worker::{DryRunExecutor, Execution, UpdateExecutor, UpdatePlan};
+    use geectl::auth::Credentials;
+    use geectl::obs::ObsClient;
     use std::env;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -286,9 +287,42 @@ mod tests {
         QueueEntry::new(package, "1.9", "2.0", "repology", &Target::Factory, kind)
     }
 
+    /// The OBS search URL for `package`, from a throwaway geectl
+    /// client (the URL is a pure function of the package, so no canned
+    /// response is needed to build it).
+    fn search_url_for(package: &str) -> String {
+        let probe = FakeHttpClient::new();
+        let obs = ObsClient::new(&probe);
+        obs.search_url(package).unwrap()
+    }
+
+    /// An OBS client with credentials, for tests that need the
+    /// authenticated endpoints (the open-SR search, filing).
+    fn obs_with_creds(http: &FakeHttpClient) -> ObsClient<'_> {
+        ObsClient::with_credentials(
+            http,
+            Credentials::Basic {
+                username: "scarabeus_iv".to_string(),
+                password: "secret".to_string(),
+            },
+        )
+        .unwrap()
+    }
+
     /// A canned OBS backend for `package`: a devel project, a devel
     /// spec at the given version, and an open-SR search result.
     fn http_for(package: &str, devel_version: &str, open_sr_matches: u32) -> FakeHttpClient {
+        let search_body = if open_sr_matches == 0 {
+            "<collection matches=\"0\"></collection>".to_string()
+        } else {
+            // A full request element with a submit action: geectl's
+            // open-SR check counts only requests that carry one, so a
+            // bare self-closing `<request id="..."/>` would read as
+            // empty and the skip would silently stop happening.
+            format!(
+                "<collection matches=\"{open_sr_matches}\"><request id=\"1398492\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"{package}\"/><target project=\"devel:languages:python\" package=\"{package}\"/></action></request></collection>"
+            )
+        };
         FakeHttpClient::new()
             .with(
                 &format!("https://api.opensuse.org/public/source/openSUSE:Factory/{package}"),
@@ -302,10 +336,7 @@ mod tests {
                 ),
                 &format!("Name: {package}\nVersion: {devel_version}\n"),
             )
-            .with(
-                &search_url(package).unwrap(),
-                &format!("<collection matches=\"{open_sr_matches}\"></collection>"),
-            )
+            .with(&search_url_for(package), &search_body)
     }
 
     /// An executor that reports the update as completed (for live-mode
@@ -342,7 +373,7 @@ mod tests {
 
         let mut queue = Queue::open(&path).unwrap();
         let http = http_for("foo", "1.9", 0);
-        let obs = ObsClient::new(&http);
+        let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
         let cfg = config(4, 20);
@@ -393,10 +424,10 @@ mod tests {
                 "Name: sec-pkg\nVersion: 1.9\n",
             )
             .with(
-                &search_url("sec-pkg").unwrap(),
+                &search_url_for("sec-pkg"),
                 "<collection matches=\"0\"></collection>",
             );
-        let obs = ObsClient::new(&http);
+        let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
         let cfg = config(4, 20);
@@ -442,11 +473,11 @@ mod tests {
                     &format!("Name: {pkg}\nVersion: 1.9\n"),
                 )
                 .with(
-                    &search_url(pkg).unwrap(),
+                    &search_url_for(pkg),
                     "<collection matches=\"0\"></collection>",
                 );
         }
-        let obs = ObsClient::new(&http);
+        let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
         let cfg = config(2, 20);
@@ -492,20 +523,14 @@ mod tests {
                 "Name: bar\nVersion: 1.9\n",
             )
             .with(
-                &search_url("bar").unwrap(),
+                &search_url_for("bar"),
                 "<collection matches=\"0\"></collection>",
             )
             .with_post(
                 "https://api.opensuse.org/request?cmd=create",
                 "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
             );
-        let obs = ObsClient::with_credentials(
-            &http,
-            ObsCredentials {
-                username: "scarabeus_iv".to_string(),
-                password: "secret".to_string(),
-            },
-        );
+        let obs = obs_with_creds(&http);
         let executor = CompletedExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
         // Daily cap 1: only the first entry files; the second is skipped
@@ -595,7 +620,7 @@ mod tests {
         // run fails loudly instead of escalating foo and moving on to
         // bar. Both entries stay pending for the next run.
         let http = http_for("foo", "1.9", 0)
-            .with_status(&search_url("foo").unwrap(), 401, "unauthorized")
+            .with_status(&search_url_for("foo"), 401, "unauthorized")
             .with(
                 "https://api.opensuse.org/public/source/openSUSE:Factory/bar",
                 "<directory name=\"bar\"><devel project=\"devel:languages:python\" package=\"bar\"/></directory>",
@@ -605,16 +630,10 @@ mod tests {
                 "Name: bar\nVersion: 1.9\n",
             )
             .with(
-                &search_url("bar").unwrap(),
+                &search_url_for("bar"),
                 "<collection matches=\"0\"></collection>",
             );
-        let obs = ObsClient::with_credentials(
-            &http,
-            ObsCredentials {
-                username: "scarabeus_iv".to_string(),
-                password: "secret".to_string(),
-            },
-        );
+        let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
@@ -649,15 +668,8 @@ mod tests {
         drop(queue);
 
         let mut queue = Queue::open(&path).unwrap();
-        let http =
-            http_for("foo", "1.9", 0).with_status(&search_url("foo").unwrap(), 403, "forbidden");
-        let obs = ObsClient::with_credentials(
-            &http,
-            ObsCredentials {
-                username: "scarabeus_iv".to_string(),
-                password: "secret".to_string(),
-            },
-        );
+        let http = http_for("foo", "1.9", 0).with_status(&search_url_for("foo"), 403, "forbidden");
+        let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
@@ -692,13 +704,7 @@ mod tests {
             "https://api.opensuse.org/request?cmd=create",
             "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
         );
-        let obs = ObsClient::with_credentials(
-            &http,
-            ObsCredentials {
-                username: "scarabeus_iv".to_string(),
-                password: "secret".to_string(),
-            },
-        );
+        let obs = obs_with_creds(&http);
         let executor = CompletedExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
@@ -835,7 +841,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
                 "Name: foo\nVersion: 1.9\n",
             );
-        let obs = ObsClient::new(&http);
+        let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
@@ -950,13 +956,7 @@ mod tests {
         // marked done and carries no SR id.
         let mut queue = Queue::open(&path).unwrap();
         let http = http_for("foo", "1.9", 0);
-        let obs = ObsClient::with_credentials(
-            &http,
-            ObsCredentials {
-                username: "scarabeus_iv".to_string(),
-                password: "secret".to_string(),
-            },
-        );
+        let obs = obs_with_creds(&http);
         let executor = CompletedExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
