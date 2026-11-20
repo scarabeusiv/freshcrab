@@ -21,9 +21,9 @@ use freshcrab::config::load_config;
 use freshcrab::dispatcher::Dispatcher;
 use freshcrab::dry_run::resolve as resolve_dry_run;
 use freshcrab::factory::FactoryClient;
-use freshcrab::http::UreqClient;
+use freshcrab::http::{HttpError, UreqClient};
 use freshcrab::obs::{ObsClient, ObsCredentials};
-use freshcrab::queue::{DedupChecks, Queue, QueueEntry, QueueError};
+use freshcrab::queue::{DedupChecks, Queue, QueueEntry};
 use freshcrab::watcher::Watcher;
 use freshcrab::worker::{DryRunExecutor, Worker};
 use std::process::ExitCode;
@@ -200,7 +200,9 @@ fn main() -> ExitCode {
     // evaluates the dedup rules and prints the decision for each candidate
     // (would-enqueue / would-skip + reason) and persists nothing; in live
     // mode it enqueues and the state file is written (via the dry-run
-    // guard in `Queue::save`).
+    // guard in `Queue::save`) — unless the loop below fails loudly on
+    // an auth rejection, which returns before `save`; the next run
+    // re-derives the entries that were dropped.
     let mut queue = match Queue::open(&queue_path) {
         Ok(queue) => queue,
         Err(e) => {
@@ -229,17 +231,17 @@ fn main() -> ExitCode {
                 None
             }
         };
-        // The open-SR check is fail-closed: on error it returns Err and
+        // The open-SR check is fail-closed for a non-auth failure:
         // `Queue::add` skips the package instead of queueing it on an
         // unchecked dedup. The search API 401s without OBS credentials,
         // so without them an error here is the normal no-credentials
         // case, and skipping is the safe answer until credentials are
-        // provided.
-        let has_open_sr = |pkg: &str| -> Result<bool, QueueError> {
-            obs.has_open_sr(pkg)
-                .map_err(|e| QueueError(format!("open-SR check failed for {pkg}: {e}")))
-        };
-        queue.add(
+        // provided. An auth rejection (rotated or expired credentials)
+        // is different: it would strike every candidate, so
+        // `Queue::add` returns it as an error and the run fails loudly
+        // below instead of exiting 0 with an empty batch.
+        let has_open_sr = |pkg: &str| -> Result<bool, HttpError> { obs.has_open_sr(pkg) };
+        if let Err(e) = queue.add(
             QueueEntry::new(
                 package,
                 &entry.factory_version,
@@ -253,7 +255,14 @@ fn main() -> ExitCode {
                 has_open_sr: Some(&has_open_sr),
             },
             &dry_run,
-        );
+        ) {
+            // `Queue::add` only propagates auth rejections (every other
+            // check failure is a fail-closed skip inside `add`).
+            eprintln!(
+                "OBS authentication rejected ({e}); stopping — check OSC_USERNAME/OSC_PASSWORD"
+            );
+            return ExitCode::from(1);
+        }
     }
     if let Err(e) = queue.save(&dry_run) {
         eprintln!("{e}");

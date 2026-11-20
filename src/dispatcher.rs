@@ -114,7 +114,10 @@ impl<'a> Dispatcher<'a> {
     /// the filed SR id lives only in the queue file, so losing it would
     /// leave the entry pending — the next run would file again (the
     /// open-SR dedup re-check is the backstop, but a silent success here
-    /// would hide the loss).
+    /// would hide the loss). An OBS auth rejection (401/403) also fails
+    /// the run loudly: the batch stops at once and the error propagates
+    /// instead of a report, so bad or rotated credentials yield one
+    /// loud signal rather than one escalation per package.
     pub fn dispatch(&self, queue: &mut Queue) -> Result<DispatchReport, QueueError> {
         // Crash recovery (see the module docs): entries stranded in
         // `in_progress` by a crashed earlier run go back to `pending`
@@ -207,6 +210,23 @@ impl<'a> Dispatcher<'a> {
                         reason,
                         sr_id: None,
                     });
+                }
+                WorkerOutcome::AuthRejected { reason } => {
+                    // Auth rejection is a run-level failure (bad or
+                    // rotated OBS credentials), not a per-package
+                    // problem: stop the batch and fail the run loudly
+                    // instead of escalating package by package. The
+                    // entry stays pending — the next run retries it
+                    // once the credentials are fixed. The queue is not
+                    // saved again here: filings already made are safe
+                    // (each was saved immediately, `mark_filed` + `save`
+                    // per filing), but this entry's still-pending state
+                    // and any earlier in-memory mutations (escalations,
+                    // skips, the stale-reset) are unsaved — all are
+                    // re-derived on the next run, so nothing is lost.
+                    return Err(QueueError(format!(
+                        "OBS authentication rejected ({reason}); stopping dispatch — check OSC_USERNAME/OSC_PASSWORD"
+                    )));
                 }
                 WorkerOutcome::Filed { sr_id, .. } => {
                     // Record the filed SR on the entry (status done)
@@ -544,6 +564,107 @@ mod tests {
         assert_eq!(report.cap_remaining, 20);
         assert_eq!(queue.find("foo").unwrap().status, "done");
         assert!(http.posted().is_empty());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn dispatch_fails_loudly_on_auth_rejection() {
+        let path = tmp_path();
+        let mut queue = Queue::open(&path).unwrap();
+        let live = DryRun::new(false);
+        queue
+            .add(
+                entry("foo", UpdateKind::Routine),
+                DedupChecks::none(),
+                &live,
+            )
+            .unwrap();
+        queue
+            .add(
+                entry("bar", UpdateKind::Routine),
+                DedupChecks::none(),
+                &live,
+            )
+            .unwrap();
+        queue.save(&live).unwrap();
+        drop(queue);
+
+        let mut queue = Queue::open(&path).unwrap();
+        // The open-SR search 401s for foo (rotated credentials): the
+        // run fails loudly instead of escalating foo and moving on to
+        // bar. Both entries stay pending for the next run.
+        let http = http_for("foo", "1.9", 0)
+            .with_status(&search_url("foo").unwrap(), 401, "unauthorized")
+            .with(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/bar",
+                "<directory name=\"bar\"><devel project=\"devel:languages:python\" package=\"bar\"/></directory>",
+            )
+            .with(
+                "https://api.opensuse.org/public/source/devel:languages:python/bar/bar.spec",
+                "Name: bar\nVersion: 1.9\n",
+            )
+            .with(
+                &search_url("bar").unwrap(),
+                "<collection matches=\"0\"></collection>",
+            );
+        let obs = ObsClient::with_credentials(
+            &http,
+            ObsCredentials {
+                username: "scarabeus_iv".to_string(),
+                password: "secret".to_string(),
+            },
+        );
+        let executor = DryRunExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let cfg = config(4, 20);
+        let dispatcher = Dispatcher::new(&worker, &cfg, &live);
+        let err = dispatcher.dispatch(&mut queue).unwrap_err();
+        assert!(format!("{err}").contains("authentication rejected"));
+        assert_eq!(queue.find("foo").unwrap().status, "pending");
+        assert_eq!(queue.find("bar").unwrap().status, "pending");
+        // bar was never reached: the batch stopped at foo.
+        assert!(http.authed_gets().iter().all(|u| !u.contains("bar")));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn dispatch_fails_loudly_on_auth_rejection_403() {
+        // A 403 on the open-SR search is an auth rejection too: the
+        // run fails loudly instead of escalating the package and
+        // moving on. Mirrors the 401 test — 403 is covered only
+        // transitively elsewhere (shared mapping + fake test).
+        let path = tmp_path();
+        let mut queue = Queue::open(&path).unwrap();
+        let live = DryRun::new(false);
+        queue
+            .add(
+                entry("foo", UpdateKind::Routine),
+                DedupChecks::none(),
+                &live,
+            )
+            .unwrap();
+        queue.save(&live).unwrap();
+        drop(queue);
+
+        let mut queue = Queue::open(&path).unwrap();
+        let http =
+            http_for("foo", "1.9", 0).with_status(&search_url("foo").unwrap(), 403, "forbidden");
+        let obs = ObsClient::with_credentials(
+            &http,
+            ObsCredentials {
+                username: "scarabeus_iv".to_string(),
+                password: "secret".to_string(),
+            },
+        );
+        let executor = DryRunExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let cfg = config(4, 20);
+        let dispatcher = Dispatcher::new(&worker, &cfg, &live);
+        let err = dispatcher.dispatch(&mut queue).unwrap_err();
+        assert!(format!("{err}").contains("authentication rejected"));
+        assert_eq!(queue.find("foo").unwrap().status, "pending");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }

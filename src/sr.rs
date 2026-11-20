@@ -29,12 +29,35 @@ use crate::worker::UpdatePlan;
 use std::fmt;
 
 /// Error from SR payload building or filing.
+///
+/// Mirrors [`crate::http::HttpError`]: an auth rejection (the OBS API
+/// 401d the filing POST) is a distinct variant, so the worker can fail
+/// the run loudly on bad or rotated credentials instead of escalating
+/// the package like any other filing failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SrError(pub String);
+pub enum SrError {
+    /// The OBS API rejected the credentials when filing.
+    AuthRejected(String),
+    /// Any other payload or filing failure.
+    Other(String),
+}
+
+impl SrError {
+    /// The message without the `sr error: ` Display prefix (the
+    /// escalation reason text the worker reports).
+    pub fn message(&self) -> &str {
+        match self {
+            SrError::AuthRejected(msg) | SrError::Other(msg) => msg,
+        }
+    }
+}
 
 impl fmt::Display for SrError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "sr error: {}", self.0)
+        match self {
+            SrError::AuthRejected(msg) => write!(f, "sr error (auth rejected): {msg}"),
+            SrError::Other(msg) => write!(f, "sr error: {msg}"),
+        }
     }
 }
 
@@ -83,7 +106,7 @@ impl SrPayload {
             ("target project", target_project),
         ] {
             if !valid_obs_name(value) {
-                return Err(SrError(format!(
+                return Err(SrError::Other(format!(
                     "invalid OBS project name for {label}: {value:?}"
                 )));
             }
@@ -93,16 +116,20 @@ impl SrPayload {
             ("target package", target_package),
         ] {
             if !valid_obs_name(value) {
-                return Err(SrError(format!(
+                return Err(SrError::Other(format!(
                     "invalid OBS package name for {label}: {value:?}"
                 )));
             }
         }
         if description.trim().is_empty() {
-            return Err(SrError("SR description must not be empty".to_string()));
+            return Err(SrError::Other(
+                "SR description must not be empty".to_string(),
+            ));
         }
         if changes_entry.trim().is_empty() {
-            return Err(SrError("SR .changes entry must not be empty".to_string()));
+            return Err(SrError::Other(
+                "SR .changes entry must not be empty".to_string(),
+            ));
         }
         let payload = SrPayload {
             source_project: source_project.to_string(),
@@ -124,7 +151,7 @@ impl SrPayload {
     /// source project would file to the wrong place.
     pub fn from_plan(plan: &UpdatePlan) -> Result<Self, SrError> {
         let source_project = plan.branch_project.clone().ok_or_else(|| {
-            SrError(
+            SrError::Other(
                 "cannot build an SR payload: the branch project is unresolved \
                  (set home_project in config.yaml or OSC_USERNAME/OSC_PASSWORD)"
                     .to_string(),
@@ -200,7 +227,9 @@ fn check_well_formed(xml: &str) -> Result<(), SrError> {
         // only advances at the end of the iteration, after the tag.
         let start = i + open;
         let Some(close_rel) = xml[start..].find('>') else {
-            return Err(SrError("malformed XML: unterminated tag".to_string()));
+            return Err(SrError::Other(
+                "malformed XML: unterminated tag".to_string(),
+            ));
         };
         let close = start + close_rel;
         let raw = &xml[start + 1..close];
@@ -217,12 +246,12 @@ fn check_well_formed(xml: &str) -> Result<(), SrError> {
             match stack.pop() {
                 Some(open_name) if open_name == name => {}
                 Some(open_name) => {
-                    return Err(SrError(format!(
+                    return Err(SrError::Other(format!(
                         "malformed XML: closing </{name}> does not match open <{open_name}>"
                     )));
                 }
                 None => {
-                    return Err(SrError(format!(
+                    return Err(SrError::Other(format!(
                         "malformed XML: closing </{name}> with nothing open"
                     )));
                 }
@@ -232,7 +261,7 @@ fn check_well_formed(xml: &str) -> Result<(), SrError> {
             // its path for the structure check.
             let name = without_slash.split_whitespace().next().unwrap_or("");
             if name.is_empty() {
-                return Err(SrError("malformed XML: empty tag".to_string()));
+                return Err(SrError::Other("malformed XML: empty tag".to_string()));
             }
             let mut path = stack.join("/");
             if !path.is_empty() {
@@ -244,11 +273,11 @@ fn check_well_formed(xml: &str) -> Result<(), SrError> {
             // Open tag: push it. The tag name is the first word.
             let name = raw.split_whitespace().next().unwrap_or("");
             if name.is_empty() {
-                return Err(SrError("malformed XML: empty tag".to_string()));
+                return Err(SrError::Other("malformed XML: empty tag".to_string()));
             }
             if stack.is_empty() {
                 if root_seen {
-                    return Err(SrError(
+                    return Err(SrError::Other(
                         "malformed XML: more than one root element".to_string(),
                     ));
                 }
@@ -261,39 +290,39 @@ fn check_well_formed(xml: &str) -> Result<(), SrError> {
         i = close + 1;
     }
     if !stack.is_empty() {
-        return Err(SrError(format!(
+        return Err(SrError::Other(format!(
             "malformed XML: unclosed tag(s): {}",
             stack.join(", ")
         )));
     }
     if !root_seen {
-        return Err(SrError("malformed XML: no root element".to_string()));
+        return Err(SrError::Other("malformed XML: no root element".to_string()));
     }
     // Required structure: exactly one root `request`, containing an
     // `action` (which holds `source` and `target`) and a `description`.
     let has = |path: &str| paths.iter().any(|p| p == path);
     if !has("request") {
-        return Err(SrError(
+        return Err(SrError::Other(
             "malformed SR XML: root element is not <request>".to_string(),
         ));
     }
     if !has("request/action") {
-        return Err(SrError(
+        return Err(SrError::Other(
             "malformed SR XML: missing <action> in <request>".to_string(),
         ));
     }
     if !has("request/action/source") {
-        return Err(SrError(
+        return Err(SrError::Other(
             "malformed SR XML: missing <source> in <action>".to_string(),
         ));
     }
     if !has("request/action/target") {
-        return Err(SrError(
+        return Err(SrError::Other(
             "malformed SR XML: missing <target> in <action>".to_string(),
         ));
     }
     if !has("request/description") {
-        return Err(SrError(
+        return Err(SrError::Other(
             "malformed SR XML: missing <description> in <request>".to_string(),
         ));
     }
@@ -344,10 +373,17 @@ impl<'a> SrFiling<'a> {
             return Ok(None);
         }
         let xml = payload.to_xml();
-        let id = self
-            .obs
-            .create_request(&xml)
-            .map_err(|e| SrError(format!("OBS create-request failed: {e}")))?;
+        let id = self.obs.create_request(&xml).map_err(|e| {
+            // Preserve the variant: an auth rejection at filing time
+            // must stay distinguishable so the worker fails the run
+            // loudly instead of escalating the package.
+            let msg = format!("OBS create-request failed: {e}");
+            if e.is_auth_rejected() {
+                SrError::AuthRejected(msg)
+            } else {
+                SrError::Other(msg)
+            }
+        })?;
         Ok(Some(id))
     }
 }
@@ -530,5 +566,31 @@ mod tests {
         let dry = DryRun::new(false);
         let filing = SrFiling::new(&obs, &dry);
         assert!(filing.file(&payload()).is_err());
+    }
+
+    #[test]
+    fn file_returns_auth_rejected_on_401() {
+        // Live mode, credentials present, but the OBS API 401s the
+        // filing POST: the auth rejection stays typed (AuthRejected)
+        // so the worker can fail the run loudly instead of escalating
+        // the package.
+        let http = FakeHttpClient::new().with_post_status(
+            "https://api.opensuse.org/request?cmd=create",
+            401,
+            "unauthorized",
+        );
+        let obs = ObsClient::with_credentials(
+            &http,
+            ObsCredentials {
+                username: "scarabeus_iv".to_string(),
+                password: "secret".to_string(),
+            },
+        );
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert!(matches!(
+            filing.file(&payload()),
+            Err(SrError::AuthRejected(_))
+        ));
     }
 }
