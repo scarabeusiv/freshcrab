@@ -8,8 +8,8 @@
 use crate::collectors::{encode_path, valid_obs_name};
 use crate::http::{HttpClient, HttpError};
 
-// The OBS API base and the Factory project, shared with `obs.rs`
-// (which imports them from here so there is exactly one definition).
+// The OBS API base and the Factory project. The geectl OBS client
+// carries its own copy of the same constants.
 pub const OBS_API: &str = "https://api.opensuse.org";
 pub const FACTORY_PROJECT: &str = "openSUSE:Factory";
 
