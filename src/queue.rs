@@ -15,6 +15,12 @@
 //! (`crate::dry_run::DryRun`): the dedup rules are still evaluated (reads
 //! are not gated) and the decision is printed (would-enqueue / would-skip
 //! + reason), but nothing is added and nothing is persisted.
+//!
+//! An escalated entry is parked with its reason and timestamp (see
+//! `QueueEntry::escalation_reason`): re-adding the same update does not
+//! re-run the dedup checks and does not re-escalate it — the entry stays
+//! escalated until a newer upstream version arrives (a new update) or a
+//! human clears it.
 
 use crate::dry_run::DryRun;
 use crate::target::Target;
@@ -66,6 +72,27 @@ pub struct QueueEntry {
     /// Routine version bump or security (CVE-driven) update.
     #[serde(default)]
     pub kind: UpdateKind,
+    /// The OBS submit-request id filed for this entry, if any. Set by
+    /// the dispatcher when the SR is filed; used to count SRs filed
+    /// today for the daily cap. Old queue files load with None.
+    #[serde(default)]
+    pub sr_id: Option<String>,
+    /// CVE ids this entry fixes (security entries). Empty for routine
+    /// bumps. Stored as strings; the worker parses them with
+    /// `CveId::parse`. Old queue files load with an empty list.
+    #[serde(default)]
+    pub cves: Vec<String>,
+    /// Why this entry was escalated to a human, if it was. Persisted
+    /// with the entry (not only in the run's stdout) so triage does not
+    /// need a captured run log, and so a re-run does not re-escalate the
+    /// same update: an escalated entry stays parked until a newer
+    /// upstream version arrives. Old queue files load with None.
+    #[serde(default)]
+    pub escalation_reason: Option<String>,
+    /// When the entry was escalated (epoch seconds, like `updated_at`).
+    /// Old queue files load with None.
+    #[serde(default)]
+    pub escalated_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -88,9 +115,19 @@ impl QueueEntry {
             status: "pending".to_string(),
             target: target.clone(),
             kind,
+            sr_id: None,
+            cves: Vec::new(),
+            escalation_reason: None,
+            escalated_at: None,
             created_at: now.clone(),
             updated_at: now,
         }
+    }
+
+    /// Attach the CVE ids this entry fixes (security entries).
+    pub fn with_cves(mut self, cves: Vec<String>) -> Self {
+        self.cves = cves;
+        self
     }
 }
 
@@ -412,6 +449,25 @@ impl Queue {
             ));
             return None;
         }
+        // An escalated entry is parked: the same update (same upstream
+        // version) is not re-run, so the dedup API calls are not made
+        // and the entry is not re-escalated on every run. A newer
+        // upstream version is a new update and refreshes the entry
+        // below (clearing the old escalation).
+        if let Some(existing) = self.entries.iter().find(|e| e.package == entry.package) {
+            if existing.status == "escalated" && existing.upstream_version == entry.upstream_version
+            {
+                let reason = existing
+                    .escalation_reason
+                    .clone()
+                    .unwrap_or_else(|| "escalated".to_string());
+                dry_run.note(&format!(
+                    "would-skip {}: still escalated ({reason})",
+                    entry.package
+                ));
+                return None;
+            }
+        }
         if let Some(check) = dedup.devel_version {
             if let Some(current) = check(&entry.package) {
                 if !is_newer(&entry.upstream_version, &current) {
@@ -435,12 +491,11 @@ impl Queue {
                 Ok(false) => {}
                 Err(e) => {
                     // Fail closed: the dedup check could not run (the
-                    // OBS search API 401s without credentials, and no
-                    // credentials are plumbed yet — that is the filing
-                    // phase's work). Queueing anyway would file a
-                    // duplicate submit request, so skip the package
-                    // and say so loudly instead of treating the failed
-                    // check as "no open SR".
+                    // OBS search API 401s without credentials).
+                    // Queueing anyway would file a duplicate submit
+                    // request, so skip the package and say so loudly
+                    // instead of treating the failed check as
+                    // "no open SR".
                     eprintln!(
                         "warning: open-SR check failed for {}: {e}; skipping (fail-closed)",
                         entry.package
@@ -470,6 +525,14 @@ impl Queue {
             existing.source = entry.source;
             existing.target = entry.target;
             existing.kind = entry.kind;
+            // A refresh is a new update, not the old one: the old filed
+            // SR id must not survive (it would count toward the daily
+            // cap and feed a stale changelog), and the CVEs are the new
+            // entry's. The old escalation was for the old version too.
+            existing.sr_id = None;
+            existing.cves = entry.cves.clone();
+            existing.escalation_reason = None;
+            existing.escalated_at = None;
             existing.status = "pending".to_string();
             existing.updated_at = now_iso();
             return Some(existing.clone());
@@ -502,6 +565,119 @@ impl Queue {
     pub fn entries(&self) -> &[QueueEntry] {
         &self.entries
     }
+
+    /// Record that an SR was filed for `package`: set the SR id and
+    /// mark the entry done. In dry-run, logs the would-do and changes
+    /// nothing.
+    pub fn mark_filed(
+        &mut self,
+        package: &str,
+        sr_id: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), QueueError> {
+        if !dry_run.allow(&format!("record filed SR {sr_id} for {package}")) {
+            return Ok(());
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.package == package)
+            .ok_or_else(|| QueueError(format!("no queue entry for package {package:?}")))?;
+        entry.sr_id = Some(sr_id.to_string());
+        entry.status = "done".to_string();
+        entry.updated_at = now_iso();
+        Ok(())
+    }
+
+    /// Escalate the entry for `package` to a human, persisting the
+    /// reason and the time (epoch seconds). Unlike `set_status`, the
+    /// reason is stored on the entry, not only in the run's stdout, so
+    /// triage does not need a captured log — and the entry stays parked
+    /// (see `add`) until a newer upstream version arrives. In dry-run,
+    /// logs the would-do and changes nothing.
+    pub fn escalate(
+        &mut self,
+        package: &str,
+        reason: &str,
+        dry_run: &DryRun,
+    ) -> Result<(), QueueError> {
+        if !dry_run.allow(&format!("escalate {package}: {reason}")) {
+            return Ok(());
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.package == package)
+            .ok_or_else(|| QueueError(format!("no queue entry for package {package:?}")))?;
+        entry.status = "escalated".to_string();
+        entry.escalation_reason = Some(reason.to_string());
+        entry.escalated_at = Some(now_iso());
+        entry.updated_at = now_iso();
+        Ok(())
+    }
+
+    /// Crash recovery: reset entries stranded in `in_progress` back to
+    /// `pending`, so the next dispatch retries them instead of losing
+    /// them (`pending()` only matches `pending`). A crash between the
+    /// old pre-mark and the save used to strand entries forever; the
+    /// dispatcher calls this at the start of every run. Each reset goes
+    /// through the dry-run guard, so in dry-run it only records the
+    /// would-do. Returns how many entries were reset.
+    pub fn reset_stale_in_progress(&mut self, dry_run: &DryRun) -> Result<usize, QueueError> {
+        let stranded: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.status == "in_progress")
+            .map(|e| e.package.clone())
+            .collect();
+        let count = stranded.len();
+        for package in &stranded {
+            self.set_status(package, "pending", dry_run)?;
+        }
+        Ok(count)
+    }
+
+    /// Count entries whose SR was filed on the given UTC day (the day
+    /// number from [`day_of_epoch`]).
+    pub fn srs_filed_on_day(&self, day: u64) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.sr_id.is_some()
+                    && e.updated_at
+                        .parse::<u64>()
+                        // An unparsable updated_at is not counted
+                        // (fail-open for the cap). Only program-written
+                        // epoch seconds ever occur here, and a refreshed
+                        // entry has its sr_id cleared, so a stale id
+                        // cannot be miscounted — that covers the main
+                        // path without risking counting corrupt rows.
+                        .map(|t| day_of_epoch(t) == day)
+                        .unwrap_or(false)
+            })
+            .count()
+    }
+
+    /// Count SRs filed today (current UTC day). The dispatcher uses this
+    /// for the daily SR cap.
+    pub fn srs_filed_today(&self) -> usize {
+        self.srs_filed_on_day(today_day())
+    }
+}
+
+/// The UTC day number for an epoch-seconds timestamp (seconds / 86400).
+/// Days are UTC days; the daily SR cap counts SRs filed on the current
+/// UTC day.
+pub fn day_of_epoch(secs: u64) -> u64 {
+    secs / 86_400
+}
+
+/// The current UTC day number.
+fn today_day() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1422,5 +1598,375 @@ mod tests {
         assert!(orphan_tmps(&path).is_empty());
         drop(q);
         let _ = fs::remove_dir(&path);
+    }
+
+    #[test]
+    fn mark_filed_records_sr_and_counts_today() {
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        assert_eq!(q.srs_filed_today(), 0);
+        q.mark_filed("foo", "1400001", &live()).unwrap();
+        let entry = q.find("foo").unwrap();
+        assert_eq!(entry.status, "done");
+        assert_eq!(entry.sr_id.as_deref(), Some("1400001"));
+        assert_eq!(q.srs_filed_today(), 1);
+        drop(q);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mark_filed_is_dry_run_gated() {
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        q.mark_filed("foo", "1400001", &dry()).unwrap();
+        // Dry-run changed nothing.
+        assert_eq!(q.find("foo").unwrap().status, "pending");
+        assert_eq!(q.find("foo").unwrap().sr_id, None);
+        assert_eq!(q.srs_filed_today(), 0);
+        drop(q);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn srs_filed_on_day_counts_only_that_day() {
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        q.add(
+            QueueEntry::new(
+                "bar",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        // File foo today, and pretend bar was filed yesterday by moving
+        // its updated_at back a day after marking it filed.
+        q.mark_filed("foo", "1400001", &live()).unwrap();
+        q.mark_filed("bar", "1400002", &live()).unwrap();
+        let today = today_day();
+        for e in q.entries.iter_mut() {
+            if e.package == "bar" {
+                let yesterday = e.updated_at.parse::<u64>().unwrap().saturating_sub(86_400);
+                e.updated_at = yesterday.to_string();
+            }
+        }
+        assert_eq!(q.srs_filed_on_day(today), 1);
+        assert_eq!(q.srs_filed_on_day(today - 1), 1);
+        assert_eq!(q.srs_filed_today(), 1);
+        drop(q);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_queue_file_loads_without_sr_id_and_cves() {
+        // A queue file written before sr_id/cves existed (no such keys)
+        // still loads, with None / empty defaults.
+        let path = tmp_path();
+        let text = "[{\"package\": \"foo\", \"factory_version\": \"1.9\", \"upstream_version\": \"2.0\", \"source\": \"repology\", \"status\": \"pending\", \"target\": \"factory\", \"kind\": \"routine\", \"created_at\": \"1\", \"updated_at\": \"1\"}]";
+        fs::write(&path, text).unwrap();
+        let q = Queue::open(&path).unwrap();
+        let entry = q.find("foo").unwrap();
+        assert_eq!(entry.sr_id, None);
+        assert!(entry.cves.is_empty());
+        drop(q);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn day_of_epoch_is_utc_days() {
+        assert_eq!(day_of_epoch(0), 0);
+        assert_eq!(day_of_epoch(86_399), 0);
+        assert_eq!(day_of_epoch(86_400), 1);
+    }
+
+    #[test]
+    fn refresh_clears_sr_id_and_takes_new_cves() {
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        let sec = QueueEntry::new(
+            "foo",
+            "1.9",
+            "2.0",
+            "repology",
+            &Target::Factory,
+            UpdateKind::Security,
+        )
+        .with_cves(vec!["CVE-2026-12345".to_string()]);
+        q.add(sec, DedupChecks::none(), &live()).unwrap();
+        q.mark_filed("foo", "1400001", &live()).unwrap();
+        assert_eq!(q.find("foo").unwrap().sr_id.as_deref(), Some("1400001"));
+        // A newer upstream version refreshes the entry in place: the
+        // old SR id is cleared and the new CVEs replace the old ones.
+        let refreshed = q
+            .add(
+                QueueEntry::new(
+                    "foo",
+                    "2.0",
+                    "2.1",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Security,
+                )
+                .with_cves(vec!["CVE-2026-99999".to_string()]),
+                DedupChecks::none(),
+                &live(),
+            )
+            .unwrap();
+        assert_eq!(refreshed.status, "pending");
+        assert_eq!(refreshed.sr_id, None);
+        assert_eq!(refreshed.cves, vec!["CVE-2026-99999".to_string()]);
+        // The old SR no longer counts toward the daily cap.
+        assert_eq!(q.srs_filed_today(), 0);
+        drop(q);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn escalate_persists_reason_and_timestamp() {
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        q.escalate("foo", "devel version check failed for foo: boom", &live())
+            .unwrap();
+        let entry = q.find("foo").unwrap();
+        assert_eq!(entry.status, "escalated");
+        assert_eq!(
+            entry.escalation_reason.as_deref(),
+            Some("devel version check failed for foo: boom")
+        );
+        assert!(entry.escalated_at.is_some());
+        // It survives a save + reload (triage does not need stdout).
+        q.save(&live()).unwrap();
+        drop(q);
+        let q = Queue::open(&path).unwrap();
+        let entry = q.find("foo").unwrap();
+        assert_eq!(entry.status, "escalated");
+        assert_eq!(
+            entry.escalation_reason.as_deref(),
+            Some("devel version check failed for foo: boom")
+        );
+        assert!(entry.escalated_at.is_some());
+        drop(q);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn escalated_entry_stays_parked_for_same_version() {
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        q.escalate("foo", "no devel project", &live()).unwrap();
+        // A dedup checker that records whether it was called: the
+        // parked entry must not trigger any API call.
+        use std::cell::Cell;
+        let called = Cell::new(false);
+        let devel = |_pkg: &str| {
+            called.set(true);
+            Some("1.9".to_string())
+        };
+        let has_open_sr = |_pkg: &str| -> Result<bool, QueueError> {
+            called.set(true);
+            Ok(false)
+        };
+        assert!(q
+            .add(
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
+                DedupChecks {
+                    devel_version: Some(&devel),
+                    has_open_sr: Some(&has_open_sr),
+                },
+                &live(),
+            )
+            .is_none());
+        assert!(!called.get());
+        let entry = q.find("foo").unwrap();
+        assert_eq!(entry.status, "escalated");
+        assert_eq!(entry.escalation_reason.as_deref(), Some("no devel project"));
+        drop(q);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn escalated_entry_refreshes_for_newer_version() {
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        q.escalate("foo", "no devel project", &live()).unwrap();
+        // A newer upstream version is a new update: the entry refreshes
+        // to pending and the old escalation is cleared.
+        let refreshed = q
+            .add(
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.1",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
+                DedupChecks::none(),
+                &live(),
+            )
+            .unwrap();
+        assert_eq!(refreshed.status, "pending");
+        assert_eq!(refreshed.escalation_reason, None);
+        assert_eq!(refreshed.escalated_at, None);
+        drop(q);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reset_stale_in_progress_recovers_crashed_entries() {
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        // Simulate a crash mid-dispatch: the entry was marked
+        // in_progress and the run never saved its outcome.
+        q.set_status("foo", "in_progress", &live()).unwrap();
+        assert_eq!(q.reset_stale_in_progress(&live()).unwrap(), 1);
+        assert_eq!(q.find("foo").unwrap().status, "pending");
+        // A second reset finds nothing stranded.
+        assert_eq!(q.reset_stale_in_progress(&live()).unwrap(), 0);
+        drop(q);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reset_stale_in_progress_is_dry_run_gated() {
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        q.set_status("foo", "in_progress", &live()).unwrap();
+        // Dry-run records the would-do and changes nothing.
+        assert_eq!(q.reset_stale_in_progress(&dry()).unwrap(), 1);
+        assert_eq!(q.find("foo").unwrap().status, "in_progress");
+        drop(q);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_queue_file_loads_without_escalation_fields() {
+        // A queue file written before escalation_reason/escalated_at
+        // existed still loads, with None defaults.
+        let path = tmp_path();
+        let text = "[{\"package\": \"foo\", \"factory_version\": \"1.9\", \"upstream_version\": \"2.0\", \"source\": \"repology\", \"status\": \"escalated\", \"target\": \"factory\", \"kind\": \"routine\", \"created_at\": \"1\", \"updated_at\": \"1\"}]";
+        fs::write(&path, text).unwrap();
+        let q = Queue::open(&path).unwrap();
+        let entry = q.find("foo").unwrap();
+        assert_eq!(entry.escalation_reason, None);
+        assert_eq!(entry.escalated_at, None);
+        drop(q);
+        let _ = fs::remove_file(&path);
     }
 }
