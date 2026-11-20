@@ -662,14 +662,17 @@ impl Queue {
                 e.sr_id.is_some()
                     && e.updated_at
                         .parse::<u64>()
-                        // An unparsable updated_at is not counted
-                        // (fail-open for the cap). Only program-written
-                        // epoch seconds ever occur here, and a refreshed
-                        // entry has its sr_id cleared, so a stale id
-                        // cannot be miscounted — that covers the main
-                        // path without risking counting corrupt rows.
+                        // An unparsable updated_at counts toward the cap
+                        // (fail-closed for a rate limit). Only
+                        // program-written epoch seconds ever occur here,
+                        // so an unparsable value means a hand-edited or
+                        // corrupt row — and a row carrying an sr_id most
+                        // plausibly is a filing, so assuming it was filed
+                        // on the queried day is the safe direction for a
+                        // limit. A refreshed entry has its sr_id cleared,
+                        // so a stale id cannot be miscounted.
                         .map(|t| day_of_epoch(t) == day)
-                        .unwrap_or(false)
+                        .unwrap_or(true)
             })
             .count()
     }
@@ -1765,6 +1768,74 @@ mod tests {
         }
         assert_eq!(q.srs_filed_on_day(today), 1);
         assert_eq!(q.srs_filed_on_day(today - 1), 1);
+        assert_eq!(q.srs_filed_today(), 1);
+        drop(q);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn srs_filed_on_day_counts_unparsable_updated_at() {
+        // Fail-closed for the cap: an entry carrying an sr_id whose
+        // updated_at is unparsable (hand-edited or corrupt row) still
+        // counts — a row with an sr_id most plausibly is a filing, and
+        // the safe direction for a rate limit is to assume it was
+        // filed today rather than to let a corrupt timestamp bypass
+        // the cap. An entry without an sr_id never counts.
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        q.add(
+            QueueEntry::new(
+                "foo",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        q.add(
+            QueueEntry::new(
+                "bar",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        q.mark_filed("foo", "1400001", &live()).unwrap();
+        for e in q.entries.iter_mut() {
+            if e.package == "foo" {
+                e.updated_at = "not-a-timestamp".to_string();
+            }
+        }
+        // An entry without an sr_id never counts, even when its
+        // updated_at is equally unparsable: the fail-closed direction
+        // applies only to rows that plausibly are filings.
+        q.add(
+            QueueEntry::new(
+                "baz",
+                "1.9",
+                "2.0",
+                "repology",
+                &Target::Factory,
+                UpdateKind::Routine,
+            ),
+            DedupChecks::none(),
+            &live(),
+        )
+        .unwrap();
+        for e in q.entries.iter_mut() {
+            if e.package == "baz" {
+                e.updated_at = "not-a-timestamp".to_string();
+            }
+        }
         assert_eq!(q.srs_filed_today(), 1);
         drop(q);
         let _ = fs::remove_file(&path);
