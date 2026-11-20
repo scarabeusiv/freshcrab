@@ -1,4 +1,5 @@
-<img src="docs/assets/logo.svg" alt="freshcrab logo — a bright green crab molting out of a cracked old shell" width="128" height="128">
+<img src="https://raw.githubusercontent.com/scarabeusiv/freshcrab/main/docs/assets/logo.svg"
+     align="right" width="130" alt="freshcrab logo">
 
 # freshcrab
 
