@@ -45,6 +45,11 @@ concurrency: 4
 daily_sr_cap: 20
 kill_switch: false
 report_only: true
+dry_run: true
+
+# The OBS home project the worker branches into (empty = derive it
+# from the OBS username, home:{OSC_USERNAME}).
+home_project: ""
 ```
 
 Mount your copy over the default:
@@ -59,14 +64,17 @@ syntax).
 
 ## Dry-run
 
-Dry-run is the default in this phase, and it is global: one mode
-governs the watcher, the queue, and (later) the worker. In dry-run
+Dry-run is the default, and it is global: one mode governs the
+watcher, the queue, the dispatcher, and the worker. In dry-run
 nothing is written or filed anywhere — the watcher polls the collectors
 and prints what it WOULD queue (package, Factory version, newest
 upstream version, collector source), the queue evaluates the dedup
 rules and prints the decision for each candidate (would-enqueue /
-would-skip + reason), and the worker prints the full plan and takes no
-action. Every mutating operation goes through the single dry-run guard
+would-skip + reason), and the dispatcher and worker print the full
+plan for each queued entry (the update steps, the SR description, the
+one `.changes` entry, and the exact SR payload — source/target
+project and package, the full request XML) and take no action. Every
+mutating operation goes through the single dry-run guard
 (`src/dry_run.rs`); no component mutates state without consulting it.
 
 The mode resolves as CLI flag > env var > config file:
@@ -97,6 +105,55 @@ podman run --rm -v "$PWD/config.yaml:/app/config.yaml:ro" freshcrab --live --pac
 # or
 FRESHCRAB_DRY_RUN=false podman run --rm -v "$PWD/config.yaml:/app/config.yaml:ro" freshcrab --packages foo bar
 ```
+
+## The dispatcher (report_only: false)
+
+With `report_only: true` (the default) the watcher prints the queue
+and stops. Report-only gates the dispatcher only: the watcher still
+enqueues, and in live mode `queue.json` is written (use `dry_run` to
+prevent all writes). With `report_only: false` the dispatcher runs after the
+watcher: it picks pending queue entries — security (CVE-driven) first,
+then routine, at most `concurrency` per run, stopping when the daily
+SR cap (`daily_sr_cap` SRs filed today) is reached — drives each
+through the worker, and prints the dispatch report as JSON:
+
+```json
+{
+  "dispatched": 2,
+  "filed": 0,
+  "planned": 2,
+  "skipped": 0,
+  "escalated": 0,
+  "cap_remaining": 20,
+  "outcomes": [
+    {
+      "package": "foo",
+      "outcome": "planned",
+      "reason": "dry-run: plan logged, nothing filed",
+      "sr_id": null
+    }
+  ]
+}
+```
+
+In dry-run (the default) every entry is `planned`: the plan and the
+exact SR payload are logged to stderr, nothing is filed, and the queue
+entry stays `pending`. In live mode the worker files the SR
+(`POST /request?cmd=create`) and the entry is marked `done` with the
+request id — but only once the live executor exists. Until then, live
+mode refuses to file (the update steps were not performed) and the
+entry escalates instead. Set `home_project` in `config.yaml` (or
+`OSC_USERNAME` in the environment) so the worker can resolve the
+branch project; without it, live filing escalates and dry-run planning
+notes the gap.
+
+Durability: every run starts by resetting entries stranded in
+`in_progress` by a crashed earlier run back to `pending`, and a filed
+SR is saved to the queue file immediately (not only at the end of the
+batch). An escalated entry is parked with its reason and timestamp in
+`queue.json` — it is not re-dispatched until a newer upstream version
+arrives. The daily SR cap counts SRs filed in the local queue file
+only; filings from another host are not counted.
 
 ## Pause via the kill switch
 
@@ -129,8 +186,11 @@ entries are dispatched before routine ones. The persistent queue
 state file (`queue.json`, written by the queue module) holds the
 same entries plus `created_at` / `updated_at` and the full status
 set: `pending`, `in_progress`, `done`, `blocked`, `escalated`.
-`blocked` and `escalated` entries need a human (see
-`worker/brief.md` for what escalates).
+Filed entries also carry `sr_id` (the OBS request id) and security
+entries carry `cves` (the CVE ids they fix); the dispatcher counts
+`sr_id` entries filed today for the daily SR cap. `blocked` and
+`escalated` entries need a human (see `worker/brief.md` for what
+escalates).
 
 Only one writer runs at a time: the queue takes an exclusive lock on
 `<queue>.lock`, held until the process exits. A second writer (a
@@ -180,7 +240,19 @@ the Factory and devel-project reads use the OBS public API
 OBS search API, which has no public equivalent and returns 401 without
 credentials — without OBS credentials the check fails and the package
 is skipped (fail-closed) instead of being queued on an unchecked
-dedup; credential plumbing is the filing phase's work.
+dedup. Filing a submit request needs credentials too. The credentials
+are read from the `OSC_USERNAME` / `OSC_PASSWORD` environment
+variables (the OBS API accepts HTTP Basic auth with oscrc
+credentials); pass them to the container with `-e`:
+
+```sh
+podman run --rm -e OSC_USERNAME=scarabeus_iv -e OSC_PASSWORD=... \
+  -v "$PWD/config.yaml:/app/config.yaml:ro" freshcrab --packages foo
+```
+
+The values are never logged. Without them the dedup check fails
+closed as above, and any live filing attempt fails loudly instead of
+filing anonymously.
 
 ## Run the tests
 
