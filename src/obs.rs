@@ -27,6 +27,7 @@
 use crate::collectors::{encode_path, encode_query, valid_obs_name};
 use crate::factory::{parse_spec_version, FACTORY_PROJECT, OBS_API};
 use crate::http::{HttpClient, HttpError};
+use crate::sr::FilingPermit;
 
 /// OBS credentials (username + password) for the authenticated API.
 /// Read from the environment (`OSC_USERNAME` / `OSC_PASSWORD`) — never
@@ -174,11 +175,11 @@ impl<'a> ObsClient<'a> {
     /// dry-run guard lives in `SrFiling`, not here — do not call this
     /// in dry-run.
     ///
-    /// Convention, not compiler-enforced: `SrFiling` (`crate::sr`) is
-    /// the single permitted caller in this crate. A direct call bypasses
-    /// the dry-run guard, so do not add another one; enforcing it would
-    /// need a capability/token design, which is a follow-up.
-    pub fn create_request(&self, xml: &str) -> Result<String, HttpError> {
+    /// Compiler-enforced single caller: this takes a [`FilingPermit`],
+    /// which only [`SrFiling`](crate::sr::SrFiling) can mint. A direct
+    /// call from anywhere else cannot compile, so the dry-run guard
+    /// cannot be bypassed by a future caller.
+    pub fn create_request(&self, _permit: &FilingPermit, xml: &str) -> Result<String, HttpError> {
         let creds = self.credentials.as_ref().ok_or_else(|| {
             HttpError::Other(
                 "cannot file a submit request without OBS credentials \
@@ -360,43 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn create_request_posts_xml_and_returns_id() {
-        let http = FakeHttpClient::new().with_post(
-            "https://api.opensuse.org/request?cmd=create",
-            "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
-        );
-        let client = ObsClient::with_credentials(
-            &http,
-            ObsCredentials {
-                username: "scarabeus_iv".to_string(),
-                password: "secret".to_string(),
-            },
-        );
-        let id = client
-            .create_request("<request><action type=\"submit\"/></request>")
-            .unwrap();
-        assert_eq!(id, "1400001");
-        let posted = http.posted();
-        assert_eq!(posted.len(), 1);
-        assert_eq!(posted[0].0, "https://api.opensuse.org/request?cmd=create");
-        // The filing POST carried the credentials.
-        assert_eq!(http.posted_auth(), vec![true]);
-    }
-
-    #[test]
-    fn create_request_without_credentials_fails_closed() {
-        let http = FakeHttpClient::new().with_post(
-            "https://api.opensuse.org/request?cmd=create",
-            "<request id=\"1400001\"></request>",
-        );
-        let client = ObsClient::new(&http);
-        assert!(client
-            .create_request("<request><action type=\"submit\"/></request>")
-            .is_err());
-        assert!(http.posted().is_empty());
-    }
-
-    #[test]
     fn has_open_sr_uses_auth_when_credentials_present() {
         let http = FakeHttpClient::new().with(
             &search_url("foo").unwrap(),
@@ -423,22 +387,5 @@ mod tests {
         assert!(debug.contains("scarabeus_iv"));
         assert!(!debug.contains("s3cr3t"));
         assert!(debug.contains("[redacted]"));
-    }
-
-    #[test]
-    fn create_request_transport_error_fails() {
-        // No canned POST response: the transport fails, so filing fails
-        // instead of silently reporting success.
-        let http = FakeHttpClient::new();
-        let client = ObsClient::with_credentials(
-            &http,
-            ObsCredentials {
-                username: "scarabeus_iv".to_string(),
-                password: "secret".to_string(),
-            },
-        );
-        assert!(client
-            .create_request("<request><action type=\"submit\"/></request>")
-            .is_err());
     }
 }

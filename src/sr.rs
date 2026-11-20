@@ -329,6 +329,26 @@ fn check_well_formed(xml: &str) -> Result<(), SrError> {
     Ok(())
 }
 
+/// Capability token proving the caller is [`SrFiling`]: the only way
+/// to file a submit request is through [`SrFiling::file`], which
+/// enforces the dry-run guard.
+///
+/// The token can only be minted here — its field is private and its
+/// constructor is private, so no other module (in this crate or
+/// outside it) can construct one. [`ObsClient::create_request`]
+/// requires it, which makes the single-caller rule compiler-
+/// enforced: a future direct caller cannot compile without a token
+/// it cannot mint.
+pub struct FilingPermit {
+    _private: (),
+}
+
+impl FilingPermit {
+    fn new() -> Self {
+        FilingPermit { _private: () }
+    }
+}
+
 /// Files a submit request through the OBS API.
 ///
 /// The only filing path. In dry-run, [`SrFiling::file`] logs exactly
@@ -373,17 +393,20 @@ impl<'a> SrFiling<'a> {
             return Ok(None);
         }
         let xml = payload.to_xml();
-        let id = self.obs.create_request(&xml).map_err(|e| {
-            // Preserve the variant: an auth rejection at filing time
-            // must stay distinguishable so the worker fails the run
-            // loudly instead of escalating the package.
-            let msg = format!("OBS create-request failed: {e}");
-            if e.is_auth_rejected() {
-                SrError::AuthRejected(msg)
-            } else {
-                SrError::Other(msg)
-            }
-        })?;
+        let id = self
+            .obs
+            .create_request(&FilingPermit::new(), &xml)
+            .map_err(|e| {
+                // Preserve the variant: an auth rejection at filing time
+                // must stay distinguishable so the worker fails the run
+                // loudly instead of escalating the package.
+                let msg = format!("OBS create-request failed: {e}");
+                if e.is_auth_rejected() {
+                    SrError::AuthRejected(msg)
+                } else {
+                    SrError::Other(msg)
+                }
+            })?;
         Ok(Some(id))
     }
 }
@@ -592,5 +615,47 @@ mod tests {
             filing.file(&payload()),
             Err(SrError::AuthRejected(_))
         ));
+    }
+
+    #[test]
+    fn file_posts_xml_and_returns_id() {
+        // Live mode: filing POSTs the payload XML and returns the new
+        // request id; the POST carried the credentials.
+        let http = FakeHttpClient::new().with_post(
+            "https://api.opensuse.org/request?cmd=create",
+            "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
+        );
+        let obs = ObsClient::with_credentials(
+            &http,
+            ObsCredentials {
+                username: "scarabeus_iv".to_string(),
+                password: "secret".to_string(),
+            },
+        );
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert_eq!(
+            filing.file(&payload()).unwrap(),
+            Some("1400001".to_string())
+        );
+        let posted = http.posted();
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0].0, "https://api.opensuse.org/request?cmd=create");
+        assert_eq!(http.posted_auth(), vec![true]);
+    }
+
+    #[test]
+    fn file_without_credentials_fails_closed() {
+        // No credentials: filing fails instead of posting anonymously,
+        // and nothing is posted.
+        let http = FakeHttpClient::new().with_post(
+            "https://api.opensuse.org/request?cmd=create",
+            "<request id=\"1400001\"></request>",
+        );
+        let obs = ObsClient::new(&http);
+        let dry = DryRun::new(false);
+        let filing = SrFiling::new(&obs, &dry);
+        assert!(filing.file(&payload()).is_err());
+        assert!(http.posted().is_empty());
     }
 }
