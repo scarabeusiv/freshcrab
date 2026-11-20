@@ -189,7 +189,7 @@ dependencies = [
 [[package]]
 name = "geectl"
 version = "0.1.0"
-source = "git+https://github.com/scarabeusiv/geectl?rev=d415c11ef9d10ce673b6d3f10bf34a0f9a21d862#d415c11ef9d10ce673b6d3f10bf34a0f9a21d862"
+source = "git+https://github.com/scarabeusiv/geectl?rev=bda5911a1e466aa7f71d49cad97f83b7d5182bd4#bda5911a1e466aa7f71d49cad97f83b7d5182bd4"
 dependencies = [
  "base64",
  "clap",

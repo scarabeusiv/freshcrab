@@ -33,8 +33,13 @@ fs2 = "0.4"
 base64 = "0.23"
 # The OBS library: the devel lookup, the open-SR check, and SR filing
 # all come from geectl now; the local OBS client is deleted. Pinned to
-# the reviewed main revision (staging step 3 of the geectl migration).
-geectl = { git = "https://github.com/scarabeusiv/geectl", rev = "d415c11ef9d10ce673b6d3f10bf34a0f9a21d862" }
+# the v0.1.0 tag's reviewed rev (bda5911, tagged 2026-11-20) — a tag
+# is mutable, so a tag pin would let `cargo update -p geectl`
+# silently advance the dependency; a rev pin cannot move. Bump by
+# changing the rev (and the tag in this comment) in a reviewed PR;
+# .github/workflows/geectl-pin.yml fails loudly when a newer geectl
+# release exists.
+geectl = { git = "https://github.com/scarabeusiv/geectl", rev = "bda5911a1e466aa7f71d49cad97f83b7d5182bd4" }
 
 [lints.rust]
 unsafe_code = "forbid"

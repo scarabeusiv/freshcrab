@@ -442,6 +442,18 @@ impl geectl::http::HttpClient for FakeHttpClient {
         ))
     }
 
+    fn put_file(
+        &self,
+        url: &str,
+        _body: &str,
+        _credentials: &geectl::auth::Credentials,
+    ) -> Result<String, geectl::error::GeectlError> {
+        Err(geectl::error::GeectlError::new(
+            geectl::error::ErrorKind::NetworkError,
+            format!("no canned put_file response for {url}"),
+        ))
+    }
+
     fn delete(
         &self,
         url: &str,
