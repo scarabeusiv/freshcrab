@@ -94,7 +94,9 @@ impl<'a> ObsClient<'a> {
     /// Return the devel project for `package` on Factory, or None.
     pub fn devel_project(&self, package: &str) -> Result<Option<String>, HttpError> {
         if !valid_obs_name(package) {
-            return Err(HttpError(format!("invalid OBS package name: {package:?}")));
+            return Err(HttpError::Other(format!(
+                "invalid OBS package name: {package:?}"
+            )));
         }
         let url = format!(
             "{OBS_API}/public/source/{FACTORY_PROJECT}/{}",
@@ -125,7 +127,9 @@ impl<'a> ObsClient<'a> {
         // is validated and encoded like any other interpolated value
         // before it goes into a URL.
         if !valid_obs_name(&project) {
-            return Err(HttpError(format!("invalid OBS project name: {project:?}")));
+            return Err(HttpError::Other(format!(
+                "invalid OBS project name: {project:?}"
+            )));
         }
         let url = format!(
             "{OBS_API}/public/source/{}/{}/{}.spec",
@@ -157,7 +161,7 @@ impl<'a> ObsClient<'a> {
         };
         match parse_search_matches(&body) {
             Some(n) => Ok(n > 0),
-            None => Err(HttpError(format!(
+            None => Err(HttpError::Other(format!(
                 "unexpected OBS search response for package {package:?}"
             ))),
         }
@@ -176,7 +180,7 @@ impl<'a> ObsClient<'a> {
     /// need a capability/token design, which is a follow-up.
     pub fn create_request(&self, xml: &str) -> Result<String, HttpError> {
         let creds = self.credentials.as_ref().ok_or_else(|| {
-            HttpError(
+            HttpError::Other(
                 "cannot file a submit request without OBS credentials \
                  (set OSC_USERNAME/OSC_PASSWORD)"
                     .to_string(),
@@ -186,8 +190,9 @@ impl<'a> ObsClient<'a> {
         let body = self
             .http
             .post(&url, xml, Some((&creds.username, &creds.password)))?;
-        parse_request_id(&body)
-            .ok_or_else(|| HttpError(format!("unexpected OBS create-request response: {body:?}")))
+        parse_request_id(&body).ok_or_else(|| {
+            HttpError::Other(format!("unexpected OBS create-request response: {body:?}"))
+        })
     }
 }
 
@@ -199,7 +204,9 @@ impl<'a> ObsClient<'a> {
 /// would break out of the literal.
 pub fn search_url(package: &str) -> Result<String, HttpError> {
     if !valid_obs_name(package) {
-        return Err(HttpError(format!("invalid OBS package name: {package:?}")));
+        return Err(HttpError::Other(format!(
+            "invalid OBS package name: {package:?}"
+        )));
     }
     let match_expr = format!(
         "action/target/@package='{package}' and (state/@name='new' or state/@name='review')"
@@ -324,7 +331,7 @@ mod tests {
         let http = FakeHttpClient::new();
         let client = ObsClient::new(&http);
         let err = client.devel_project("foo/bar").unwrap_err();
-        assert!(err.0.contains("invalid OBS package name"));
+        assert!(format!("{err}").contains("invalid OBS package name"));
     }
 
     #[test]
@@ -338,7 +345,7 @@ mod tests {
         );
         let client = ObsClient::new(&http);
         let err = client.devel_version("foo").unwrap_err();
-        assert!(err.0.contains("invalid OBS project name"));
+        assert!(format!("{err}").contains("invalid OBS project name"));
     }
 
     #[test]

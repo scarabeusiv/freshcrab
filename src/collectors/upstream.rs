@@ -83,7 +83,7 @@ impl<'a> UpstreamChecker for GithubReleasesChecker<'a> {
                         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
             });
         if !valid {
-            return Err(HttpError(format!(
+            return Err(HttpError::Other(format!(
                 "invalid GitHub repository: {:?}",
                 self.repo
             )));
