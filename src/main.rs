@@ -1,24 +1,31 @@
-//! Command-line entry point for the freshcrab watcher.
+//! Command-line entry point for the freshcrab watcher and dispatcher.
 //!
 //! Report-only by default: prints the queue (packages behind on Factory)
 //! and files nothing. The config file controls the package set, the
 //! exclusions, and the kill switch.
 //!
-//! Dry-run mode (default true in this phase) is global: the watcher polls
-//! the collectors and prints what it WOULD queue, the queue evaluates the
-//! dedup rules and prints the decision for each candidate, and nothing is
-//! written or filed. The effective mode is resolved as CLI flag
-//! (`--dry-run` / `--live`) > env var (`FRESHCRAB_DRY_RUN`) > config
-//! (`dry_run`) and is logged loudly at startup. All plan output goes to
-//! stderr, so stdout stays machine-readable JSON.
+//! When `report_only` is false, the dispatcher runs after the watcher:
+//! it picks pending queue entries (security first, within the
+//! concurrency limit and the daily SR cap), drives each through the
+//! worker, and prints the dispatch report as JSON. Dry-run mode
+//! (default true) is global: the watcher polls the collectors and
+//! prints what it WOULD queue, the queue evaluates the dedup rules and
+//! prints the decision for each candidate, and the dispatcher logs the
+//! would-do plan and the exact SR payload and files nothing. The
+//! effective mode is resolved as CLI flag (`--dry-run` / `--live`) >
+//! env var (`FRESHCRAB_DRY_RUN`) > config (`dry_run`) and is logged
+//! loudly at startup. All plan output goes to stderr, so stdout stays
+//! machine-readable JSON.
 
 use freshcrab::config::load_config;
+use freshcrab::dispatcher::Dispatcher;
 use freshcrab::dry_run::resolve as resolve_dry_run;
 use freshcrab::factory::FactoryClient;
 use freshcrab::http::UreqClient;
-use freshcrab::obs::ObsClient;
+use freshcrab::obs::{ObsClient, ObsCredentials};
 use freshcrab::queue::{DedupChecks, Queue, QueueEntry, QueueError};
 use freshcrab::watcher::Watcher;
+use freshcrab::worker::{DryRunExecutor, Worker};
 use std::process::ExitCode;
 
 fn print_usage() {
@@ -29,8 +36,13 @@ fn print_usage() {
     eprintln!("  --dry-run           force dry-run mode (default in this phase)");
     eprintln!("  --live              force live mode (writes the queue; overrides config and env)");
     eprintln!(
-        "The watcher runs in report-only mode: it prints the queue as JSON and files nothing."
+        "The watcher runs in report-only mode by default: it prints the queue as JSON and files nothing."
     );
+    eprintln!("Report-only gates the dispatcher only: the watcher still enqueues, and in live");
+    eprintln!("mode the queue state file is still written (dry-run prevents all writes).");
+    eprintln!("With report_only: false in the config, the dispatcher runs after the watcher and");
+    eprintln!("files submit requests to the devel projects (dry-run by default: it logs the plan");
+    eprintln!("and the exact SR payload and files nothing).");
     eprintln!("Dry-run plan output goes to stderr; stdout is the JSON report.");
 }
 
@@ -196,7 +208,15 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let obs = ObsClient::new(&http);
+    // The OBS client carries the credentials for the authenticated
+    // endpoints (the open-SR search the dedup checks use, and filing a
+    // submit request). Credentials come from the environment only;
+    // without them those calls fail closed, as before.
+    let credentials = ObsCredentials::from_env();
+    let obs = match &credentials {
+        Some(creds) => ObsClient::with_credentials(&http, creds.clone()),
+        None => ObsClient::new(&http),
+    };
     for entry in &entries {
         let package = entry.package.as_str();
         // The devel-version check is a public-API read: on error, log
@@ -212,9 +232,9 @@ fn main() -> ExitCode {
         // The open-SR check is fail-closed: on error it returns Err and
         // `Queue::add` skips the package instead of queueing it on an
         // unchecked dedup. The search API 401s without OBS credentials,
-        // and no credentials are plumbed yet (that is the filing
-        // phase's work) — so an error here is the normal no-credentials
-        // case, and skipping is the safe answer until then.
+        // so without them an error here is the normal no-credentials
+        // case, and skipping is the safe answer until credentials are
+        // provided.
         let has_open_sr = |pkg: &str| -> Result<bool, QueueError> {
             obs.has_open_sr(pkg)
                 .map_err(|e| QueueError(format!("open-SR check failed for {pkg}: {e}")))
@@ -240,6 +260,10 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Report-only gates the dispatcher only: the watcher above has
+    // already enqueued, and in live mode the queue state file was
+    // already written (the queue is the watcher's staging state, not a
+    // filing). `dry_run` is the flag that prevents all writes.
     if config.report_only {
         match serde_json::to_string_pretty(&entries) {
             Ok(json) => println!("{json}"),
@@ -251,13 +275,36 @@ fn main() -> ExitCode {
         return ExitCode::from(0);
     }
 
-    // Filing submit requests is a later phase; report-only is the only
-    // mode this scaffolding implements.
-    eprintln!("SR filing is not implemented yet; running in report-only mode.");
-    match serde_json::to_string_pretty(&entries) {
+    // The dispatcher drives the queued entries through the worker and
+    // files submit requests to the devel projects. Dry-run (default
+    // true) still applies: the worker logs the plan and the exact SR
+    // payload and files nothing. The live executor is the agent/CI
+    // step and does not exist yet, so in live mode the DryRunExecutor
+    // refuses and the entries escalate instead of filing.
+    let executor = DryRunExecutor;
+    let worker = Worker::new(
+        &obs,
+        &executor,
+        credentials.as_ref(),
+        &config.home_project,
+        &dry_run,
+    );
+    let dispatcher = Dispatcher::new(&worker, &config, &dry_run);
+    let report = match dispatcher.dispatch(&mut queue) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("error: dispatch failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    eprintln!(
+        "dispatched {} package(s), filed {} SR(s), {} planned, {} skipped, {} escalated",
+        report.dispatched, report.filed, report.planned, report.skipped, report.escalated
+    );
+    match serde_json::to_string_pretty(&report) {
         Ok(json) => println!("{json}"),
         Err(e) => {
-            eprintln!("cannot serialize queue: {e}");
+            eprintln!("cannot serialize dispatch report: {e}");
             return ExitCode::from(1);
         }
     }
