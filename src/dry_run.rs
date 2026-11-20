@@ -54,6 +54,20 @@ impl DryRun {
         self.plan.borrow().clone()
     }
 
+    /// Merge another dry-run's recorded plan into this one, verbatim.
+    /// The lines are already formatted (`[dry-run] ...`) and already
+    /// printed by their owner (geectl's `DryRun` prints as it
+    /// records), so this records them without printing or
+    /// re-prefixing: it only makes `plan()` consumers see the full
+    /// plan. In live mode the other plan is empty, so merging is a
+    /// no-op — and a live `DryRun` records nothing even if lines are
+    /// passed in, keeping the "live plan is empty" invariant.
+    pub fn merge_plan(&self, lines: &[String]) {
+        if self.enabled {
+            self.plan.borrow_mut().extend(lines.iter().cloned());
+        }
+    }
+
     /// The guard. Call before any mutating operation. Returns true when
     /// the operation may proceed (live mode). In dry-run, records and
     /// prints the would-do action and returns false.
@@ -138,6 +152,25 @@ mod tests {
         let dry = DryRun::new(true);
         assert!(!dry.allow("write the queue file"));
         assert_eq!(dry.plan(), vec!["[dry-run] would: write the queue file"]);
+    }
+
+    #[test]
+    fn merge_plan_records_verbatim() {
+        let dry = DryRun::new(true);
+        dry.note("would do the local step");
+        dry.merge_plan(&["[dry-run] would: file submit request for foo".to_string()]);
+        assert_eq!(
+            dry.plan(),
+            vec![
+                "[dry-run] would do the local step",
+                "[dry-run] would: file submit request for foo",
+            ]
+        );
+
+        // Live mode records nothing, even merged lines.
+        let live = DryRun::new(false);
+        live.merge_plan(&["[dry-run] would: file submit request for foo".to_string()]);
+        assert!(live.plan().is_empty());
     }
 
     #[test]

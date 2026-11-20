@@ -21,11 +21,12 @@ use freshcrab::config::load_config;
 use freshcrab::dispatcher::Dispatcher;
 use freshcrab::dry_run::resolve as resolve_dry_run;
 use freshcrab::factory::FactoryClient;
-use freshcrab::http::{HttpError, UreqClient};
-use freshcrab::obs::{ObsClient, ObsCredentials};
+use freshcrab::http::{map_obs_credentials_error, UreqClient};
 use freshcrab::queue::{DedupChecks, Queue, QueueEntry};
 use freshcrab::watcher::Watcher;
 use freshcrab::worker::{DryRunExecutor, Worker};
+use geectl::auth::Credentials;
+use geectl::error::{ErrorKind, GeectlError};
 use std::process::ExitCode;
 
 fn print_usage() {
@@ -213,11 +214,35 @@ fn main() -> ExitCode {
     // The OBS client carries the credentials for the authenticated
     // endpoints (the open-SR search the dedup checks use, and filing a
     // submit request). Credentials come from the environment only;
-    // without them those calls fail closed, as before.
-    let credentials = ObsCredentials::from_env();
+    // without them those calls fail closed, as before. The OBS client
+    // is geectl's, on its own HTTP client: the freshcrab client keeps
+    // the freshcrab User-Agent the collectors need, and the OBS client
+    // gets geectl's bounded timeouts.
+    let geectl_http = match geectl::http::UreqClient::new(geectl::http::Timeout::default()) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("cannot build the OBS HTTP client: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let credentials = match obs_credentials_from_env() {
+        Ok(credentials) => credentials,
+        Err(e) => {
+            eprintln!("invalid OBS credentials (OSC_USERNAME/OSC_PASSWORD): {e}");
+            return ExitCode::from(1);
+        }
+    };
     let obs = match &credentials {
-        Some(creds) => ObsClient::with_credentials(&http, creds.clone()),
-        None => ObsClient::new(&http),
+        Some(creds) => {
+            match geectl::obs::ObsClient::with_credentials(&geectl_http, creds.clone()) {
+                Ok(obs) => obs,
+                Err(e) => {
+                    eprintln!("cannot build the OBS client: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        None => geectl::obs::ObsClient::new(&geectl_http),
     };
     for entry in &entries {
         let package = entry.package.as_str();
@@ -233,14 +258,28 @@ fn main() -> ExitCode {
         };
         // The open-SR check is fail-closed for a non-auth failure:
         // `Queue::add` skips the package instead of queueing it on an
-        // unchecked dedup. The search API 401s without OBS credentials,
+        // unchecked dedup. Without OBS credentials geectl refuses the
+        // check before any request (a ConfigError, mapped at the seam
+        // below to name the `OSC_*` variables freshcrab users set),
         // so without them an error here is the normal no-credentials
         // case, and skipping is the safe answer until credentials are
-        // provided. An auth rejection (rotated or expired credentials)
+        // provided. An auth failure (rotated or expired credentials)
         // is different: it would strike every candidate, so
-        // `Queue::add` returns it as an error and the run fails loudly
-        // below instead of exiting 0 with an empty batch.
-        let has_open_sr = |pkg: &str| -> Result<bool, HttpError> { obs.has_open_sr(pkg) };
+        // `Queue::add` returns it as an error and the run fails
+        // loudly below instead of exiting 0 with an empty batch.
+        // Map geectl's no-credentials ConfigError at the seam: geectl
+        // names its own `GEECTL_OBS_*` variables, but freshcrab users
+        // set `OSC_*`. Auth failures and every other error pass
+        // through untouched.
+        let has_open_sr = |pkg: &str| -> Result<bool, GeectlError> {
+            obs.has_open_sr(pkg).map_err(|e| {
+                if e.kind() == ErrorKind::ConfigError {
+                    map_obs_credentials_error(&e)
+                } else {
+                    e
+                }
+            })
+        };
         if let Err(e) = queue.add(
             QueueEntry::new(
                 package,
@@ -318,4 +357,28 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::from(0)
+}
+
+/// Read OBS credentials from the environment (`OSC_USERNAME` /
+/// `OSC_PASSWORD`), as geectl Basic credentials. None when either
+/// variable is unset or empty. The pair is validated with geectl's
+/// `validate_basic` (no `:` in the username, non-empty password), so
+/// a malformed pair fails fast here instead of 401ing at the first
+/// request. geectl's own resolver is not used: it reads the
+/// `GEECTL_OBS_*` variables, which are the wrong names for freshcrab
+/// users.
+fn obs_credentials_from_env() -> Result<Option<Credentials>, GeectlError> {
+    let username = std::env::var("OSC_USERNAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let password = std::env::var("OSC_PASSWORD")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    match (username, password) {
+        (Some(username), Some(password)) => {
+            let (username, password) = geectl::auth::validate_basic(&username, &password)?;
+            Ok(Some(Credentials::Basic { username, password }))
+        }
+        _ => Ok(None),
+    }
 }
