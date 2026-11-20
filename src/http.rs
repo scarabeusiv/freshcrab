@@ -21,12 +21,18 @@ pub const USER_AGENT: &str = "freshcrab/0.1 (https://github.com/scarabeusiv/fres
 /// the run loudly instead of yielding per-package skips. A 401/403
 /// on an unauthenticated read is [`HttpError::Other`] — there are no
 /// credentials to reject, so a proxy 401 on a public read must not
-/// fail the whole run. Any other failure is [`HttpError::Other`].
+/// fail the whole run. A 404 is a distinct variant too
+/// ([`HttpError::NotFound`]): the status, not the error text, decides
+/// it, so a mapping can never mistake another failure for a missing
+/// resource. Any other failure is [`HttpError::Other`].
 #[derive(Debug)]
 pub enum HttpError {
     /// The server rejected the credentials (HTTP 401/403). Carries
     /// the underlying error text (e.g. `http status: 401`).
     AuthRejected(String),
+    /// The server answered 404 (the resource does not exist). Carries
+    /// the underlying error text (e.g. `http status: 404`).
+    NotFound(String),
     /// Any other HTTP or transport failure (other statuses, timeouts,
     /// DNS, unreadable bodies). Carries the underlying error text.
     Other(String),
@@ -37,12 +43,18 @@ impl HttpError {
     pub fn is_auth_rejected(&self) -> bool {
         matches!(self, HttpError::AuthRejected(_))
     }
+
+    /// True when the server answered 404 (the resource does not exist).
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, HttpError::NotFound(_))
+    }
 }
 
 impl fmt::Display for HttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HttpError::AuthRejected(msg) => write!(f, "http error (auth rejected): {msg}"),
+            HttpError::NotFound(msg) => write!(f, "http error (not found): {msg}"),
             HttpError::Other(msg) => write!(f, "http error: {msg}"),
         }
     }
@@ -54,7 +66,10 @@ impl std::error::Error for HttpError {}
 /// every failure is a plain failure. A 401/403 here is not an auth
 /// rejection — there are no credentials to reject.
 fn map_ureq_error(e: ureq::Error) -> HttpError {
-    HttpError::Other(e.to_string())
+    match e {
+        ureq::Error::StatusCode(404) => HttpError::NotFound(e.to_string()),
+        other => HttpError::Other(other.to_string()),
+    }
 }
 
 /// Map a ureq error to [`HttpError`] for a credentialed call
@@ -67,6 +82,7 @@ fn map_ureq_auth_error(e: ureq::Error) -> HttpError {
         ureq::Error::StatusCode(401) | ureq::Error::StatusCode(403) => {
             HttpError::AuthRejected(e.to_string())
         }
+        ureq::Error::StatusCode(404) => HttpError::NotFound(e.to_string()),
         other => HttpError::Other(other.to_string()),
     }
 }
@@ -242,10 +258,11 @@ impl FakeHttpClient {
 }
 
 /// Turn a canned (status, body) pair into the `HttpClient` result:
-/// 2xx is the body, any other status is a plain failure — except on a
-/// credentialed call (`auth` true), where 401/403 is an auth
-/// rejection. A missing canned response is a plain failure (the old
-/// "no canned response" error), never a silent success.
+/// 2xx is the body, 404 is a not-found, and any other status is a
+/// plain failure — except on a credentialed call (`auth` true), where
+/// 401/403 is an auth rejection. A missing canned response is a plain
+/// failure (the old "no canned response" error), never a silent
+/// success.
 fn canned(
     responses: &HashMap<String, (u16, String)>,
     url: &str,
@@ -258,6 +275,9 @@ fn canned(
     match *status {
         200..=299 => Ok(body.clone()),
         401 | 403 if auth => Err(HttpError::AuthRejected(format!(
+            "http status: {status} for {url}"
+        ))),
+        404 => Err(HttpError::NotFound(format!(
             "http status: {status} for {url}"
         ))),
         _ => Err(HttpError::Other(format!("http status: {status} for {url}"))),
@@ -286,6 +306,151 @@ impl HttpClient for FakeHttpClient {
             "no canned POST response",
             auth.is_some(),
         )
+    }
+}
+
+/// Map a freshcrab [`HttpError`] to a [`geectl::error::GeectlError`].
+/// An auth rejection is an auth failure; a 404 is a not-found, so
+/// geectl's devel-project lookup can read it as "no devel project"
+/// the way its own client does; any other failure is a network error,
+/// with the original message kept. The 404 mapping is by variant,
+/// not by the error text: the status decides it where the error is
+/// built (`canned`, `map_ureq_error`), so a message change cannot
+/// silently break the mapping.
+fn map_geectl_error(e: &HttpError) -> geectl::error::GeectlError {
+    use geectl::error::{ErrorKind, GeectlError};
+    match e {
+        HttpError::AuthRejected(msg) => GeectlError::new(ErrorKind::AuthFailed, msg.clone()),
+        HttpError::NotFound(msg) => GeectlError::new(ErrorKind::NotFound, msg.clone()),
+        HttpError::Other(msg) => GeectlError::new(ErrorKind::NetworkError, msg.clone()),
+    }
+}
+
+/// Map a geectl error that names geectl's own credential variables
+/// (`GEECTL_OBS_*`) to freshcrab's (`OSC_*`). Freshcrab users set
+/// `OSC_USERNAME`/`OSC_PASSWORD`; geectl's no-credentials ConfigError
+/// names its own variables, and that text reaches the user verbatim
+/// through the open-SR check's warning. Only the variable names are
+/// rewritten — the kind and the rest of the message are preserved —
+/// and an error that names no `GEECTL_OBS_*` variable is returned
+/// unchanged. Used at the seam where freshcrab consumes geectl's
+/// no-credentials error for display (the open-SR check in `main`).
+pub fn map_obs_credentials_error(e: &geectl::error::GeectlError) -> geectl::error::GeectlError {
+    use geectl::error::GeectlError;
+    // The parenthetical is geectl's fixed no-credentials wording
+    // (`ObsClient` in geectl's obs.rs): freshcrab has no password-file
+    // variable, so the whole phrase maps to the `OSC_*` pair. The
+    // single-name replaces below cover any other `GEECTL_OBS_*`
+    // mention; `GEECTL_OBS_PASSWORD_FILE` goes first because it
+    // contains `GEECTL_OBS_PASSWORD` as a prefix.
+    let context = e
+        .context
+        .replace(
+            "(GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            "(OSC_USERNAME + OSC_PASSWORD)",
+        )
+        .replace("GEECTL_OBS_PASSWORD_FILE", "OSC_PASSWORD")
+        .replace("GEECTL_OBS_PASSWORD", "OSC_PASSWORD")
+        .replace("GEECTL_OBS_USERNAME", "OSC_USERNAME");
+    GeectlError::new(e.kind(), context)
+}
+
+/// Implement geectl's HTTP client for the fake, so the geectl OBS
+/// client can run against canned responses in tests. This is NOT
+/// `#[cfg(test)]`: integration tests link the library without
+/// `cfg(test)`, so a test-gated impl would be invisible to them and
+/// `tests/test_sr.rs` could not build a geectl client over the fake.
+/// Production never uses this impl — the binary builds a geectl
+/// `UreqClient` for the OBS client.
+impl geectl::http::HttpClient for FakeHttpClient {
+    fn get(&self, url: &str) -> Result<String, geectl::error::GeectlError> {
+        <Self as HttpClient>::get(self, url).map_err(|e| map_geectl_error(&e))
+    }
+
+    fn get_with(
+        &self,
+        url: &str,
+        credentials: &geectl::auth::Credentials,
+    ) -> Result<String, geectl::error::GeectlError> {
+        match credentials {
+            geectl::auth::Credentials::Basic { username, password } => {
+                // The fake's `get_auth` records the URL in `authed_gets`
+                // and models a 401/403 as an auth rejection, exactly as
+                // the production path does.
+                <Self as HttpClient>::get_auth(self, url, username, password)
+                    .map_err(|e| map_geectl_error(&e))
+            }
+            // No credentials (or a non-Basic pair, which OBS cannot
+            // use): a plain unauthenticated read. That matches
+            // geectl's transport, which passes `Credentials::None`
+            // through to a plain GET (`apply_auth` and
+            // `require_credentials_transport` both accept it); the
+            // no-credentials ConfigError is raised by `ObsClient`
+            // methods (`has_open_sr`, `create_request`) before any
+            // HTTP call, so it is never the fake's to produce.
+            _ => <Self as HttpClient>::get(self, url).map_err(|e| map_geectl_error(&e)),
+        }
+    }
+
+    fn post(
+        &self,
+        url: &str,
+        body: &str,
+        credentials: &geectl::auth::Credentials,
+    ) -> Result<String, geectl::error::GeectlError> {
+        let auth = match credentials {
+            geectl::auth::Credentials::Basic { username, password } => {
+                Some((username.as_str(), password.as_str()))
+            }
+            _ => None,
+        };
+        <Self as HttpClient>::post(self, url, body, auth).map_err(|e| map_geectl_error(&e))
+    }
+
+    // The remaining methods are unused by freshcrab's OBS flows (the
+    // public reads, the open-SR search, and the filing POST only need
+    // `get`, `get_with`, and `post`): they fail with a clear message
+    // instead of silently succeeding.
+    fn post_json(&self, url: &str, _body: &str) -> Result<String, geectl::error::GeectlError> {
+        Err(geectl::error::GeectlError::new(
+            geectl::error::ErrorKind::NetworkError,
+            format!("no canned post_json response for {url}"),
+        ))
+    }
+
+    fn post_text(
+        &self,
+        url: &str,
+        _body: &str,
+        _credentials: &geectl::auth::Credentials,
+    ) -> Result<String, geectl::error::GeectlError> {
+        Err(geectl::error::GeectlError::new(
+            geectl::error::ErrorKind::NetworkError,
+            format!("no canned post_text response for {url}"),
+        ))
+    }
+
+    fn put(
+        &self,
+        url: &str,
+        _body: &str,
+        _credentials: &geectl::auth::Credentials,
+    ) -> Result<String, geectl::error::GeectlError> {
+        Err(geectl::error::GeectlError::new(
+            geectl::error::ErrorKind::NetworkError,
+            format!("no canned put response for {url}"),
+        ))
+    }
+
+    fn delete(
+        &self,
+        url: &str,
+        _credentials: &geectl::auth::Credentials,
+    ) -> Result<String, geectl::error::GeectlError> {
+        Err(geectl::error::GeectlError::new(
+            geectl::error::ErrorKind::NetworkError,
+            format!("no canned delete response for {url}"),
+        ))
     }
 }
 
@@ -348,6 +513,8 @@ mod tests {
             .is_auth_rejected());
         let missing = http.get("https://example.invalid/missing").unwrap_err();
         assert!(!missing.is_auth_rejected());
+        // A 404 is a not-found by status, on the fake as on the real client.
+        assert!(missing.is_not_found());
         let broken = http.get("https://example.invalid/broken").unwrap_err();
         assert!(!broken.is_auth_rejected());
         // No canned response at all is still a plain failure.
@@ -378,5 +545,93 @@ mod tests {
             .post("https://example.invalid/create", "<request/>", None)
             .unwrap_err();
         assert!(!err.is_auth_rejected());
+    }
+
+    #[test]
+    fn ureq_mappers_map_404_by_status() {
+        // The real client's mappers decide 404 by status, like the
+        // fake's `canned`: a 404 is NotFound on both paths, never a
+        // plain failure, and never an auth rejection.
+        let err = map_ureq_error(ureq::Error::StatusCode(404));
+        assert!(err.is_not_found());
+        assert!(!err.is_auth_rejected());
+        let err = map_ureq_auth_error(ureq::Error::StatusCode(404));
+        assert!(err.is_not_found());
+        assert!(!err.is_auth_rejected());
+        let err = map_ureq_auth_error(ureq::Error::StatusCode(401));
+        assert!(err.is_auth_rejected());
+        assert!(!err.is_not_found());
+        let err = map_ureq_error(ureq::Error::StatusCode(500));
+        assert!(!err.is_not_found());
+        assert!(!err.is_auth_rejected());
+    }
+
+    #[test]
+    fn obs_credentials_error_names_osc_vars() {
+        use geectl::error::{ErrorKind, GeectlError};
+        let err = GeectlError::new(
+            ErrorKind::ConfigError,
+            "checking for open submit requests requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+        );
+        let mapped = map_obs_credentials_error(&err);
+        assert_eq!(mapped.kind(), ErrorKind::ConfigError);
+        assert_eq!(
+            mapped.context,
+            "checking for open submit requests requires OBS credentials (OSC_USERNAME + OSC_PASSWORD)"
+        );
+        // An error that names no GEECTL_OBS_* variable passes through.
+        let other = GeectlError::new(ErrorKind::ConfigError, "some other config problem");
+        assert_eq!(
+            map_obs_credentials_error(&other).context,
+            "some other config problem"
+        );
+    }
+
+    #[test]
+    fn geectl_impl_maps_errors_to_geectl_kinds() {
+        // The geectl HttpClient impl over the fake: a 401 on a
+        // credentialed call is an auth failure, a 404 is a not-found
+        // (geectl's devel lookup reads it as "no devel project"), and
+        // the unused methods fail with a clear message.
+        use geectl::auth::Credentials;
+        use geectl::error::ErrorKind;
+        use geectl::http::HttpClient as GeectlHttpClient;
+        let http = FakeHttpClient::new()
+            .with_status("https://example.invalid/ok", 200, "body")
+            .with_status("https://example.invalid/denied", 401, "unauthorized")
+            .with_status("https://example.invalid/missing", 404, "not found");
+        assert_eq!(
+            GeectlHttpClient::get(&http, "https://example.invalid/ok").unwrap(),
+            "body"
+        );
+        let err = GeectlHttpClient::get_with(
+            &http,
+            "https://example.invalid/denied",
+            &Credentials::Basic {
+                username: "u".to_string(),
+                password: "p".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AuthFailed);
+        let err = GeectlHttpClient::get_with(
+            &http,
+            "https://example.invalid/missing",
+            &Credentials::None,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(GeectlHttpClient::post_json(&http, "https://example.invalid/x", "{}").is_err());
+        assert!(GeectlHttpClient::put(
+            &http,
+            "https://example.invalid/x",
+            "<x/>",
+            &Credentials::None
+        )
+        .is_err());
+        assert!(
+            GeectlHttpClient::delete(&http, "https://example.invalid/x", &Credentials::None)
+                .is_err()
+        );
     }
 }
