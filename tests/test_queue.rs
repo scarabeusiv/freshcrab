@@ -48,6 +48,7 @@ fn add_and_deduplicate() {
             DedupChecks::none(),
             &live_run
         )
+        .unwrap()
         .is_some());
     // In flight: a second add for the same package is skipped.
     assert!(q
@@ -63,6 +64,7 @@ fn add_and_deduplicate() {
             DedupChecks::none(),
             &live_run
         )
+        .unwrap()
         .is_none());
     // Devel already new: skipped.
     let devel = |_pkg: &str| Some("2.0".to_string());
@@ -82,6 +84,7 @@ fn add_and_deduplicate() {
             },
             &live_run
         )
+        .unwrap()
         .is_none());
     // Open SR: skipped.
     let has_sr = |_pkg: &str| Ok(true);
@@ -101,6 +104,7 @@ fn add_and_deduplicate() {
             },
             &live_run
         )
+        .unwrap()
         .is_none());
     // Devel behind and no open SR: queued.
     let devel_behind = |_pkg: &str| Some("1.9".to_string());
@@ -121,6 +125,7 @@ fn add_and_deduplicate() {
             },
             &live_run
         )
+        .unwrap()
         .is_some());
     let _ = fs::remove_file(&path);
 }
@@ -188,6 +193,7 @@ fn dry_run_add_and_save_write_nothing() {
             DedupChecks::none(),
             &dry_run
         )
+        .unwrap()
         .is_none());
     assert!(q.entries().is_empty());
     q.save(&dry_run).unwrap();
@@ -220,6 +226,7 @@ fn live_add_and_save_take_effect() {
             DedupChecks::none(),
             &live_run
         )
+        .unwrap()
         .is_some());
     q.save(&live_run).unwrap();
     assert!(Path::new(&path).exists());
@@ -269,6 +276,7 @@ fn entry_carries_target_and_kind() {
             DedupChecks::none(),
             &live_run,
         )
+        .unwrap()
         .unwrap();
     assert_eq!(entry.target, Target::Factory);
     assert_eq!(entry.kind, UpdateKind::Security);

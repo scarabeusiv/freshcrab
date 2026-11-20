@@ -23,6 +23,7 @@
 //! human clears it.
 
 use crate::dry_run::DryRun;
+use crate::http::HttpError;
 use crate::target::Target;
 use crate::version::is_newer;
 use fs2::FileExt;
@@ -146,10 +147,13 @@ fn now_iso() -> String {
 pub type DevelVersionCheck<'a> = dyn Fn(&str) -> Option<String> + 'a;
 /// Reports whether an open submit request targets a package. Used by
 /// `Queue::add` for deduplication. Returns an error when the check
-/// itself fails (e.g. the OBS search API 401s without credentials):
-/// `Queue::add` treats that as fail-closed and skips the package
-/// rather than queueing it on an unchecked dedup.
-pub type OpenSrCheck<'a> = dyn Fn(&str) -> Result<bool, QueueError> + 'a;
+/// itself fails: a non-auth failure (e.g. a transport error) is
+/// fail-closed — `Queue::add` skips the package rather than queueing
+/// it on an unchecked dedup — but an auth rejection
+/// ([`HttpError::AuthRejected`], e.g. the OBS search API 401s on
+/// rotated credentials) propagates out of `Queue::add` so the run
+/// fails loudly instead of silently skipping every candidate.
+pub type OpenSrCheck<'a> = dyn Fn(&str) -> Result<bool, HttpError> + 'a;
 
 /// The dedup checkers for `Queue::add`. Both are optional; a missing
 /// checker skips that check.
@@ -427,11 +431,16 @@ impl Queue {
     /// None (that check is skipped). Returns the entry, or None when the
     /// package was skipped.
     ///
-    /// When the open-SR check itself errors, the package is skipped
-    /// (fail-closed) rather than queued on an unchecked dedup. When an
-    /// entry for the package already exists (done, blocked, or
-    /// escalated), it is refreshed in place instead of pushing a
-    /// duplicate — one entry per package, always.
+    /// When the open-SR check itself errors with anything but an auth
+    /// rejection, the package is skipped (fail-closed) rather than
+    /// queued on an unchecked dedup. An auth rejection
+    /// ([`HttpError::AuthRejected`]) is returned as an error instead:
+    /// with rotated or expired credentials every candidate would
+    /// otherwise be skipped one by one and the run would exit 0 with
+    /// an empty batch — the exact silent failure the typed rejection
+    /// exists to remove. When an entry for the package already exists
+    /// (done, blocked, or escalated), it is refreshed in place instead
+    /// of pushing a duplicate — one entry per package, always.
     ///
     /// In dry-run, the dedup rules are still evaluated and the decision is
     /// printed (would-enqueue / would-skip + reason), but nothing is
@@ -441,13 +450,13 @@ impl Queue {
         entry: QueueEntry,
         dedup: DedupChecks<'_>,
         dry_run: &DryRun,
-    ) -> Option<QueueEntry> {
+    ) -> Result<Option<QueueEntry>, HttpError> {
         if self.in_flight(&entry.package) {
             dry_run.note(&format!(
                 "would-skip {}: task already in flight",
                 entry.package
             ));
-            return None;
+            return Ok(None);
         }
         // An escalated entry is parked: the same update (same upstream
         // version) is not re-run, so the dedup API calls are not made
@@ -465,7 +474,7 @@ impl Queue {
                     "would-skip {}: still escalated ({reason})",
                     entry.package
                 ));
-                return None;
+                return Ok(None);
             }
         }
         if let Some(check) = dedup.devel_version {
@@ -475,7 +484,7 @@ impl Queue {
                         "would-skip {}: devel already has {current}",
                         entry.package
                     ));
-                    return None;
+                    return Ok(None);
                 }
             }
         }
@@ -486,10 +495,17 @@ impl Queue {
                         "would-skip {}: open submit request already targets it",
                         entry.package
                     ));
-                    return None;
+                    return Ok(None);
                 }
                 Ok(false) => {}
                 Err(e) => {
+                    // An auth rejection (rotated or expired OBS
+                    // credentials) is not a per-package skip: it
+                    // would strike every candidate, so propagate it
+                    // and let the caller fail the run loudly.
+                    if e.is_auth_rejected() {
+                        return Err(e);
+                    }
                     // Fail closed: the dedup check could not run (the
                     // OBS search API 401s without credentials).
                     // Queueing anyway would file a duplicate submit
@@ -500,7 +516,7 @@ impl Queue {
                         "warning: open-SR check failed for {}: {e}; skipping (fail-closed)",
                         entry.package
                     );
-                    return None;
+                    return Ok(None);
                 }
             }
         }
@@ -518,7 +534,7 @@ impl Queue {
                 "update {} {} -> {} (source: {}){kind_suffix}",
                 entry.package, entry.factory_version, entry.upstream_version, entry.source
             )) {
-                return None;
+                return Ok(None);
             }
             existing.factory_version = entry.factory_version;
             existing.upstream_version = entry.upstream_version;
@@ -535,16 +551,16 @@ impl Queue {
             existing.escalated_at = None;
             existing.status = "pending".to_string();
             existing.updated_at = now_iso();
-            return Some(existing.clone());
+            return Ok(Some(existing.clone()));
         }
         if !dry_run.allow(&format!(
             "enqueue {} {} -> {} (source: {}){kind_suffix}",
             entry.package, entry.factory_version, entry.upstream_version, entry.source
         )) {
-            return None;
+            return Ok(None);
         }
         self.entries.push(entry.clone());
-        Some(entry)
+        Ok(Some(entry))
     }
 
     /// Entries awaiting dispatch, in queue order — security (CVE-driven)
@@ -729,6 +745,7 @@ mod tests {
                 DedupChecks::none(),
                 &live(),
             )
+            .unwrap()
             .unwrap();
         assert_eq!(entry.package, "foo");
         assert_eq!(entry.status, "pending");
@@ -766,6 +783,7 @@ mod tests {
                 DedupChecks::none(),
                 &live()
             )
+            .unwrap()
             .is_none());
         let _ = fs::remove_file(&path);
     }
@@ -801,6 +819,7 @@ mod tests {
                 DedupChecks::none(),
                 &live()
             )
+            .unwrap()
             .is_some());
         let _ = fs::remove_file(&path);
     }
@@ -826,6 +845,7 @@ mod tests {
                 },
                 &live()
             )
+            .unwrap()
             .is_none());
         let devel_newer = |_pkg: &str| Some("2.1".to_string());
         assert!(q
@@ -844,6 +864,7 @@ mod tests {
                 },
                 &live(),
             )
+            .unwrap()
             .is_none());
         let _ = fs::remove_file(&path);
     }
@@ -869,6 +890,7 @@ mod tests {
                 },
                 &live()
             )
+            .unwrap()
             .is_some());
         let _ = fs::remove_file(&path);
     }
@@ -894,6 +916,7 @@ mod tests {
                 },
                 &live()
             )
+            .unwrap()
             .is_some());
         let _ = fs::remove_file(&path);
     }
@@ -919,6 +942,7 @@ mod tests {
                 },
                 &live()
             )
+            .unwrap()
             .is_none());
         let _ = fs::remove_file(&path);
     }
@@ -944,6 +968,7 @@ mod tests {
                 },
                 &live()
             )
+            .unwrap()
             .is_some());
         let _ = fs::remove_file(&path);
     }
@@ -1084,6 +1109,7 @@ mod tests {
                 DedupChecks::none(),
                 &dry_run
             )
+            .unwrap()
             .is_none());
         assert!(q.entries().is_empty());
         assert_eq!(
@@ -1108,6 +1134,7 @@ mod tests {
                 },
                 &dry_run
             )
+            .unwrap()
             .is_none());
         assert_eq!(
             dry_run.plan()[1],
@@ -1131,6 +1158,7 @@ mod tests {
                 },
                 &dry_run
             )
+            .unwrap()
             .is_none());
         assert_eq!(
             dry_run.plan()[2],
@@ -1213,6 +1241,7 @@ mod tests {
                 DedupChecks::none(),
                 &live_run,
             )
+            .unwrap()
             .unwrap();
         assert_eq!(entry.source, "repology");
         q.save(&live_run).unwrap();
@@ -1243,6 +1272,7 @@ mod tests {
                 DedupChecks::none(),
                 &live_run,
             )
+            .unwrap()
             .unwrap();
         assert_eq!(entry.target, Target::Factory);
         assert_eq!(entry.kind, UpdateKind::Security);
@@ -1309,6 +1339,7 @@ mod tests {
                 DedupChecks::none(),
                 &dry_run
             )
+            .unwrap()
             .is_none());
         assert_eq!(
             dry_run.plan(),
@@ -1353,6 +1384,7 @@ mod tests {
                 DedupChecks::none(),
                 &live_run,
             )
+            .unwrap()
             .unwrap();
         assert_eq!(entry.upstream_version, "2.1");
         assert_eq!(entry.status, "pending");
@@ -1393,8 +1425,8 @@ mod tests {
         // rather than queued on an unchecked dedup.
         let path = tmp_path();
         let mut q = Queue::open(&path).unwrap();
-        let has_sr = |_pkg: &str| -> Result<bool, QueueError> {
-            Err(QueueError("open-SR check failed".to_string()))
+        let has_sr = |_pkg: &str| -> Result<bool, HttpError> {
+            Err(HttpError::Other("open-SR check failed".to_string()))
         };
         assert!(q
             .add(
@@ -1412,7 +1444,43 @@ mod tests {
                 },
                 &live()
             )
+            .unwrap()
             .is_none());
+        assert!(q.entries().is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_sr_check_auth_rejection_fails_add() {
+        // An auth rejection from the open-SR check (rotated or expired
+        // OBS credentials) propagates out of `add` as an error instead
+        // of a per-package skip: with bad credentials every candidate
+        // would be skipped one by one and the run would exit 0 with an
+        // empty batch. A non-auth failure stays fail-closed (see
+        // `open_sr_check_error_is_fail_closed`).
+        let path = tmp_path();
+        let mut q = Queue::open(&path).unwrap();
+        let has_sr = |_pkg: &str| -> Result<bool, HttpError> {
+            Err(HttpError::AuthRejected("http status: 401".to_string()))
+        };
+        let err = q
+            .add(
+                QueueEntry::new(
+                    "foo",
+                    "1.9",
+                    "2.0",
+                    "repology",
+                    &Target::Factory,
+                    UpdateKind::Routine,
+                ),
+                DedupChecks {
+                    devel_version: None,
+                    has_open_sr: Some(&has_sr),
+                },
+                &live(),
+            )
+            .unwrap_err();
+        assert!(err.is_auth_rejected());
         assert!(q.entries().is_empty());
         let _ = fs::remove_file(&path);
     }
@@ -1450,6 +1518,7 @@ mod tests {
                 DedupChecks::none(),
                 &dry_run
             )
+            .unwrap()
             .is_none());
         assert_eq!(q.find("foo").unwrap().upstream_version, "2.0");
         assert_eq!(q.find("foo").unwrap().status, "done");
@@ -1755,6 +1824,7 @@ mod tests {
                 DedupChecks::none(),
                 &live(),
             )
+            .unwrap()
             .unwrap();
         assert_eq!(refreshed.status, "pending");
         assert_eq!(refreshed.sr_id, None);
@@ -1832,7 +1902,7 @@ mod tests {
             called.set(true);
             Some("1.9".to_string())
         };
-        let has_open_sr = |_pkg: &str| -> Result<bool, QueueError> {
+        let has_open_sr = |_pkg: &str| -> Result<bool, HttpError> {
             called.set(true);
             Ok(false)
         };
@@ -1852,6 +1922,7 @@ mod tests {
                 },
                 &live(),
             )
+            .unwrap()
             .is_none());
         assert!(!called.get());
         let entry = q.find("foo").unwrap();
@@ -1894,6 +1965,7 @@ mod tests {
                 DedupChecks::none(),
                 &live(),
             )
+            .unwrap()
             .unwrap();
         assert_eq!(refreshed.status, "pending");
         assert_eq!(refreshed.escalation_reason, None);

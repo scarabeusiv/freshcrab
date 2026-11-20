@@ -35,6 +35,7 @@
 
 use crate::cve::{changelog_names_cve, CveId};
 use crate::dry_run::DryRun;
+use crate::http::HttpError;
 use crate::obs::{ObsClient, ObsCredentials};
 use crate::queue::{QueueEntry, UpdateKind};
 use crate::sr::{SrError, SrFiling, SrPayload};
@@ -147,6 +148,17 @@ impl UpdateExecutor for DryRunExecutor {
     }
 }
 
+/// Map an OBS-call failure to the outcome: an auth rejection is a
+/// run-level failure ([`WorkerOutcome::AuthRejected`]), anything else
+/// escalates the package.
+fn obs_failure(e: &HttpError, reason: String) -> WorkerOutcome {
+    if e.is_auth_rejected() {
+        WorkerOutcome::AuthRejected { reason }
+    } else {
+        WorkerOutcome::Escalated { reason }
+    }
+}
+
 /// The outcome of driving one queue entry through the worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerOutcome {
@@ -169,6 +181,12 @@ pub enum WorkerOutcome {
     /// invalid, or live mode has no live executor). Escalate with the
     /// reason.
     Escalated { reason: String },
+    /// The OBS API rejected the credentials (401/403) on a check or on
+    /// filing. This is a run-level failure — bad or rotated
+    /// credentials — not a per-package problem: the dispatcher stops
+    /// the batch and fails the run loudly instead of escalating
+    /// package by package. The entry stays pending for the next run.
+    AuthRejected { reason: String },
     /// Live: the SR was filed. Carries the OBS request id.
     Filed { sr_id: String, plan: UpdatePlan },
 }
@@ -222,9 +240,10 @@ impl<'a> Worker<'a> {
             Ok(Some(project)) => project,
             Ok(None) => return WorkerOutcome::NoDevelProject,
             Err(e) => {
-                return WorkerOutcome::Escalated {
-                    reason: format!("devel project lookup failed for {}: {e}", entry.package),
-                };
+                return obs_failure(
+                    &e,
+                    format!("devel project lookup failed for {}: {e}", entry.package),
+                );
             }
         };
         // 2. Dedup re-check: the devel project may already have the new
@@ -241,9 +260,10 @@ impl<'a> Worker<'a> {
             }
             Ok(None) => {}
             Err(e) => {
-                return WorkerOutcome::Escalated {
-                    reason: format!("devel version check failed for {}: {e}", entry.package),
-                };
+                return obs_failure(
+                    &e,
+                    format!("devel version check failed for {}: {e}", entry.package),
+                );
             }
         }
         // 3. Dedup re-check: an open SR may already target the package.
@@ -255,9 +275,10 @@ impl<'a> Worker<'a> {
             }
             Ok(false) => {}
             Err(e) => {
-                return WorkerOutcome::Escalated {
-                    reason: format!("open-SR check failed for {}: {e}", entry.package),
-                };
+                return obs_failure(
+                    &e,
+                    format!("open-SR check failed for {}: {e}", entry.package),
+                );
             }
         }
         // 4. Resolve the branch project (may be None; see the field docs).
@@ -279,7 +300,9 @@ impl<'a> Worker<'a> {
             Ok(payload) => Some(payload),
             Err(e) => {
                 if self.dry_run.live() {
-                    return WorkerOutcome::Escalated { reason: e.0 };
+                    return WorkerOutcome::Escalated {
+                        reason: e.message().to_string(),
+                    };
                 }
                 self.dry_run
                     .note(&format!("SR payload not built for {}: {e}", entry.package));
@@ -315,8 +338,11 @@ impl<'a> Worker<'a> {
                         plan,
                         payload: Some(payload),
                     },
-                    Err(SrError(e)) => WorkerOutcome::Escalated {
-                        reason: format!("SR filing failed: {e}"),
+                    Err(SrError::AuthRejected(reason)) => WorkerOutcome::AuthRejected {
+                        reason: format!("SR filing failed: {reason}"),
+                    },
+                    Err(SrError::Other(reason)) => WorkerOutcome::Escalated {
+                        reason: format!("SR filing failed: {reason}"),
                     },
                 }
             }
@@ -662,6 +688,94 @@ mod tests {
             worker.run(&entry("foo")),
             WorkerOutcome::Skipped { .. }
         ));
+    }
+
+    #[test]
+    fn run_auth_rejected_on_open_sr_check() {
+        // The OBS search API 401s (rotated credentials): the worker
+        // reports AuthRejected — a run-level failure — not an
+        // escalation of the package.
+        let dry = DryRun::new(true);
+        let http = FakeHttpClient::new()
+            .with(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
+                "<directory name=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\"/></directory>",
+            )
+            .with(
+                "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
+                "Name: foo\nVersion: 1.9\n",
+            )
+            .with_status(&search_url("foo").unwrap(), 401, "unauthorized");
+        let obs = ObsClient::with_credentials(
+            &http,
+            ObsCredentials {
+                username: "scarabeus_iv".to_string(),
+                password: "secret".to_string(),
+            },
+        );
+        let executor = DryRunExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        assert!(matches!(
+            worker.run(&entry("foo")),
+            WorkerOutcome::AuthRejected { .. }
+        ));
+    }
+
+    #[test]
+    fn run_transport_error_on_open_sr_check_escalates() {
+        // A non-auth failure (no canned search response = transport
+        // error) still escalates the package; only auth rejection is
+        // run-level.
+        let dry = DryRun::new(true);
+        let http = FakeHttpClient::new()
+            .with(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
+                "<directory name=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\"/></directory>",
+            )
+            .with(
+                "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
+                "Name: foo\nVersion: 1.9\n",
+            );
+        let obs = ObsClient::new(&http);
+        let executor = DryRunExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        assert!(matches!(
+            worker.run(&entry("foo")),
+            WorkerOutcome::Escalated { .. }
+        ));
+    }
+
+    #[test]
+    fn run_auth_rejected_on_filing() {
+        // The filing POST 401s (rotated credentials): the worker
+        // reports AuthRejected, not an escalation of the package.
+        struct CompletedExecutor;
+        impl UpdateExecutor for CompletedExecutor {
+            fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
+                Ok(Execution::Completed)
+            }
+        }
+        let dry = DryRun::new(false);
+        let http = http_for_foo("1.9", 0).with_post_status(
+            "https://api.opensuse.org/request?cmd=create",
+            401,
+            "unauthorized",
+        );
+        let obs = ObsClient::with_credentials(
+            &http,
+            ObsCredentials {
+                username: "scarabeus_iv".to_string(),
+                password: "secret".to_string(),
+            },
+        );
+        let executor = CompletedExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        assert!(matches!(
+            worker.run(&entry("foo")),
+            WorkerOutcome::AuthRejected { .. }
+        ));
+        // The POST was attempted (and rejected); nothing was filed.
+        assert_eq!(http.posted().len(), 1);
     }
 
     #[test]
