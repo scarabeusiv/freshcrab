@@ -188,6 +188,16 @@ impl<'a> Dispatcher<'a> {
                         sr_id: None,
                     });
                 }
+                WorkerOutcome::NotMaintained { reason } => {
+                    queue.escalate(&entry.package, &reason, self.dry_run)?;
+                    report.escalated += 1;
+                    report.outcomes.push(DispatchEntryOutcome {
+                        package: entry.package.clone(),
+                        outcome: "escalated".to_string(),
+                        reason,
+                        sr_id: None,
+                    });
+                }
                 WorkerOutcome::Planned { .. } => {
                     // Dry-run: the plan (and the SR payload, when
                     // built) was logged; the entry stays pending — a
@@ -1005,6 +1015,73 @@ mod tests {
         assert_eq!(report.dispatched, 1);
         assert_eq!(report.escalated, 1);
         assert_eq!(queue.find("föö").unwrap().status, "escalated");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    /// The maintained-instances listing POST URL for `foo` (same
+    /// shape as the worker tests: the branch command with the
+    /// maintained attributes and `dryrun=1`).
+    fn maintained_instances_url() -> String {
+        let query = [
+            ("cmd", "branch"),
+            ("attribute", "OBS:Maintained"),
+            ("update_project_attribute", "OBS:UpdateProject"),
+            ("package", "foo"),
+            ("dryrun", "1"),
+        ];
+        let mut url = "https://api.opensuse.org/source?".to_string();
+        for (i, (name, value)) in query.iter().enumerate() {
+            if i > 0 {
+                url.push('&');
+            }
+            url.push_str(&geectl::url::encode_query_value(name));
+            url.push('=');
+            url.push_str(&geectl::url::encode_query_value(value));
+        }
+        url
+    }
+
+    #[test]
+    fn dispatch_maintenance_not_maintained_escalates() {
+        let path = tmp_path();
+        let mut queue = Queue::open(&path).unwrap();
+        let live = DryRun::new(false);
+        let leap = QueueEntry::new(
+            "foo",
+            "1.9",
+            "2.0",
+            "repology",
+            &Target::Leap {
+                version: "15.6".to_string(),
+            },
+            UpdateKind::Security,
+        )
+        .with_cves(vec!["CVE-2026-12345".to_string()]);
+        queue.add(leap, DedupChecks::none(), &live).unwrap();
+        queue.save(&live).unwrap();
+        drop(queue);
+
+        // The package is maintained nowhere: the worker reports
+        // NotMaintained and the dispatcher escalates the entry.
+        let mut queue = Queue::open(&path).unwrap();
+        let dry = DryRun::new(true);
+        let http = FakeHttpClient::new()
+            .with_post(&maintained_instances_url(), "<collection></collection>");
+        let obs = obs_with_creds(&http);
+        let executor = DryRunExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let cfg = config(4, 20);
+        let dispatcher = Dispatcher::new(&worker, &cfg, &dry);
+        let report = dispatcher.dispatch(&mut queue).unwrap();
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(report.escalated, 1);
+        assert_eq!(report.outcomes[0].outcome, "escalated");
+        assert!(report.outcomes[0]
+            .reason
+            .contains("no maintained instance for foo on leap-15.6"));
+        // Dry-run changed no queue state: the entry is still pending.
+        assert_eq!(queue.find("foo").unwrap().status, "pending");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }
