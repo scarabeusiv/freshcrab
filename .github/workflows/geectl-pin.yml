@@ -8,8 +8,8 @@
 # when a newer geectl tag exists, so the pin is bumped in a reviewed
 # PR (change the rev in Cargo.toml, the tag in the Cargo.toml comment
 # and the deny.toml comment, then `cargo update -p geectl`). When it
-# fails, bump: take the newest tag's SHA (`gh api
-# repos/scarabeusiv/geectl/tags --jq '.[0]'`) and update the rev pin.
+# fails, bump: take the newest bare semver tag's SHA (see the tag
+# selection below) and update the rev pin.
 name: geectl-pin
 
 on:
@@ -58,10 +58,22 @@ jobs:
           fi
           echo "pinned geectl rev ${pinned} (committed ${commit_date})"
           # The newest geectl release tag must be the pinned one: a
-          # newer tag means a newer release exists to bump to.
-          tags_json=$(gh api "repos/scarabeusiv/geectl/tags?per_page=1")
-          latest_tag=$(printf '%s' "${tags_json}" | jq -r '.[0].name')
-          latest_sha=$(printf '%s' "${tags_json}" | jq -r '.[0].commit.sha')
+          # newer tag means a newer release exists to bump to. The
+          # tags endpoint does not order contractually, so fetch a
+          # full page and pick the newest bare semver tag
+          # (vMAJOR.MINOR.PATCH, no prereleases) by version sort
+          # instead of trusting the first entry.
+          tags_json=$(gh api "repos/scarabeusiv/geectl/tags?per_page=100")
+          latest_tag=$(printf '%s' "${tags_json}" | jq -r '.[].name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+          if [ -z "${latest_tag}" ]; then
+            echo "no bare semver geectl tag found" >&2
+            exit 1
+          fi
+          latest_sha=$(printf '%s' "${tags_json}" | jq -r --arg tag "${latest_tag}" '.[] | select(.name == $tag) | .commit.sha')
+          if [ -z "${latest_sha}" ]; then
+            echo "could not read commit sha for geectl tag ${latest_tag}" >&2
+            exit 1
+          fi
           if [ "${latest_sha}" != "${pinned}" ]; then
             echo "geectl has a newer release ${latest_tag} (${latest_sha}); bump the rev pin in Cargo.toml (and the tag in its comment) in a reviewed PR" >&2
             exit 1
