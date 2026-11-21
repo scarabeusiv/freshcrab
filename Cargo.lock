@@ -188,11 +188,13 @@ dependencies = [
 
 [[package]]
 name = "geectl"
-version = "0.1.0"
-source = "git+https://github.com/scarabeusiv/geectl?rev=bda5911a1e466aa7f71d49cad97f83b7d5182bd4#bda5911a1e466aa7f71d49cad97f83b7d5182bd4"
+version = "0.2.0"
+source = "git+https://github.com/scarabeusiv/geectl?rev=d8c314016fe125f94e7bc940427f84e97759f0df#d8c314016fe125f94e7bc940427f84e97759f0df"
 dependencies = [
  "base64",
  "clap",
+ "libc",
+ "log",
  "serde",
  "serde_json",
  "toml",

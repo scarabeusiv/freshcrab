@@ -31,15 +31,16 @@ fs2 = "0.4"
 # Base64 for the HTTP Basic auth header. Already a transitive
 # dependency via ureq (same version), so this adds no new crate.
 base64 = "0.23"
-# The OBS library: the devel lookup, the open-SR check, and SR filing
-# all come from geectl now; the local OBS client is deleted. Pinned to
-# the v0.1.0 tag's reviewed rev (bda5911, tagged 2026-11-20) — a tag
+# The OBS library: the Factory reads, the devel lookup, the open-SR
+# check, and SR filing all come from geectl now; the local OBS client
+# is deleted. Pinned to
+# the v0.2.0 tag's reviewed rev (d8c3140, tagged 2026-11-21) — a tag
 # is mutable, so a tag pin would let `cargo update -p geectl`
 # silently advance the dependency; a rev pin cannot move. Bump by
 # changing the rev (and the tag in this comment) in a reviewed PR;
 # .github/workflows/geectl-pin.yml fails loudly when a newer geectl
 # release exists.
-geectl = { git = "https://github.com/scarabeusiv/geectl", rev = "bda5911a1e466aa7f71d49cad97f83b7d5182bd4" }
+geectl = { git = "https://github.com/scarabeusiv/geectl", rev = "d8c314016fe125f94e7bc940427f84e97759f0df" }
 
 [lints.rust]
 unsafe_code = "forbid"
