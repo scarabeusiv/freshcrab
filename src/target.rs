@@ -58,6 +58,23 @@ impl Target {
     pub fn is_leap(&self) -> bool {
         matches!(self, Target::Leap { .. })
     }
+
+    /// The maintenance update project this Leap release publishes
+    /// into, when it is known. Only `15.6` is verified
+    /// (`openSUSE:Leap:15.6:Update` exists); other releases resolve
+    /// their release project server-side from the source package's
+    /// link target when the incident omits it (see
+    /// `docs/leap-and-cve.md`: `openSUSE:Leap:16.0:Update` does not
+    /// exist). Factory has no update project.
+    pub fn update_project(&self) -> Option<String> {
+        match self {
+            Target::Factory => None,
+            Target::Leap { version } if version == "15.6" => {
+                Some("openSUSE:Leap:15.6:Update".to_string())
+            }
+            Target::Leap { .. } => None,
+        }
+    }
 }
 
 /// A Leap release number: `major.minor`, e.g. `"16.0"`, `"15.6"`.
@@ -165,6 +182,29 @@ mod tests {
             }
             .obs_project(),
             "openSUSE:Leap:16.0"
+        );
+    }
+
+    #[test]
+    fn update_project() {
+        assert_eq!(Target::Factory.update_project(), None);
+        assert_eq!(
+            Target::Leap {
+                version: "15.6".to_string()
+            }
+            .update_project()
+            .as_deref(),
+            Some("openSUSE:Leap:15.6:Update")
+        );
+        // 16.0 has no `:Update` project (see docs/leap-and-cve.md):
+        // the incident omits the release project and the server
+        // resolves it from the link target.
+        assert_eq!(
+            Target::Leap {
+                version: "16.0".to_string()
+            }
+            .update_project(),
+            None
         );
     }
 
