@@ -128,6 +128,13 @@ pub trait UpdateExecutor {
     /// in dry-run (steps logged, nothing executed) or
     /// [`Execution::Completed`] in live mode when the update is really
     /// done. Err when the update cannot be performed (with the reason).
+    ///
+    /// Branching is the first step, and it differs by target: a
+    /// Factory plan branches from its devel project; a Leap plan
+    /// branches with `ObsClient::maintenance_branch` into
+    /// `plan.branch_project` (the server-derived maintenance branch)
+    /// — never a plain branch, and never from a devel project, which
+    /// a Leap plan does not have.
     fn execute(&self, plan: &UpdatePlan, dry_run: &DryRun) -> Result<Execution, String>;
 }
 
@@ -157,11 +164,12 @@ impl UpdateExecutor for DryRunExecutor {
             // its branch is the server-derived maintenance branch
             // (from the maintained project, not a devel project).
             Target::Leap { .. } => {
+                // The branch source is the maintained project (the
+                // update project), which the plan does not carry —
+                // name the target, not a project, in the note.
                 dry_run.note(&format!(
-                    "would branch maintained {} from {} into {}",
-                    plan.package,
-                    plan.target.obs_project(),
-                    branch
+                    "would branch maintained {} for {} into {}",
+                    plan.package, plan.target, branch
                 ));
                 dry_run.note(&format!(
                     "would apply the Leap update for {} (backport patch + Release bump + one .changes entry)",
@@ -241,12 +249,26 @@ fn filing_failure(e: &GeectlError, what: &str) -> WorkerOutcome {
     }
 }
 
+/// Whether `e` is geectl's open-maintenance-incident dedup refusal
+/// (live filing only): an open incident already targets the same
+/// source package and release project. The kind alone does not
+/// identify it (`InvalidInput` also covers payload validation), so
+/// the message is matched — geectl's wording for this refusal, pinned
+/// by the duplicate test below.
+fn is_open_maintenance_incident_duplicate(e: &GeectlError) -> bool {
+    e.kind() == ErrorKind::InvalidInput
+        && e.to_string()
+            .contains("an open maintenance_incident request already targets")
+}
+
 /// The outcome of driving one queue entry through the worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerOutcome {
     /// The dedup re-check says the update is already handled (the devel
-    /// project already has the version, or an open SR targets the
-    /// package). The SR stays unfiled.
+    /// project already has the version, an open SR targets the
+    /// package, or an open maintenance incident already targets it —
+    /// the incident dedup is geectl's filing-time check). No SR is
+    /// filed and no incident is filed.
     Skipped { reason: String },
     /// No devel project could be resolved for the package. The entry
     /// escalates; filing needs a target.
@@ -463,10 +485,13 @@ impl<'a> Worker<'a> {
     /// devel project, and an open maintenance incident is refused by
     /// geectl's filing-time dedup (`SrFiling::file_maintenance_incident`
     /// in live mode), so there is no worker-side open-incident
-    /// check — geectl exposes none. The branch itself is an executor
-    /// step, as on the Factory path: the plan names the branch
-    /// project the listing reports, and the live executor branches
-    /// into it with `ObsClient::maintenance_branch`.
+    /// check — geectl exposes none. A duplicate found that way is
+    /// already handled, so it maps to `Skipped`, not `Escalated`
+    /// (see `is_open_maintenance_incident_duplicate`). The branch
+    /// itself is an executor step, as on the Factory path: the plan
+    /// names the branch project the listing reports, and the live
+    /// executor creates it with `ObsClient::maintenance_branch`
+    /// before executing the steps (see `UpdateExecutor`).
     fn run_maintenance(&self, entry: &QueueEntry) -> WorkerOutcome {
         // 1. Maintained instances: the read that proves the package
         // is maintained on this target and names the branch project
@@ -483,9 +508,24 @@ impl<'a> Worker<'a> {
                 );
             }
         };
+        // The listing's source project is the maintained project —
+        // the update project (`openSUSE:Leap:15.6:Update`), not the
+        // release project (`openSUSE:Leap:15.6`): maintenance happens
+        // in the update project, the release project is frozen.
+        // Only releases with a known update project resolve (see
+        // `Target::update_project`): 16.0/16.1 have no `:Update`
+        // project (verified live), so they cannot resolve here.
+        let Some(maintained_project) = entry.target.update_project() else {
+            return WorkerOutcome::NotMaintained {
+                reason: format!(
+                    "no maintained instance for {} on {}: {} has no known update project (no :Update project exists; see docs/leap-and-cve.md)",
+                    entry.package, entry.target, entry.target
+                ),
+            };
+        };
         let Some(instance) = instances
             .iter()
-            .find(|i| i.source_project == entry.target.obs_project())
+            .find(|i| i.source_project == maintained_project)
         else {
             return WorkerOutcome::NotMaintained {
                 reason: format!(
@@ -504,13 +544,23 @@ impl<'a> Worker<'a> {
             }
         };
         // 3. Build the incident payload from the plan and the
-        // instance it was built from.
+        // instance it was built from. Mirror the Factory path: in
+        // dry-run a payload that cannot be built is a planned
+        // outcome with a note, not an escalation; in live mode it
+        // escalates (nothing may be filed without a payload).
         let payload = match maintenance_incident_payload_from_plan(&plan, instance) {
-            Ok(payload) => payload,
+            Ok(payload) => Some(payload),
             Err(e) => {
-                return WorkerOutcome::Escalated {
-                    reason: e.to_string(),
-                };
+                if self.dry_run.live() {
+                    return WorkerOutcome::Escalated {
+                        reason: e.to_string(),
+                    };
+                }
+                self.dry_run.note(&format!(
+                    "maintenance incident payload not built for {}: {e}",
+                    entry.package
+                ));
+                None
             }
         };
         // 4. Execute the update steps.
@@ -523,9 +573,20 @@ impl<'a> Worker<'a> {
         match execution {
             Execution::Planned => WorkerOutcome::Planned {
                 plan,
-                payload: Some(FilingPayload::Maintenance(payload)),
+                payload: payload.map(FilingPayload::Maintenance),
             },
             Execution::Completed => {
+                // A payload failure escalates before execution in
+                // live mode (see step 3), so this is unreachable
+                // there; fail closed rather than filing nothing.
+                let Some(payload) = payload else {
+                    return WorkerOutcome::Escalated {
+                        reason: format!(
+                            "maintenance incident payload not built for {}",
+                            entry.package
+                        ),
+                    };
+                };
                 // Live: file the maintenance incident. The filing is
                 // gated by the dry-run guard inside
                 // `SrFiling::file_maintenance_incident`, so this path
@@ -540,7 +601,25 @@ impl<'a> Worker<'a> {
                         plan,
                         payload: Some(FilingPayload::Maintenance(payload)),
                     },
-                    Err(e) => filing_failure(&e, "maintenance incident filing failed"),
+                    Err(e) => {
+                        // An open incident already targets this
+                        // package: the update is already handled
+                        // (this is also the crash-recovery case — an
+                        // incident filed just before a crash). Mark
+                        // it done instead of escalating it into a
+                        // parked entry that would file the same
+                        // incident again.
+                        if is_open_maintenance_incident_duplicate(&e) {
+                            WorkerOutcome::Skipped {
+                                reason: format!(
+                                    "maintenance incident already open for {}: {e}",
+                                    entry.package
+                                ),
+                            }
+                        } else {
+                            filing_failure(&e, "maintenance incident filing failed")
+                        }
+                    }
                 }
             }
         }
@@ -590,7 +669,7 @@ impl<'a> Worker<'a> {
                 entry.package
             )));
         }
-        let changes_entry = changes_entry_for(&entry.upstream_version, &cves);
+        let changes_entry = changes_entry_for(&entry.upstream_version, &cves, &entry.target);
         // The generated entry must name every CVE it claims to fix
         // (defense in depth: the generator above names them, this
         // re-checks the text that would actually be filed).
@@ -688,10 +767,12 @@ fn payload_from_plan(plan: &UpdatePlan) -> Result<SrPayload, GeectlError> {
 /// lands in the branch project. The target is the maintenance
 /// project; the release project is the target's update project when
 /// known (see `Target::update_project`), and otherwise omitted —
-/// the server resolves it from the source package's link target at
-/// filing time. No cleanup opt-in: the incident source is the
-/// maintenance working area, which the maintainer may reuse for the
-/// next incident (geectl's default).
+/// geectl documents the server stores a filing-time-resolved value
+/// when none is filed. What it resolves from for a release with no
+/// `:Update` project is unverified (see `docs/leap-and-cve.md`); no
+/// live release is in that position today. No cleanup opt-in: the
+/// incident source is the maintenance working area, which the
+/// maintainer may reuse for the next incident (geectl's default).
 fn maintenance_incident_payload_from_plan(
     plan: &UpdatePlan,
     instance: &MaintainedInstance,
@@ -717,17 +798,29 @@ fn maintenance_incident_payload_from_plan(
 /// Build the one `.changes` entry for a submission. The entry is dated
 /// now (UTC) and authored with the packager identity. A security entry
 /// names each CVE it fixes; a routine entry is a plain version bump.
-fn changes_entry_for(upstream_version: &str, cves: &[CveId]) -> String {
+/// A Leap entry is a backport, not a version bump: it says so
+/// (Release bump, no version change) and never claims a version bump.
+fn changes_entry_for(upstream_version: &str, cves: &[CveId], target: &Target) -> String {
     let date = format_changes_date(now_epoch_secs());
     let body = if cves.is_empty() {
-        format!("- Update to version {upstream_version}.")
+        match target {
+            Target::Factory => format!("- Update to version {upstream_version}."),
+            Target::Leap { .. } => {
+                "- Backport the upstream fix (Release bump, no version change).".to_string()
+            }
+        }
     } else {
         let list = cves
             .iter()
             .map(|c| c.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        format!("- Update to version {upstream_version} (fixes {list}).")
+        match target {
+            Target::Factory => format!("- Update to version {upstream_version} (fixes {list})."),
+            Target::Leap { .. } => {
+                format!("- Backport the fix for {list} (Release bump, no version change).")
+            }
+        }
     };
     format!(
         "-------------------------------------------------------------------\n{date} - {CHANGELOG_AUTHOR}\n\n{body}\n"
@@ -745,14 +838,16 @@ fn description_for(
     target: &Target,
 ) -> String {
     // The shipped version belongs to the entry's target, not always
-    // to Factory.
-    let ships = match target {
-        Target::Factory => format!("Factory ships {factory_version}"),
-        Target::Leap { version } => format!("Leap {version} ships {factory_version}"),
+    // to Factory — and a Leap update is a backport, not a version
+    // bump, so its description must not claim one.
+    let mut text = match target {
+        Target::Factory => format!(
+            "Update {package} to {upstream_version}\n\nUpstream {upstream_version} is available (confirmed by {source}); Factory ships {factory_version}. Bumps Version and the tarball, one .changes entry."
+        ),
+        Target::Leap { version } => format!(
+            "Backport the fix for {package} to Leap {version} (Release bump, no version change)\n\nUpstream {upstream_version} fixes it (confirmed by {source}); Leap {version} ships {factory_version}."
+        ),
     };
-    let mut text = format!(
-        "Update {package} to {upstream_version}\n\nUpstream {upstream_version} is available (confirmed by {source}); {ships}. Bumps Version and the tarball, one .changes entry."
-    );
     if !cves.is_empty() {
         let list = cves
             .iter()
@@ -1432,22 +1527,34 @@ mod tests {
         )
     }
 
-    /// A maintained-instances listing body for `foo` on the given
-    /// Leap release: one instance, branched from that release's
-    /// project into the server-derived branch project.
-    fn maintained_instances_body(version: &str) -> String {
-        format!(
-            "<collection><package project=\"openSUSE:Leap:{version}\" package=\"foo\"><target project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:{version}:Update\"/></package></collection>"
-        )
+    /// A maintained-instances listing body for `foo`: geectl's
+    /// `dry_run_report()` shape — the source project is the update
+    /// project (`openSUSE:Leap:15.6:Update`), with a second instance
+    /// on 15.5. The target package keeps its dots in the report
+    /// (`foo.openSUSE:Leap:15.6:Update`); the parser turns `:` into
+    /// `_` (`foo.openSUSE_Leap_15.6_Update`).
+    fn maintained_instances_body() -> &'static str {
+        "<collection><package project=\"openSUSE:Leap:15.6:Update\" package=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\" /><target project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.6:Update\" /></package><package project=\"openSUSE:Leap:15.5:Update\" package=\"foo\"><target project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.5:Update\" /></package></collection>"
+    }
+
+    /// The same listing with only the 15.5 instance: `foo` is
+    /// maintained, but not on the entry's 15.6 target.
+    fn maintained_instances_body_15_5_only() -> &'static str {
+        "<collection><package project=\"openSUSE:Leap:15.5:Update\" package=\"foo\"><target project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.5:Update\" /></package></collection>"
+    }
+
+    /// Geectl's verbatim `dry_run_report()` fixture (`obs.rs`): the
+    /// regression test below feeds these exact bytes to the worker so
+    /// the matcher is proven against geectl's own fixture, not only
+    /// against a re-typed copy of it.
+    fn maintained_instances_body_geectl_verbatim() -> &'static str {
+        "<collection><package project=\"openSUSE:Leap:15.6:Update\" package=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\" /><target project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.6:Update\" /></package><package project=\"openSUSE:Leap:15.5:Update\" package=\"foo\"><target project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.5:Update\" /></package></collection>"
     }
 
     /// A canned OBS backend for a Leap `foo`: the maintained-instances
-    /// listing for 15.6.
+    /// listing for 15.6 (plus the 15.5 instance the report carries).
     fn http_for_leap_foo() -> FakeHttpClient {
-        FakeHttpClient::new().with_post(
-            &maintained_instances_url(),
-            &maintained_instances_body("15.6"),
-        )
+        FakeHttpClient::new().with_post(&maintained_instances_url(), maintained_instances_body())
     }
 
     #[test]
@@ -1473,6 +1580,16 @@ mod tests {
         );
         assert!(plan.description.contains("Leap 15.6 ships 1.9"));
         assert!(plan.description.contains("CVE-2026-12345"));
+        // A Leap plan is a backport: its description and .changes
+        // entry must not claim a version bump.
+        assert!(plan
+            .description
+            .contains("Backport the fix for foo to Leap 15.6"));
+        assert!(!plan.description.contains("Bumps Version"));
+        assert!(plan
+            .changes_entry
+            .contains("Backport the fix for CVE-2026-12345"));
+        assert!(!plan.changes_entry.contains("Update to version"));
     }
 
     #[test]
@@ -1508,6 +1625,12 @@ mod tests {
                         // may reuse (geectl's default).
                         assert!(payload.source_update().is_none());
                         assert!(payload.validate_xml().is_ok());
+                        // The filed description is the backport text,
+                        // not a version-bump claim.
+                        assert!(payload
+                            .description()
+                            .contains("Backport the fix for foo to Leap 15.6"));
+                        assert!(!payload.description().contains("Bumps Version"));
                     }
                     other => panic!("expected Maintenance payload, got {other:?}"),
                 }
@@ -1515,7 +1638,7 @@ mod tests {
                 assert!(dry
                     .plan()
                     .iter()
-                    .any(|l| l.contains("would branch maintained foo from openSUSE:Leap:15.6")));
+                    .any(|l| l.contains("would branch maintained foo for leap-15.6")));
             }
             other => panic!("expected Planned, got {other:?}"),
         }
@@ -1600,12 +1723,12 @@ mod tests {
 
     #[test]
     fn run_maintenance_no_instance_for_target_escalates() {
-        // The package is maintained, but only on another release:
-        // no instance matches this entry's target.
+        // The package is maintained, but only on another release
+        // (15.5): no instance matches this entry's 15.6 target.
         let dry = DryRun::new(true);
         let http = FakeHttpClient::new().with_post(
             &maintained_instances_url(),
-            &maintained_instances_body("16.0"),
+            maintained_instances_body_15_5_only(),
         );
         let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
@@ -1617,15 +1740,53 @@ mod tests {
     }
 
     #[test]
-    fn run_maintenance_16_0_omits_release_project() {
-        // 16.0 has no `:Update` project: the incident omits the
-        // release project and the server resolves it from the link
-        // target at filing time.
+    fn maintenance_incident_payload_16_0_omits_release_project() {
+        // 16.0 has no `:Update` project (verified live): the incident
+        // omits the release project. This pins the payload layer
+        // only — discovery never yields a 16.0 instance (see
+        // `run_maintenance_16_0_has_no_known_update_project`), so
+        // the omit path is hypothetical until a 16.x release project
+        // exists; geectl documents the server stores a
+        // filing-time-resolved value when none is filed.
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new().with_post(
-            &maintained_instances_url(),
-            &maintained_instances_body("16.0"),
+        let http = FakeHttpClient::new();
+        let obs = ObsClient::new(&http);
+        let executor = DryRunExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let mut e = leap_entry("foo");
+        e.target = Target::Leap {
+            version: "16.0".to_string(),
+        };
+        let plan = worker
+            .build_plan(
+                &e,
+                None,
+                Some("home:scarabeus_iv:branches:OBS_Maintained:foo".to_string()),
+            )
+            .unwrap();
+        let instance = MaintainedInstance {
+            source_project: "openSUSE:Leap:16.0:Update".to_string(),
+            source_package: "foo".to_string(),
+            devel_project: None,
+            devel_package: None,
+            target_project: "home:scarabeus_iv:branches:OBS_Maintained:foo".to_string(),
+            target_package: "foo.openSUSE_Leap_16.0_Update".to_string(),
+        };
+        let payload = maintenance_incident_payload_from_plan(&plan, &instance).unwrap();
+        assert_eq!(payload.target_releaseproject(), None);
+        assert_eq!(
+            payload.source_packages()[0],
+            "foo.openSUSE_Leap_16.0_Update"
         );
+    }
+
+    #[test]
+    fn run_maintenance_16_0_has_no_known_update_project() {
+        // 16.0 has no `:Update` project, so the worker cannot match
+        // a maintained instance for it — even when the listing
+        // carries instances for other releases.
+        let dry = DryRun::new(true);
+        let http = http_for_leap_foo();
         let obs = obs_with_creds(&http);
         let executor = DryRunExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
@@ -1634,14 +1795,42 @@ mod tests {
             version: "16.0".to_string(),
         };
         match worker.run(&e) {
+            WorkerOutcome::NotMaintained { reason } => {
+                assert!(reason.contains("has no known update project"), "{reason}");
+            }
+            other => panic!("expected NotMaintained, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_maintenance_selects_update_project_from_geectl_fixture() {
+        // Regression: geectl's verbatim `dry_run_report()` bytes —
+        // the source project is the update project, and the worker
+        // must select that instance, not look for the release project.
+        let dry = DryRun::new(true);
+        let http = FakeHttpClient::new().with_post(
+            &maintained_instances_url(),
+            maintained_instances_body_geectl_verbatim(),
+        );
+        let obs = obs_with_creds(&http);
+        let executor = DryRunExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        match worker.run(&leap_entry("foo")) {
             WorkerOutcome::Planned { payload, .. } => {
                 let payload = payload.expect("payload built in dry-run");
                 match &payload {
                     FilingPayload::Maintenance(payload) => {
-                        assert_eq!(payload.target_releaseproject(), None);
+                        assert_eq!(
+                            payload.source_project(),
+                            "home:alice:branches:OBS_Maintained:foo"
+                        );
                         assert_eq!(
                             payload.source_packages()[0],
-                            "foo.openSUSE_Leap_16.0_Update"
+                            "foo.openSUSE_Leap_15.6_Update"
+                        );
+                        assert_eq!(
+                            payload.target_releaseproject(),
+                            Some("openSUSE:Leap:15.6:Update")
                         );
                     }
                     other => panic!("expected Maintenance payload, got {other:?}"),
@@ -1649,6 +1838,120 @@ mod tests {
             }
             other => panic!("expected Planned, got {other:?}"),
         }
+    }
+
+    /// An open incident in the dedup search, releasing to the given
+    /// project (the parser narrows on the target's `releaseproject`).
+    fn open_incident_body(release_project: &str) -> String {
+        format!(
+            "<collection matches=\"1\"><request id=\"1399001\" creator=\"alice\"><action type=\"maintenance_incident\"><source project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE_Leap_15.6_Update\" /><target project=\"openSUSE:Maintenance\" releaseproject=\"{release_project}\" /></action><state name=\"new\" /></request></collection>"
+        )
+    }
+
+    #[test]
+    fn run_maintenance_live_duplicate_incident_skips() {
+        // An open incident already targets this package: the filing
+        // refuses at dedup time, and the worker marks the entry done
+        // (Skipped) instead of escalating it — the incident exists,
+        // and a re-run after a crash must not escalate it either.
+        struct CompletedExecutor;
+        impl UpdateExecutor for CompletedExecutor {
+            fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
+                Ok(Execution::Completed)
+            }
+        }
+        let dry = DryRun::new(false);
+        let http = http_for_leap_foo().with(
+            &maintenance_dedup_url(),
+            &open_incident_body("openSUSE:Leap:15.6:Update"),
+        );
+        let obs = obs_with_creds(&http);
+        let executor = CompletedExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        match worker.run(&leap_entry("foo")) {
+            WorkerOutcome::Skipped { reason } => {
+                assert!(reason.contains("already open"), "{reason}");
+                assert!(reason.contains("1399001"), "{reason}");
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        // No filing POST: the dedup refusal stopped it, after the
+        // one listing POST.
+        assert_eq!(http.posted().len(), 1);
+        assert_eq!(http.posted()[0].0, maintained_instances_url());
+    }
+
+    #[test]
+    fn run_maintenance_live_other_release_project_does_not_block() {
+        // An open incident releasing elsewhere (15.5) is a different
+        // incident: the parser narrows on the release project, so the
+        // 15.6 filing proceeds.
+        struct CompletedExecutor;
+        impl UpdateExecutor for CompletedExecutor {
+            fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
+                Ok(Execution::Completed)
+            }
+        }
+        let dry = DryRun::new(false);
+        let http = http_for_leap_foo()
+            .with(
+                &maintenance_dedup_url(),
+                &open_incident_body("openSUSE:Leap:15.5:Update"),
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create&addrevision=1",
+                "<request id=\"1400002\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = obs_with_creds(&http);
+        let executor = CompletedExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        match worker.run(&leap_entry("foo")) {
+            WorkerOutcome::Filed { sr_id, .. } => assert_eq!(sr_id, "1400002"),
+            other => panic!("expected Filed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_maintenance_dry_run_completed_executor_notes_would_be_incident() {
+        // CompletedExecutor in dry-run mode (mirrors the Factory
+        // test): the worker takes the Completed arm, the filing call
+        // is dry-run guarded, and the would-be incident lines land in
+        // freshcrab's plan — the human-readable record of what would
+        // be filed.
+        struct CompletedExecutor;
+        impl UpdateExecutor for CompletedExecutor {
+            fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
+                Ok(Execution::Completed)
+            }
+        }
+        let dry = DryRun::new(true);
+        let http = http_for_leap_foo();
+        let obs = obs_with_creds(&http);
+        let executor = CompletedExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        match worker.run(&leap_entry("foo")) {
+            WorkerOutcome::Planned { .. } => {}
+            other => panic!("expected Planned, got {other:?}"),
+        }
+        let plan = dry.plan();
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("would: file maintenance incident request for")),
+            "filing line missing from plan: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|l| l.contains(
+                "source: home:scarabeus_iv:branches:OBS_Maintained:foo/foo.openSUSE_Leap_15.6_Update"
+            )),
+            "filing detail missing from plan: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("target: openSUSE:Maintenance")),
+            "filing detail missing from plan: {plan:?}"
+        );
+        // And nothing was posted beyond the listing (dry-run files nothing).
+        assert_eq!(http.posted().len(), 1);
     }
 
     #[test]

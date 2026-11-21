@@ -97,7 +97,9 @@ this: a freshcrab PR adding OBS logic is refused.
    payload is built from the matching instance (source package is
    the branch package name), and the maintenance incident is filed
    to `openSUSE:Maintenance` via geectl — see `docs/leap-and-cve.md`.
-   The executor is the `UpdateExecutor` trait:
+   The live executor creates a Leap branch with
+   `ObsClient::maintenance_branch`, never a plain branch (see
+   `UpdateExecutor`). The executor is the `UpdateExecutor` trait:
    only the `DryRunExecutor` is shipped (dry-run: logs the
    would-do steps and returns `Planned`; live: refuses, so an SR is filed
    only on a plan that was executed). The live executor — the agent/CI step
@@ -186,13 +188,13 @@ Leap entries is implemented (`Worker::run_maintenance`); what is
 still missing is the Leap watcher that produces Leap entries, so
 `leap-*` targets remain refused at startup (`main.rs`).
 
-- **Targets** (`src/target.rs`): a `Target` is `Factory` or
+ - **Targets** (`src/target.rs`): a `Target` is `Factory` or
   `Leap { version }`, with the OBS project, the update project
-  (`15.6` → `openSUSE:Leap:15.6:Update`; other releases resolve
-  server-side), and an implemented/not-yet-implemented gate. Config
-  has a `targets:` list (default `[factory]`); a Leap target parses
-  but the pipeline refuses to run it. Queue entries carry their
-  target.
+  (`15.6` → `openSUSE:Leap:15.6:Update`; 16.0/16.1 have no `:Update`
+  project — Leap 16.x is Git-tracked, see `docs/leap-and-cve.md`),
+  and an implemented/not-yet-implemented gate. Config has a
+  `targets:` list (default `[factory]`); a Leap target parses but
+  the pipeline refuses to run it. Queue entries carry their target.
 - **CVE validation** (`src/cve.rs`): the rule is that a security
   fix's changelog (`.changes`) entry must carry the CVE reference,
   and validation compares the changelog against the CVE list. The

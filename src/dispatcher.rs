@@ -29,10 +29,12 @@
 //! only matches `pending`) are reset to `pending` at the start of every
 //! run. The dispatcher does not pre-mark an entry before the worker runs:
 //! a crash during the worker leaves the entry `pending`, so the next run
-//! retries it, and the worker's dedup re-check (open SR) is the backstop
-//! against filing twice. A filed SR is saved to the queue file immediately
-//! after `mark_filed`, not only at the end of the batch, so a crash cannot
-//! lose the filed id.
+//! retries it, and the worker's dedup re-check (open SR, Factory) is the backstop
+//! against filing twice. For maintenance entries there is no worker-side
+//! re-check: a duplicate is found at filing time and maps to `Skipped`
+//! (already handled), which is the same backstop one step later. A filed SR
+//! is saved to the queue file immediately after `mark_filed`, not only
+//! at the end of the batch, so a crash cannot lose the filed id.
 //!
 //! TOCTOU: the dedup re-check and the filing POST are two separate OBS
 //! calls — OBS has no conditional create — so a submit request filed by
@@ -71,7 +73,8 @@ pub struct DispatchEntryOutcome {
 pub struct DispatchReport {
     /// Entries handed to the worker.
     pub dispatched: usize,
-    /// Entries whose SR was filed.
+    /// Entries whose request was filed (submit request or
+    /// maintenance incident).
     pub filed: usize,
     /// Entries planned in dry-run (nothing filed, nothing changed).
     pub planned: usize,
@@ -112,8 +115,10 @@ impl<'a> Dispatcher<'a> {
     /// nothing on disk). A failed save is an error: after a live filing
     /// the filed SR id lives only in the queue file, so losing it would
     /// leave the entry pending — the next run would file again (the
-    /// open-SR dedup re-check is the backstop, but a silent success here
-    /// would hide the loss). An OBS auth rejection (401/403) also fails
+    /// Factory open-SR dedup re-check is the backstop, and a
+    /// maintenance duplicate maps to `Skipped` at filing time, but a
+    /// silent success here would hide the loss). An OBS auth rejection
+    /// (401/403) also fails
     /// the run loudly: the batch stops at once and the error propagates
     /// instead of a report, so bad or rotated credentials yield one
     /// loud signal rather than one escalation per package.
@@ -237,19 +242,24 @@ impl<'a> Dispatcher<'a> {
                         "OBS authentication rejected ({reason}); stopping dispatch — check OSC_USERNAME/OSC_PASSWORD"
                     )));
                 }
-                WorkerOutcome::Filed { sr_id, .. } => {
-                    // Record the filed SR on the entry (status done)
-                    // and consume one cap. The save is immediate, not
-                    // only at the end of the batch: a crash after the
-                    // POST must not lose the filed id.
+                WorkerOutcome::Filed { sr_id, plan } => {
+                    // Record the filed request on the entry (status
+                    // done) and consume one cap. The save is
+                    // immediate, not only at the end of the batch: a
+                    // crash after the POST must not lose the filed id.
                     queue.mark_filed(&entry.package, &sr_id, self.dry_run)?;
                     queue.save(self.dry_run)?;
                     remaining_cap = remaining_cap.saturating_sub(1);
                     report.filed += 1;
+                    let reason = if plan.target.is_leap() {
+                        format!("maintenance incident {sr_id} filed")
+                    } else {
+                        format!("submit request {sr_id} filed")
+                    };
                     report.outcomes.push(DispatchEntryOutcome {
                         package: entry.package.clone(),
                         outcome: "filed".to_string(),
-                        reason: format!("submit request {sr_id} filed"),
+                        reason,
                         sr_id: Some(sr_id),
                     });
                 }
@@ -1082,6 +1092,122 @@ mod tests {
             .contains("no maintained instance for foo on leap-15.6"));
         // Dry-run changed no queue state: the entry is still pending.
         assert_eq!(queue.find("foo").unwrap().status, "pending");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    /// The open-incident dedup search URL for the maintenance filing
+    /// (same shape as the worker tests).
+    fn maintenance_dedup_url() -> String {
+        let match_expr = "(state/@name='new' or state/@name='review') and action/@type='maintenance_incident' and action[source/@package='foo.openSUSE_Leap_15.6_Update' and target/@project='openSUSE:Maintenance']";
+        format!(
+            "https://api.opensuse.org/search/request?match={}",
+            geectl::url::encode_query_value(match_expr)
+        )
+    }
+
+    /// A maintained-instances listing body for `foo` (same shape as
+    /// the worker tests: source project is the update project).
+    fn maintained_instances_body() -> &'static str {
+        "<collection><package project=\"openSUSE:Leap:15.6:Update\" package=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\" /><target project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.6:Update\" /></package><package project=\"openSUSE:Leap:15.5:Update\" package=\"foo\"><target project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.5:Update\" /></package></collection>"
+    }
+
+    /// A Leap 15.6 security entry for `foo` (CVE-driven, as the Leap
+    /// watcher will produce; see docs/leap-and-cve.md).
+    fn leap_entry(package: &str) -> QueueEntry {
+        let mut e = QueueEntry::new(
+            package,
+            "1.9",
+            "2.0",
+            "repology",
+            &Target::Leap {
+                version: "15.6".to_string(),
+            },
+            UpdateKind::Security,
+        );
+        e.cves = vec!["CVE-2026-12345".to_string()];
+        e
+    }
+
+    #[test]
+    fn dispatch_live_maintenance_files_incident_and_names_it() {
+        let path = tmp_path();
+        let mut queue = Queue::open(&path).unwrap();
+        let live = DryRun::new(false);
+        queue
+            .add(leap_entry("foo"), DedupChecks::none(), &live)
+            .unwrap();
+        queue.save(&live).unwrap();
+        drop(queue);
+
+        let mut queue = Queue::open(&path).unwrap();
+        let http = FakeHttpClient::new()
+            .with_post(&maintained_instances_url(), maintained_instances_body())
+            .with(
+                &maintenance_dedup_url(),
+                "<collection matches=\"0\"></collection>",
+            )
+            .with_post(
+                "https://api.opensuse.org/request?cmd=create&addrevision=1",
+                "<request id=\"1400002\" creator=\"scarabeus_iv\"></request>",
+            );
+        let obs = obs_with_creds(&http);
+        let executor = CompletedExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let cfg = config(4, 20);
+        let dispatcher = Dispatcher::new(&worker, &cfg, &live);
+        let report = dispatcher.dispatch(&mut queue).unwrap();
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(report.filed, 1);
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(report.outcomes[0].outcome, "filed");
+        assert_eq!(
+            report.outcomes[0].reason,
+            "maintenance incident 1400002 filed"
+        );
+        assert_eq!(report.outcomes[0].sr_id.as_deref(), Some("1400002"));
+        // The filed entry is done with the incident id recorded.
+        assert_eq!(queue.find("foo").unwrap().status, "done");
+        assert_eq!(queue.find("foo").unwrap().sr_id.as_deref(), Some("1400002"));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn dispatch_live_maintenance_not_maintained_persists_escalation() {
+        // Live mode, no maintained instance for the target: the
+        // worker reports NotMaintained and the dispatcher persists
+        // the escalation — the entry is not marked done and carries
+        // no incident id.
+        let path = tmp_path();
+        let mut queue = Queue::open(&path).unwrap();
+        let live = DryRun::new(false);
+        queue
+            .add(leap_entry("foo"), DedupChecks::none(), &live)
+            .unwrap();
+        queue.save(&live).unwrap();
+        drop(queue);
+
+        let mut queue = Queue::open(&path).unwrap();
+        let http = FakeHttpClient::new()
+            .with_post(&maintained_instances_url(), "<collection></collection>");
+        let obs = obs_with_creds(&http);
+        let executor = DryRunExecutor;
+        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let cfg = config(4, 20);
+        let dispatcher = Dispatcher::new(&worker, &cfg, &live);
+        let report = dispatcher.dispatch(&mut queue).unwrap();
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(report.escalated, 1);
+        assert_eq!(report.filed, 0);
+        let found = queue.find("foo").unwrap();
+        assert_eq!(found.status, "escalated");
+        assert_eq!(found.sr_id, None);
+        assert!(found
+            .escalation_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no maintained instance for foo on leap-15.6"));
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }

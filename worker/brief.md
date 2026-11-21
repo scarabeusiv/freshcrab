@@ -97,16 +97,24 @@ mode is the only mode that branches, commits, builds, or files.
 When escalating, report: the package, the version, the exact blocker,
 and the evidence (build log line, rpmcrab finding, or diff hunk).
 
-## Leap (not active yet)
+## Leap (worker filing implemented; watcher still missing)
 
-Leap work is the remaining work (see
-`docs/leap-and-cve.md`). The Leap worker differs from
-the Factory worker above in the *kind* of change, not in the gates:
+The worker's maintenance-incident filing path is implemented
+(`Worker::run_maintenance`); what is still missing is the Leap
+watcher that produces Leap entries, so `leap-*` targets remain
+refused at startup (see `docs/leap-and-cve.md`). The
+Leap worker differs from the Factory worker above in the *kind* of
+change, not in the gates:
 
 - **Backport patch, not version bump.** Apply the upstream fix as a
   patch to the Leap version (bump only the release number). The SR
   goes to the Leap maintenance process (maintenance incident /
   update project for that release), not to the devel project.
+- **Branch via `maintenance_branch`.** The branch step for a Leap
+  plan uses `ObsClient::maintenance_branch` into the branch project
+  the maintained-instances listing reports — never a plain branch,
+  and never from a devel project, which a Leap plan does not have
+  (see `UpdateExecutor`).
 - **The `.changes` entry must name the CVE.** Every security-fix
   changelog entry carries the CVE reference it fixes. This is the
   checkable rule the CVE validator enforces: if the changelog for

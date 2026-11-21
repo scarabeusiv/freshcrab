@@ -9,8 +9,11 @@
 //! the implemented / not-yet-implemented gate.
 //!
 //! Only Factory is implemented. A Leap target parses (so the config
-//! shape is real) but the pipeline refuses to run it — see
-//! `Target::is_implemented`.
+//! shape is real) but the pipeline refuses to run it: the worker's
+//! maintenance-incident filing path is implemented
+//! (`Worker::run_maintenance`), and what is still missing is the Leap
+//! watcher that produces Leap entries — see `Target::is_implemented`
+//! and `docs/leap-and-cve.md`.
 
 use crate::version::is_newer;
 use serde::{Deserialize, Serialize};
@@ -61,11 +64,14 @@ impl Target {
 
     /// The maintenance update project this Leap release publishes
     /// into, when it is known. Only `15.6` is verified
-    /// (`openSUSE:Leap:15.6:Update` exists); other releases resolve
-    /// their release project server-side from the source package's
-    /// link target when the incident omits it (see
-    /// `docs/leap-and-cve.md`: `openSUSE:Leap:16.0:Update` does not
-    /// exist). Factory has no update project.
+    /// (`openSUSE:Leap:15.6:Update` exists); 16.0 and 16.1 have no
+    /// `:Update` project at all (verified live 2026-11-21 — Leap
+    /// 16.x is Git-tracked via scmsync, so the OBS incident model
+    /// here covers the 15.x line). An incident for a release with no
+    /// known update project omits the release project; geectl
+    /// documents the server stores a filing-time-resolved value when
+    /// none is filed (see `docs/leap-and-cve.md`). Factory has no
+    /// update project.
     pub fn update_project(&self) -> Option<String> {
         match self {
             Target::Factory => None,
