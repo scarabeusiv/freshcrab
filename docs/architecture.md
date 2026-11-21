@@ -92,7 +92,12 @@ this: a freshcrab PR adding OBS logic is refused.
    entry must name its CVE), builds the SR payload
    (geectl's `SrPayload` — validated, well-formed OBS request XML), executes
    the update steps through the executor, and files the SR to the devel
-   project via the OBS API. The executor is the `UpdateExecutor` trait:
+   project via the OBS API. A Leap entry takes the maintenance
+   path instead: the maintained instances are listed, the incident
+   payload is built from the matching instance (source package is
+   the branch package name), and the maintenance incident is filed
+   to `openSUSE:Maintenance` via geectl — see `docs/leap-and-cve.md`.
+   The executor is the `UpdateExecutor` trait:
    only the `DryRunExecutor` is shipped (dry-run: logs the
    would-do steps and returns `Planned`; live: refuses, so an SR is filed
    only on a plan that was executed). The live executor — the agent/CI step
@@ -172,17 +177,22 @@ the operation proceeds. The effective mode resolves as CLI flag
 (`--dry-run` / `--live`) > env var (`FRESHCRAB_DRY_RUN`) > config
 (`dry_run`, default `true`) and is logged loudly at startup.
 
-## Leap and CVE validation (planned, scaffolded)
+## Leap and CVE validation (planned, scaffolded; worker filing implemented)
 
 Leap and CVE validation are the remaining work — see
 `docs/leap-and-cve.md` for the full design. The scaffold provides named,
-tested seams:
+tested seams. The worker's maintenance-incident filing path for
+Leap entries is implemented (`Worker::run_maintenance`); what is
+still missing is the Leap watcher that produces Leap entries, so
+`leap-*` targets remain refused at startup (`main.rs`).
 
 - **Targets** (`src/target.rs`): a `Target` is `Factory` or
-  `Leap { version }`, with the OBS project and an
-  implemented/planned gate. Config has a `targets:`
-  list (default `[factory]`); a Leap target parses but the pipeline
-  refuses to run it. Queue entries carry their target.
+  `Leap { version }`, with the OBS project, the update project
+  (`15.6` → `openSUSE:Leap:15.6:Update`; other releases resolve
+  server-side), and an implemented/not-yet-implemented gate. Config
+  has a `targets:` list (default `[factory]`); a Leap target parses
+  but the pipeline refuses to run it. Queue entries carry their
+  target.
 - **CVE validation** (`src/cve.rs`): the rule is that a security
   fix's changelog (`.changes`) entry must carry the CVE reference,
   and validation compares the changelog against the CVE list. The
