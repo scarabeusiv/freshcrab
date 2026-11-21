@@ -1,6 +1,6 @@
 # Monthly re-pin nudge for the geectl rev pin.
 #
-# Cargo.toml pins geectl to a reviewed rev (bda5911, the v0.1.0 tag),
+# Cargo.toml pins geectl to a reviewed rev (d8c3140, the v0.2.0 tag),
 # not to the tag: a tag is mutable, so a tag pin would let a routine
 # `cargo update -p geectl` silently advance the dependency. A rev pin
 # cannot move on its own — but it also cannot signal that a newer

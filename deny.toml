@@ -40,9 +40,10 @@ yanked = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 # The geectl library is the only git source: freshcrab's OBS surface
-# (devel lookup, open-SR check, SR filing) lives in geectl now
+# (Factory reads, devel lookup, open-SR check, SR filing) lives in
+# geectl now
 # (staging step 3 of the migration), pinned to a reviewed rev in
-# Cargo.toml (bda5911, the v0.1.0 tag). A rev pin cannot advance on
+# Cargo.toml (d8c3140, the v0.2.0 tag). A rev pin cannot advance on
 # its own; bumping it is a deliberate PR, and
 # .github/workflows/geectl-pin.yml fails loudly when a newer geectl
 # release exists. No other git source is permitted.
