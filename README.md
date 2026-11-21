@@ -226,15 +226,17 @@ src/
   dry_run.rs           global dry-run mode + the single guard every
                        mutation consults (CLI > env > config)
   collectors/          Repology, Anitya, PyPI, Distrowatch, upstream check
-  factory.rs           Factory version via the OBS API
+  factory.rs           Factory version via geectl's public reads
+                       (`cat` for the spec, `list_packages` for the list)
   target.rs            distribution targets (Factory / Leap) + the
                        per-target update-policy hook
   cve.rs               CVE validation: the changelog-carries-the-CVE rule
                        + the validator interface (not yet implemented)
   watcher.rs           collectors + confirmation + Factory compare
   queue.rs             queue state file, deduplication
-  geectl (dependency)  OBS client for the dedup checks + filing a submit
-                       request (POST /request?cmd=create)
+  geectl (dependency)  OBS client for the Factory reads, the dedup
+                       checks + filing a submit request
+                       (POST /request?cmd=create)
   dispatcher.rs        picks pending entries (security first, concurrency
                        limit, daily SR cap), drives the worker, applies
                        outcomes to the queue, prints the dispatch report
