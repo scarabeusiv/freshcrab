@@ -150,8 +150,45 @@ fn main() -> ExitCode {
         return ExitCode::from(0);
     }
 
+    // The OBS client carries the credentials for the authenticated
+    // endpoints (the open-SR search the dedup checks use, and filing a
+    // submit request). Credentials come from the environment only;
+    // without them those calls fail closed, as before. The OBS client
+    // is geectl's, on its own HTTP client: the freshcrab client keeps
+    // the freshcrab User-Agent the collectors need, and the OBS client
+    // gets geectl's bounded timeouts. It is built before the watcher:
+    // the Factory reads (spec, package list) are geectl public reads
+    // through this same client, so they inherit the same transport:
+    // bounded timeouts with retries, and a 10 MiB body cap (far above
+    // any spec or listing).
+    let geectl_http = match geectl::http::UreqClient::new(geectl::http::Timeout::default()) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("cannot build the OBS HTTP client: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let credentials = match obs_credentials_from_env() {
+        Ok(credentials) => credentials,
+        Err(e) => {
+            eprintln!("invalid OBS credentials (OSC_USERNAME/OSC_PASSWORD): {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let obs = match &credentials {
+        Some(creds) => {
+            match geectl::obs::ObsClient::with_credentials(&geectl_http, creds.clone()) {
+                Ok(obs) => obs,
+                Err(e) => {
+                    eprintln!("cannot build the OBS client: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        None => geectl::obs::ObsClient::new(&geectl_http),
+    };
     let http = UreqClient::new();
-    let factory = FactoryClient::new(&http);
+    let factory = FactoryClient::new(&obs);
     let watcher = Watcher::new(&http, factory, None, &dry_run);
 
     let entries = match &packages {
@@ -210,39 +247,6 @@ fn main() -> ExitCode {
             eprintln!("{e}");
             return ExitCode::from(1);
         }
-    };
-    // The OBS client carries the credentials for the authenticated
-    // endpoints (the open-SR search the dedup checks use, and filing a
-    // submit request). Credentials come from the environment only;
-    // without them those calls fail closed, as before. The OBS client
-    // is geectl's, on its own HTTP client: the freshcrab client keeps
-    // the freshcrab User-Agent the collectors need, and the OBS client
-    // gets geectl's bounded timeouts.
-    let geectl_http = match geectl::http::UreqClient::new(geectl::http::Timeout::default()) {
-        Ok(client) => client,
-        Err(e) => {
-            eprintln!("cannot build the OBS HTTP client: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let credentials = match obs_credentials_from_env() {
-        Ok(credentials) => credentials,
-        Err(e) => {
-            eprintln!("invalid OBS credentials (OSC_USERNAME/OSC_PASSWORD): {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let obs = match &credentials {
-        Some(creds) => {
-            match geectl::obs::ObsClient::with_credentials(&geectl_http, creds.clone()) {
-                Ok(obs) => obs,
-                Err(e) => {
-                    eprintln!("cannot build the OBS client: {e}");
-                    return ExitCode::from(1);
-                }
-            }
-        }
-        None => geectl::obs::ObsClient::new(&geectl_http),
     };
     for entry in &entries {
         let package = entry.package.as_str();

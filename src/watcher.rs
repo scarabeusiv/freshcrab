@@ -21,6 +21,7 @@ use crate::factory::FactoryClient;
 use crate::http::{HttpClient, HttpError};
 use crate::queue::UpdateKind;
 use crate::target::{FactoryPolicy, Target, UpdatePolicy};
+use geectl::error::GeectlError;
 use serde::Serialize;
 use std::fmt;
 
@@ -31,8 +32,10 @@ use std::fmt;
 /// returning it as one hid that distinction from the caller.
 #[derive(Debug)]
 pub enum WatchError {
-    /// An HTTP request failed (collector, Factory, or OBS read).
+    /// An HTTP request failed (collector or upstream read).
     Http(HttpError),
+    /// A geectl OBS read failed (the Factory spec or package list).
+    Obs(GeectlError),
     /// The target is not implemented yet (Leap): the check is refused
     /// before any network I/O. The Leap step consults the CVE
     /// validator here (see `docs/leap-and-cve.md`).
@@ -43,6 +46,7 @@ impl fmt::Display for WatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WatchError::Http(e) => write!(f, "{e}"),
+            WatchError::Obs(e) => write!(f, "{e}"),
             WatchError::LeapNotImplemented => write!(
                 f,
                 "Leap targets are not implemented yet (see docs/leap-and-cve.md)"
@@ -53,9 +57,9 @@ impl fmt::Display for WatchError {
 
 impl std::error::Error for WatchError {}
 
-impl From<HttpError> for WatchError {
-    fn from(e: HttpError) -> Self {
-        WatchError::Http(e)
+impl From<GeectlError> for WatchError {
+    fn from(e: GeectlError) -> Self {
+        WatchError::Obs(e)
     }
 }
 
@@ -276,10 +280,11 @@ mod tests {
     use crate::http::FakeHttpClient;
 
     fn watcher_with_http(
-        http: &'static dyn HttpClient,
+        http: &'static FakeHttpClient,
         dry_run: &'static DryRun,
     ) -> Watcher<'static> {
-        Watcher::new(http, FactoryClient::new(http), None, dry_run)
+        let obs = Box::leak(Box::new(geectl::obs::ObsClient::new(http)));
+        Watcher::new(http, FactoryClient::new(obs), None, dry_run)
     }
 
     fn live() -> &'static DryRun {
@@ -309,10 +314,57 @@ mod tests {
                 "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
                 "Name: foo\nVersion: 1.9\n",
             );
-        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
         let watcher = watcher_with_http(http, live());
         let entry = watcher.check_package("foo").unwrap().unwrap();
         assert_eq!(entry.package, "foo");
+        assert_eq!(entry.factory_version, "1.9");
+        assert_eq!(entry.upstream_version, "2.0");
+    }
+
+    #[test]
+    fn check_package_missing_spec_is_obs_not_found() {
+        let http = FakeHttpClient::new().with_status(
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
+            404,
+            "not found",
+        );
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
+        let watcher = watcher_with_http(http, live());
+        let err = watcher.check_package("foo").unwrap_err();
+        assert!(matches!(
+            err,
+            WatchError::Obs(ref e) if e.kind() == geectl::error::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn check_package_plus_name_is_queued() {
+        // A `+` in the package name exercises the URL-encoding seam:
+        // the collectors keep `+` raw (repology path) or encode it as
+        // a query value (Anitya), while geectl percent-encodes it in
+        // the spec path segment.
+        let http = FakeHttpClient::new()
+            .with(
+                "https://repology.org/api/v1/project/libdbus-c++",
+                r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#,
+            )
+            .with(
+                "https://release-monitoring.org/api/v2/projects/?name=libdbus-c%2B%2B",
+                r#"{"items": []}"#,
+            )
+            .with(
+                "https://distrowatch.com/table.php?distribution=opensuse",
+                "<html></html>",
+            )
+            .with(
+                "https://api.opensuse.org/public/source/openSUSE:Factory/libdbus-c%2B%2B/libdbus-c%2B%2B.spec",
+                "Name: libdbus-c++\nVersion: 1.9\n",
+            );
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
+        let watcher = watcher_with_http(http, live());
+        let entry = watcher.check_package("libdbus-c++").unwrap().unwrap();
+        assert_eq!(entry.package, "libdbus-c++");
         assert_eq!(entry.factory_version, "1.9");
         assert_eq!(entry.upstream_version, "2.0");
     }
@@ -336,7 +388,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
                 "Name: foo\nVersion: 2.0\n",
             );
-        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
         let watcher = watcher_with_http(http, live());
         assert!(watcher.check_package("foo").unwrap().is_none());
     }
@@ -359,7 +411,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
                 "Name: foo\nVersion: 1.9\n",
             );
-        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
         let watcher = watcher_with_http(http, live());
         assert!(watcher.check_package("foo").unwrap().is_none());
     }
@@ -383,7 +435,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
                 "Name: foo\nVersion: 1.0\n",
             );
-        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
         let watcher = watcher_with_http(http, live());
         assert!(watcher.check_package("foo").unwrap().is_none());
     }
@@ -410,7 +462,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
                 "Name: foo\nVersion: 1.9\n",
             );
-        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
         let watcher = watcher_with_http(http, dry_run);
         let entry = watcher.check_package("foo").unwrap().unwrap();
         assert_eq!(entry.source, "repology");
@@ -440,7 +492,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
                 "Name: foo\nVersion: 1.9\n",
             );
-        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
         let watcher = watcher_with_http(http, dry_run);
         assert!(watcher.check_package("foo").unwrap().is_some());
         assert!(dry_run.plan().is_empty());
@@ -465,7 +517,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
                 "Name: foo\nVersion: 1.9\n",
             );
-        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
         let watcher = watcher_with_http(http, live());
         let entry = watcher.check_package("foo").unwrap().unwrap();
         assert_eq!(entry.target, Target::Factory);
@@ -491,11 +543,12 @@ mod tests {
     }
 
     fn watcher_with_policy(
-        http: &'static dyn HttpClient,
+        http: &'static FakeHttpClient,
         dry_run: &'static DryRun,
         policy: Box<dyn UpdatePolicy + 'static>,
     ) -> Watcher<'static> {
-        Watcher::new(http, FactoryClient::new(http), None, dry_run).with_policy(policy)
+        let obs = Box::leak(Box::new(geectl::obs::ObsClient::new(http)));
+        Watcher::new(http, FactoryClient::new(obs), None, dry_run).with_policy(policy)
     }
 
     #[test]
@@ -520,7 +573,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
                 "Name: foo\nVersion: 2.0\n",
             );
-        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
         let watcher = watcher_with_policy(http, live(), Box::new(AlwaysUpdate));
         assert!(watcher.check_package("foo").unwrap().is_some());
         let watcher = watcher_with_policy(http, live(), Box::new(NeverUpdate));
@@ -571,7 +624,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
                 "Name: foo\nVersion: 1.9\n",
             );
-        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
         let watcher =
             watcher_with_http(http, live()).with_cve_validator(Box::new(PanickingValidator));
         // Would panic if the Factory path consulted the validator.
@@ -598,7 +651,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
                 "Name: foo\nVersion: 1.9\n",
             );
-        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
         let watcher = watcher_with_http(http, live()).with_target(Target::Leap {
             version: "16.0".to_string(),
         });
@@ -625,7 +678,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
                 "Name: foo\nVersion: 1.9\n",
             );
-        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
         let watcher = watcher_with_http(http, live());
         assert!(watcher.check_package("foo").unwrap().is_none());
     }
@@ -653,7 +706,7 @@ mod tests {
                 "https://api.opensuse.org/public/source/openSUSE:Factory/good/good.spec",
                 "Name: good\nVersion: 1.9\n",
             );
-        let http: &'static dyn HttpClient = Box::leak(Box::new(http));
+        let http: &'static FakeHttpClient = Box::leak(Box::new(http));
         let watcher = watcher_with_http(http, live());
         let entries = watcher.check_packages(&["bad", "good"]);
         assert_eq!(entries.len(), 1);
