@@ -1,6 +1,6 @@
 [package]
 name = "freshcrab"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # Inherited from the geectl dependency: cargo enforces a dependency's
 # rust-version, so the MSRV job would fail on anything below geectl's
