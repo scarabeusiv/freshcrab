@@ -29,9 +29,11 @@ fn watcher_for(foo_spec_version: &str, distrowatch_html: &str) -> Watcher<'stati
             "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
             &format!("Name: foo\nVersion: {foo_spec_version}\n"),
         );
-    let http: &'static dyn freshcrab::http::HttpClient = Box::leak(Box::new(http));
+    let http: &'static FakeHttpClient = Box::leak(Box::new(http));
+    let obs: &'static geectl::obs::ObsClient<'static> =
+        Box::leak(Box::new(geectl::obs::ObsClient::new(http)));
     let dry_run: &'static DryRun = Box::leak(Box::new(DryRun::new(false)));
-    Watcher::new(http, FactoryClient::new(http), None, dry_run)
+    Watcher::new(http, FactoryClient::new(obs), None, dry_run)
 }
 
 #[test]
@@ -108,9 +110,11 @@ fn dry_run_watcher_prints_would_queue_and_writes_nothing() {
             "https://api.opensuse.org/public/source/openSUSE:Factory/foo/foo.spec",
             "Name: foo\nVersion: 1.9\n",
         );
-    let http: &'static dyn freshcrab::http::HttpClient = Box::leak(Box::new(http));
+    let http: &'static FakeHttpClient = Box::leak(Box::new(http));
+    let obs: &'static geectl::obs::ObsClient<'static> =
+        Box::leak(Box::new(geectl::obs::ObsClient::new(http)));
     let dry_run: &'static DryRun = Box::leak(Box::new(dry_run));
-    let watcher = Watcher::new(http, FactoryClient::new(http), None, dry_run);
+    let watcher = Watcher::new(http, FactoryClient::new(obs), None, dry_run);
     let entry = watcher.check_package("foo").unwrap().unwrap();
     assert_eq!(entry.source, "repology");
     assert_eq!(
