@@ -35,6 +35,7 @@
 
 use crate::cve::{changelog_names_cve, CveId};
 use crate::dry_run::DryRun;
+use crate::http::map_obs_credentials_error;
 use crate::queue::{QueueEntry, UpdateKind};
 use crate::target::Target;
 use crate::version::is_newer;
@@ -156,12 +157,37 @@ impl UpdateExecutor for DryRunExecutor {
 
 /// Map an OBS-call failure to the outcome: an auth failure is a
 /// run-level failure ([`WorkerOutcome::AuthRejected`]), anything else
-/// escalates the package.
-fn obs_failure(e: &GeectlError, reason: String) -> WorkerOutcome {
-    if e.kind() == ErrorKind::AuthFailed {
+/// escalates the package. Geectl's no-credentials error names its own
+/// `GEECTL_OBS_*` variables; the error is mapped first so the reason
+/// names freshcrab's `OSC_*` variables instead (see
+/// [`map_obs_credentials_error`]). The kind is preserved, so the
+/// auth/escalate decision is unaffected.
+fn obs_failure(e: &GeectlError, what: &str) -> WorkerOutcome {
+    let mapped = map_obs_credentials_error(e);
+    let reason = format!("{what}: {mapped}");
+    if mapped.kind() == ErrorKind::AuthFailed {
         WorkerOutcome::AuthRejected { reason }
     } else {
         WorkerOutcome::Escalated { reason }
+    }
+}
+
+/// Map a filing failure to the outcome. Preserve the variant: an auth
+/// failure at filing time must stay distinguishable so the dispatcher
+/// fails the run loudly instead of escalating the package. The error
+/// is mapped first so the reason names freshcrab's `OSC_*` variables
+/// instead of geectl's `GEECTL_OBS_*` (see
+/// [`map_obs_credentials_error`]); the kind is preserved.
+fn filing_failure(e: &GeectlError) -> WorkerOutcome {
+    let mapped = map_obs_credentials_error(e);
+    if mapped.kind() == ErrorKind::AuthFailed {
+        WorkerOutcome::AuthRejected {
+            reason: format!("SR filing failed: {mapped}"),
+        }
+    } else {
+        WorkerOutcome::Escalated {
+            reason: format!("SR filing failed: {mapped}"),
+        }
     }
 }
 
@@ -248,7 +274,7 @@ impl<'a> Worker<'a> {
             Err(e) => {
                 return obs_failure(
                     &e,
-                    format!("devel project lookup failed for {}: {e}", entry.package),
+                    &format!("devel project lookup failed for {}", entry.package),
                 );
             }
         };
@@ -268,7 +294,7 @@ impl<'a> Worker<'a> {
             Err(e) => {
                 return obs_failure(
                     &e,
-                    format!("devel version check failed for {}: {e}", entry.package),
+                    &format!("devel version check failed for {}", entry.package),
                 );
             }
         }
@@ -281,10 +307,7 @@ impl<'a> Worker<'a> {
             }
             Ok(false) => {}
             Err(e) => {
-                return obs_failure(
-                    &e,
-                    format!("open-SR check failed for {}: {e}", entry.package),
-                );
+                return obs_failure(&e, &format!("open-SR check failed for {}", entry.package));
             }
         }
         // 4. Resolve the branch project (may be None; see the field docs).
@@ -353,21 +376,7 @@ impl<'a> Worker<'a> {
                         plan,
                         payload: Some(payload),
                     },
-                    Err(e) => {
-                        // Preserve the variant: an auth failure at
-                        // filing time must stay distinguishable so the
-                        // dispatcher fails the run loudly instead of
-                        // escalating the package.
-                        if e.kind() == ErrorKind::AuthFailed {
-                            WorkerOutcome::AuthRejected {
-                                reason: format!("SR filing failed: {e}"),
-                            }
-                        } else {
-                            WorkerOutcome::Escalated {
-                                reason: format!("SR filing failed: {e}"),
-                            }
-                        }
-                    }
+                    Err(e) => filing_failure(&e),
                 }
             }
         }
@@ -1055,10 +1064,78 @@ mod tests {
         match worker.run(&entry("foo")) {
             WorkerOutcome::Escalated { reason } => {
                 assert!(reason.contains("open-SR check failed"), "{reason}");
+                // The geectl no-credentials error names GEECTL_OBS_*;
+                // the worker reason must name freshcrab's OSC_*
+                // variables instead.
+                assert!(reason.contains("OSC_USERNAME"), "{reason}");
+                assert!(reason.contains("OSC_PASSWORD"), "{reason}");
+                assert!(!reason.contains("GEECTL_OBS"), "{reason}");
             }
             other => panic!("expected Escalated, got {other:?}"),
         }
         assert!(http.posted().is_empty());
+    }
+
+    #[test]
+    fn obs_failure_maps_geectl_credential_names_and_preserves_kind() {
+        // A fake geectl error naming GEECTL_OBS_* variables: the
+        // outcome reason names freshcrab's OSC_* variables instead,
+        // and the kind still decides auth-reject vs escalate.
+        let err = GeectlError::new(
+            ErrorKind::ConfigError,
+            "checking for open submit requests requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+        );
+        match obs_failure(&err, "open-SR check failed for foo") {
+            WorkerOutcome::Escalated { reason } => {
+                assert!(reason.contains("open-SR check failed for foo"), "{reason}");
+                assert!(reason.contains("(OSC_USERNAME + OSC_PASSWORD)"), "{reason}");
+                assert!(!reason.contains("GEECTL_OBS"), "{reason}");
+            }
+            other => panic!("expected Escalated, got {other:?}"),
+        }
+        let auth_err = GeectlError::new(
+            ErrorKind::AuthFailed,
+            "set GEECTL_OBS_USERNAME and GEECTL_OBS_PASSWORD",
+        );
+        match obs_failure(&auth_err, "open-SR check failed for foo") {
+            WorkerOutcome::AuthRejected { reason } => {
+                assert!(reason.contains("OSC_USERNAME"), "{reason}");
+                assert!(reason.contains("OSC_PASSWORD"), "{reason}");
+                assert!(!reason.contains("GEECTL_OBS"), "{reason}");
+            }
+            other => panic!("expected AuthRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filing_failure_maps_geectl_credential_names_and_preserves_kind() {
+        // Same mapping at the filing arm, with the variant preserved:
+        // an auth failure stays an auth rejection, anything else
+        // escalates.
+        let err = GeectlError::new(
+            ErrorKind::ConfigError,
+            "filing requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+        );
+        match filing_failure(&err) {
+            WorkerOutcome::Escalated { reason } => {
+                assert!(reason.contains("SR filing failed"), "{reason}");
+                assert!(reason.contains("(OSC_USERNAME + OSC_PASSWORD)"), "{reason}");
+                assert!(!reason.contains("GEECTL_OBS"), "{reason}");
+            }
+            other => panic!("expected Escalated, got {other:?}"),
+        }
+        let auth_err = GeectlError::new(
+            ErrorKind::AuthFailed,
+            "set GEECTL_OBS_USERNAME and GEECTL_OBS_PASSWORD",
+        );
+        match filing_failure(&auth_err) {
+            WorkerOutcome::AuthRejected { reason } => {
+                assert!(reason.contains("OSC_USERNAME"), "{reason}");
+                assert!(reason.contains("OSC_PASSWORD"), "{reason}");
+                assert!(!reason.contains("GEECTL_OBS"), "{reason}");
+            }
+            other => panic!("expected AuthRejected, got {other:?}"),
+        }
     }
 
     #[test]

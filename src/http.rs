@@ -333,8 +333,9 @@ fn map_geectl_error(e: &HttpError) -> geectl::error::GeectlError {
 /// through the open-SR check's warning. Only the variable names are
 /// rewritten — the kind and the rest of the message are preserved —
 /// and an error that names no `GEECTL_OBS_*` variable is returned
-/// unchanged. Used at the seam where freshcrab consumes geectl's
-/// no-credentials error for display (the open-SR check in `main`).
+/// unchanged. Used at the seams where freshcrab consumes geectl's
+/// no-credentials error for display (the open-SR check in `main`, the
+/// worker's OBS failure paths).
 pub fn map_obs_credentials_error(e: &geectl::error::GeectlError) -> geectl::error::GeectlError {
     use geectl::error::GeectlError;
     // The parenthetical is geectl's fixed no-credentials wording
