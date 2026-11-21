@@ -6,11 +6,12 @@
 # Freshcrab is a single crate, so the version surfaces are exactly two:
 # the [package] version in Cargo.toml and the freshcrab entry in
 # Cargo.lock. A repo-wide grep for the current version confirms nothing
-# else carries it (README.md and docs/ hold no version string), so there
-# are no doc sentences or generated files to rewrite — unlike rpmcrab's
-# script, there is no `make gen` and no version-consistency gate to run
-# afterwards; the script ends with its own consistency check instead.
-# Historical mentions are left alone.
+# else carries it (README.md and docs/ hold no version string; the two
+# exclusions in the check below cite the pinned geectl dependency's
+# version, not this repo's), so there are no doc sentences or generated
+# files to rewrite — unlike rpmcrab's script, there is no `make gen` and
+# no version-consistency gate to run afterwards; the script ends with its
+# own consistency check instead. Historical mentions are left alone.
 set -euo pipefail
 
 # No leading zeros: Cargo rejects them, and only after the tree is edited.
@@ -24,15 +25,45 @@ fi
 
 cd "$(git rev-parse --show-toplevel)"
 
-# Never mix unrelated uncommitted edits into a bump: the workflow runs
-# on a fresh checkout, so a dirty tree here means a human ran this by
-# hand with work in progress.
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "refusing to bump with uncommitted changes in the tree" >&2
+# Standalone robustness: the tree must be clean before the bump.
+# (In the release workflow the checkout is fresh, so the precondition
+# is a no-op there; it protects a developer running the script by hand.)
+if [ -n "$(git status --porcelain)" ]; then
+  echo "refusing to bump: the tree has uncommitted changes" >&2
   exit 1
 fi
 
-old=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+# One EXIT cleanup for the whole script: it removes every tempfile
+# the script creates and, on any nonzero exit, restores the two
+# version surfaces. EXIT (not ERR) is what makes explicit `exit 1`
+# validation failures restore too — ERR never fires for an explicit
+# exit, so a post-edit drift/mismatch/stale failure used to leave a
+# dirty tree behind. Installed after the clean-tree precondition: a
+# failure before this point has edited nothing, so there is nothing
+# to restore.
+subst_tmp=""
+stale_tmp=""
+cleanup() {
+  local rc=$?
+  if [ -n "$subst_tmp" ]; then rm -f "$subst_tmp"; fi
+  if [ -n "$stale_tmp" ]; then rm -f "$stale_tmp"; fi
+  if [ "$rc" -ne 0 ]; then
+    # One file at a time: a single checkout naming a surface that is
+    # not in the index (no Cargo.lock yet, say) restores neither.
+    git checkout -- Cargo.toml 2>/dev/null || true
+    git checkout -- Cargo.lock 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+# Tolerant [package] version read: spaces around `=` and a trailing
+# comment are allowed. A workspace-inherited version
+# (`version.workspace = true`) yields nothing and fails closed below.
+manifest_version() {
+  sed -n '/^\[package\]/,/^\[/s/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -1
+}
+
+old=$(manifest_version Cargo.toml)
 if ! [[ "$old" =~ $semver ]]; then
   echo "no X.Y.Z [package] version found in Cargo.toml (got '$old')" >&2
   exit 1
@@ -51,7 +82,6 @@ else
 fi
 if [ "$forward" -ne 1 ]; then
   echo "refusing to move $old to $new: the version only moves forward" >&2
-  echo "(a half-applied earlier run is undone with: git checkout -- .)" >&2
   exit 1
 fi
 
@@ -59,44 +89,64 @@ fi
 subst() { # sed-script file
   local tmp
   tmp=$(mktemp)
-  # Expands now deliberately: each subst() call traps its own temp
-  # file, so a failure mid-call cleans it up.
-  # shellcheck disable=SC2064
-  trap "rm -f '$tmp'" EXIT
+  # Registered with the script-wide EXIT cleanup, not a trap of its
+  # own (which would replace it): a failure mid-call still removes
+  # the tempfile, and so does any later failure.
+  subst_tmp="$tmp"
   sed "$1" "$2" >"$tmp"
   cat "$tmp" >"$2"
   rm -f "$tmp"
+  subst_tmp=""
 }
 
 old_re=${old//./\\.}
 
-subst "/^\[package\]/,/^\[/s/^version = \"$old_re\"$/version = \"$new\"/" Cargo.toml
+subst "/^\[package\]/,/^\[/s/^\([[:space:]]*version[[:space:]]*=[[:space:]]*\)\"$old_re\".*/\1\"$new\"/" Cargo.toml
 
 # -p freshcrab updates only this crate's lock entry; dependencies stay
 # put. Anything more (a newer cargo rewriting the lock format, say)
 # does not belong in a version bump.
 cargo update -p freshcrab --quiet
-if [ "$(git diff --numstat -- Cargo.lock | cut -f1-2)" != "$(printf '1\t1')" ]; then
-  echo "Cargo.lock changed beyond the single freshcrab version line:" >&2
-  git diff -- Cargo.lock >&2
+# Compare against HEAD, not the worktree: a staged pre-existing edit
+# would otherwise evade the check. Both surfaces must move exactly
+# one line each (the version line); anything more does not belong in
+# a version bump.
+toml_diff=$(git diff HEAD --numstat -- Cargo.toml | cut -f1-2)
+lock_diff=$(git diff HEAD --numstat -- Cargo.lock | cut -f1-2)
+if [ "$toml_diff" != "$(printf '1\t1')" ] || [ "$lock_diff" != "$(printf '1\t1')" ]; then
+  echo "version surfaces changed beyond one line each (Cargo.toml=$toml_diff Cargo.lock=$lock_diff):" >&2
+  git diff HEAD -- Cargo.toml Cargo.lock >&2
   exit 1
 fi
 
-# Consistency check (freshcrab has no separate gate script): the new
-# version is the only version in Cargo.toml's [package] table, the lock
-# carries it for the freshcrab package, and the old version is gone
-# from the manifest.
-manifest=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-if [ "$manifest" != "$new" ]; then
-  echo "Cargo.toml [package] version is '$manifest', expected '$new'" >&2
+# Verify both surfaces carry the new version, and that no other
+# tracked file still carries the old one.
+manifest=$(manifest_version Cargo.toml)
+locked=$(sed -n '/^[[:space:]]*name[[:space:]]*=[[:space:]]*"freshcrab"/,/^[[:space:]]*version[[:space:]]*=/s/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.lock | head -1)
+if [ "$manifest" != "$new" ] || [ "$locked" != "$new" ]; then
+  echo "version mismatch after bump: Cargo.toml=$manifest Cargo.lock=$locked (expected $new)" >&2
   exit 1
 fi
-lock=$(sed -n '/^name = "freshcrab"/,/^version = /s/^version = "\(.*\)"$/\1/p' Cargo.lock | head -1)
-if [ "$lock" != "$new" ]; then
-  echo "Cargo.lock freshcrab version is '$lock', expected '$new'" >&2
+# git grep exits 1 on no match (clean) and 0 on a match (stale), but
+# 2-plus on a real error (bad pathspec, corrupt index): only exit 1
+# is tolerated, anything else fails loudly. The geectl-pin workflow
+# and deny.toml are excluded: both cite the pinned geectl
+# dependency's version (the pinned geectl tag), not this repo's, so they
+# legitimately still carry the old string after a bump.
+stale_tmp=$(mktemp)
+stale_rc=0
+# The old version must match as a whole token, not a substring: a
+# plain -F search also matches longer versions that merely contain
+# it (a 10.x release contains the 0.x string). The ERE requires a
+# non-digit, non-dot (or a line edge) on both sides, so a v-prefixed
+# or quoted occurrence still matches while the longer one does not.
+git grep -E -l "(^|[^0-9.])$old_re([^0-9.]|$)" -- ':!Cargo.lock' ':!Cargo.toml' ':!.github/workflows/geectl-pin.yml' ':!deny.toml' >"$stale_tmp" || stale_rc=$?
+if [ "$stale_rc" -gt 1 ]; then
+  echo "stale-version check failed (git grep exit $stale_rc)" >&2
   exit 1
 fi
-if sed -n '/^\[package\]/,/^\[/p' Cargo.toml | grep -q "version = \"$old_re\""; then
-  echo "old version $old still present in Cargo.toml" >&2
+if [ -s "$stale_tmp" ]; then
+  echo "old version $old still appears in:" >&2
+  cat "$stale_tmp" >&2
   exit 1
 fi
