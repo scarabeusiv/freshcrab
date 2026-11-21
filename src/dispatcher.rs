@@ -31,8 +31,9 @@
 //! a crash during the worker leaves the entry `pending`, so the next run
 //! retries it, and the worker's dedup re-check (open SR, Factory) is the backstop
 //! against filing twice. For maintenance entries there is no worker-side
-//! re-check: a duplicate is found at filing time and maps to `Skipped`
-//! (already handled), which is the same backstop one step later. A filed SR
+//! re-check: a duplicate is found at filing time and escalates with the
+//! blocking id for human triage (the dedup identity carries no fix/CVE
+//! identity). A filed SR
 //! is saved to the queue file immediately after `mark_filed`, not only
 //! at the end of the batch, so a crash cannot lose the filed id.
 //!
@@ -116,8 +117,9 @@ impl<'a> Dispatcher<'a> {
     /// the filed SR id lives only in the queue file, so losing it would
     /// leave the entry pending — the next run would file again (the
     /// Factory open-SR dedup re-check is the backstop, and a
-    /// maintenance duplicate maps to `Skipped` at filing time, but a
-    /// silent success here would hide the loss). An OBS auth rejection
+    /// maintenance duplicate escalates with the blocking id at filing
+    /// time, but a silent success here would hide the loss). An OBS
+    /// auth rejection
     /// (401/403) also fails
     /// the run loudly: the batch stops at once and the error propagates
     /// instead of a report, so bad or rotated credentials yield one

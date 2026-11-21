@@ -219,7 +219,7 @@ change, not in the gates:
   upstream fix as a patch to the Leap version (or takes the patch
   from the upstream fix commit), bumps only the release number,
   and adds exactly one `.changes` entry **naming the CVE**.
-- **Different SR target.** The SR goes to the Leap maintenance
+- **Different SR target.** The incident goes to the Leap maintenance
   process (maintenance incident / update project for that release),
   not to the devel project — implemented in the worker
   (`Worker::run_maintenance`): the maintained instances are listed
@@ -236,8 +236,10 @@ change, not in the gates:
   from is unverified). No cleanup opt-in: the incident source is
   the maintenance working area, which the maintainer may reuse. The
   open-incident dedup is geectl's filing-time check; a duplicate
-  found there maps to `Skipped` (already handled), and there is no
-  worker-side open-incident check.
+  found there escalates with the blocking id for human triage (the
+  dedup identity carries no fix/CVE identity, so the open incident
+  may be another maintainer's or for a different CVE), and there is
+  no worker-side open-incident check.
   - **Live verification caveat (2026-11-21).** The path is
   implemented against geectl's API contract and tested against
   it, but it is not verified end to end against
@@ -245,8 +247,11 @@ change, not in the gates:
   instances for real Leap packages there (verified live for
   `vim`, `curl`, `bash`, `nfs-utils`, `python3`, `openssl`,
   `git` — all 404 "no packages found by search criteria", and
-  `osc maintained nfs-utils` fails the same way), because no
-  `:Update` project carries the `OBS:Maintained` attribute. Only
+  `osc maintained nfs-utils` fails the same way). The cause is
+  verified by reading the projects' attributes directly:
+  `openSUSE:Leap:15.6:Update`, `SUSE:SLE-15-SP6:Update` and
+  `openSUSE:Backports:SLE-15-SP6:Update` carry no `OBS:Maintained`
+  attribute. Only
   15.6 has a known update project; 16.0 and 16.1 have no `:Update`
   project at all (verified live), and Leap 16.x is Git-tracked
   (`scmsync`), so the OBS incident model here covers the 15.x
