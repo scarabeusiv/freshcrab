@@ -7,6 +7,20 @@ are behind on Factory, and — via an agent — branches the package from
 its devel project, bumps the version, cleans the spec, builds it in
 OBS, validates it, and submits the update to the devel project.
 
+## OBS access rule
+
+All OBS interaction goes through geectl's library. freshcrab implements
+no OBS logic of its own: no OBS client of its own, no request/response XML
+handling, no endpoint construction, no OBS URL building. The Factory
+reads (`src/factory.rs`: the spec via `cat`, the package list via
+`list_packages`), the devel lookup, the open-SR check, and SR filing
+all run through geectl.
+
+Any new OBS need goes to geectl first and freshcrab picks it up from a
+geectl release; it is never implemented locally. Reviewers enforce
+this: a freshcrab PR adding OBS logic is refused, not refactored in
+place.
+
 ## Components
 
 ```
@@ -230,7 +244,8 @@ src/
   dry_run.rs           global dry-run mode + the single guard every
                        mutation consults (CLI > env > config)
   collectors/          Repology, Anitya, PyPI, Distrowatch, upstream check
-  factory.rs           Factory version via the OBS API
+  factory.rs           Factory version via geectl's public reads
+                       (`cat` for the spec, `list_packages` for the list)
   target.rs            distribution targets (Factory / Leap) + the
                        per-target update-policy hook
   cve.rs               CVE validation: the changelog-carries-the-CVE rule
@@ -239,8 +254,9 @@ src/
   queue.rs             queue state file, deduplication, security-first
                        ordering (kind: routine / security); filed SR ids
                        and the daily-cap count
-  geectl (dependency)  OBS client for the dedup checks + filing a submit
-                       request (POST /request?cmd=create)
+  geectl (dependency)  OBS client for the Factory reads, the dedup
+                       checks + filing a submit request
+                       (POST /request?cmd=create)
   dispatcher.rs        picks pending entries (security first, concurrency
                        limit, daily SR cap), drives the worker, applies
                        outcomes to the queue, prints the dispatch report
