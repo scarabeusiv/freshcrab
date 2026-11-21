@@ -134,7 +134,9 @@ pub trait UpdateExecutor {
     /// branches with `ObsClient::maintenance_branch` into
     /// `plan.branch_project` (the server-derived maintenance branch)
     /// — never a plain branch, and never from a devel project, which
-    /// a Leap plan does not have.
+    /// a Leap plan does not have. Land it in `plan.branch_project`:
+    /// pass `MaintenanceBranchOptions::with_target_project` for it,
+    /// or verify `MaintenanceBranchResult.target_project` equals it.
     fn execute(&self, plan: &UpdatePlan, dry_run: &DryRun) -> Result<Execution, String>;
 }
 
@@ -265,10 +267,8 @@ fn is_open_maintenance_incident_duplicate(e: &GeectlError) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerOutcome {
     /// The dedup re-check says the update is already handled (the devel
-    /// project already has the version, an open SR targets the
-    /// package, or an open maintenance incident already targets it —
-    /// the incident dedup is geectl's filing-time check). No SR is
-    /// filed and no incident is filed.
+    /// project already has the version, or an open SR targets the
+    /// package). No SR is filed.
     Skipped { reason: String },
     /// No devel project could be resolved for the package. The entry
     /// escalates; filing needs a target.
@@ -485,17 +485,38 @@ impl<'a> Worker<'a> {
     /// devel project, and an open maintenance incident is refused by
     /// geectl's filing-time dedup (`SrFiling::file_maintenance_incident`
     /// in live mode), so there is no worker-side open-incident
-    /// check — geectl exposes none. A duplicate found that way is
-    /// already handled, so it maps to `Skipped`, not `Escalated`
-    /// (see `is_open_maintenance_incident_duplicate`). The branch
+    /// check — geectl exposes none. A duplicate found that way
+    /// escalates with the blocking id for human triage, not
+    /// `Skipped`: the dedup identity carries no fix/CVE identity,
+    /// so the open incident may be another maintainer's or for a
+    /// different CVE (see `is_open_maintenance_incident_duplicate`).
+    /// The branch
     /// itself is an executor step, as on the Factory path: the plan
     /// names the branch project the listing reports, and the live
     /// executor creates it with `ObsClient::maintenance_branch`
     /// before executing the steps (see `UpdateExecutor`).
     fn run_maintenance(&self, entry: &QueueEntry) -> WorkerOutcome {
-        // 1. Maintained instances: the read that proves the package
+        // 1. The maintained project for this target — the update
+        // project (`openSUSE:Leap:15.6:Update`), not the release
+        // project (`openSUSE:Leap:15.6`): maintenance happens in the
+        // update project, the release project is frozen. Only
+        // releases with a known update project resolve (see
+        // `Target::update_project`): 16.0/16.1 have no `:Update`
+        // project (verified live), so they cannot resolve here.
+        // Checked before the listing call: a release with no known
+        // update project needs no network round-trip.
+        let Some(maintained_project) = entry.target.update_project() else {
+            return WorkerOutcome::NotMaintained {
+                reason: format!(
+                    "no maintained instance for {} on {}: {} has no known update project (only 15.6 is mapped; see docs/leap-and-cve.md)",
+                    entry.package, entry.target, entry.target
+                ),
+            };
+        };
+        // 2. Maintained instances: the read that proves the package
         // is maintained on this target and names the branch project
-        // the incident files from.
+        // the incident files from. The listing's source project is
+        // the maintained project found above.
         let instances = match self
             .obs
             .maintained_instances(&entry.package, &MaintenanceBranchOptions::new())
@@ -507,21 +528,6 @@ impl<'a> Worker<'a> {
                     &format!("maintained-instances lookup failed for {}", entry.package),
                 );
             }
-        };
-        // The listing's source project is the maintained project —
-        // the update project (`openSUSE:Leap:15.6:Update`), not the
-        // release project (`openSUSE:Leap:15.6`): maintenance happens
-        // in the update project, the release project is frozen.
-        // Only releases with a known update project resolve (see
-        // `Target::update_project`): 16.0/16.1 have no `:Update`
-        // project (verified live), so they cannot resolve here.
-        let Some(maintained_project) = entry.target.update_project() else {
-            return WorkerOutcome::NotMaintained {
-                reason: format!(
-                    "no maintained instance for {} on {}: {} has no known update project (no :Update project exists; see docs/leap-and-cve.md)",
-                    entry.package, entry.target, entry.target
-                ),
-            };
         };
         let Some(instance) = instances
             .iter()
@@ -535,7 +541,7 @@ impl<'a> Worker<'a> {
             };
         };
         let branch_project = Some(instance.target_project.clone());
-        // 2. Build the plan (validates the CVE changelog rule for
+        // 3. Build the plan (validates the CVE changelog rule for
         // security entries). A Leap plan has no devel project.
         let plan = match self.build_plan(entry, None, branch_project) {
             Ok(plan) => plan,
@@ -543,7 +549,7 @@ impl<'a> Worker<'a> {
                 return WorkerOutcome::Escalated { reason: e.0 };
             }
         };
-        // 3. Build the incident payload from the plan and the
+        // 4. Build the incident payload from the plan and the
         // instance it was built from. Mirror the Factory path: in
         // dry-run a payload that cannot be built is a planned
         // outcome with a note, not an escalation; in live mode it
@@ -563,7 +569,7 @@ impl<'a> Worker<'a> {
                 None
             }
         };
-        // 4. Execute the update steps.
+        // 5. Execute the update steps.
         let execution = match self.executor.execute(&plan, self.dry_run) {
             Ok(execution) => execution,
             Err(reason) => {
@@ -603,14 +609,18 @@ impl<'a> Worker<'a> {
                     },
                     Err(e) => {
                         // An open incident already targets this
-                        // package: the update is already handled
-                        // (this is also the crash-recovery case — an
-                        // incident filed just before a crash). Mark
-                        // it done instead of escalating it into a
-                        // parked entry that would file the same
-                        // incident again.
+                        // package — but the dedup identity carries
+                        // no fix/CVE identity, so the open incident
+                        // may be another maintainer's or for a
+                        // different CVE. Escalate with the blocking
+                        // id (it is in the error) for human triage
+                        // instead of marking the entry done and
+                        // silently dropping the fix. This is also
+                        // the crash-recovery case: the incident we
+                        // filed just before a crash is the open one,
+                        // and the human verifies that from the id.
                         if is_open_maintenance_incident_duplicate(&e) {
-                            WorkerOutcome::Skipped {
+                            WorkerOutcome::Escalated {
                                 reason: format!(
                                     "maintenance incident already open for {}: {e}",
                                     entry.package
@@ -769,8 +779,10 @@ fn payload_from_plan(plan: &UpdatePlan) -> Result<SrPayload, GeectlError> {
 /// known (see `Target::update_project`), and otherwise omitted —
 /// geectl documents the server stores a filing-time-resolved value
 /// when none is filed. What it resolves from for a release with no
-/// `:Update` project is unverified (see `docs/leap-and-cve.md`); no
-/// live release is in that position today. No cleanup opt-in: the
+/// `:Update` project is unverified (see `docs/leap-and-cve.md`); the
+/// omit is unreachable via `run_maintenance` today (unknown versions
+/// are refused first) and exists for a future release mapping.
+/// No cleanup opt-in: the
 /// incident source is the maintenance working area, which the
 /// maintainer may reuse for the next incident (geectl's default).
 fn maintenance_incident_payload_from_plan(
@@ -845,7 +857,7 @@ fn description_for(
             "Update {package} to {upstream_version}\n\nUpstream {upstream_version} is available (confirmed by {source}); Factory ships {factory_version}. Bumps Version and the tarball, one .changes entry."
         ),
         Target::Leap { version } => format!(
-            "Backport the fix for {package} to Leap {version} (Release bump, no version change)\n\nUpstream {upstream_version} fixes it (confirmed by {source}); Leap {version} ships {factory_version}."
+            "Backport the fix for {package} to Leap {version} (Release bump, no version change)\n\nUpstream {upstream_version} is available (confirmed by {source}); Leap {version} ships {factory_version}."
         ),
     };
     if !cves.is_empty() {
@@ -1800,6 +1812,9 @@ mod tests {
             }
             other => panic!("expected NotMaintained, got {other:?}"),
         }
+        // The unknown version is refused before the listing call:
+        // no network round-trip is spent on it.
+        assert!(http.posted().is_empty());
     }
 
     #[test]
@@ -1849,11 +1864,13 @@ mod tests {
     }
 
     #[test]
-    fn run_maintenance_live_duplicate_incident_skips() {
+    fn run_maintenance_live_duplicate_incident_escalates() {
         // An open incident already targets this package: the filing
-        // refuses at dedup time, and the worker marks the entry done
-        // (Skipped) instead of escalating it — the incident exists,
-        // and a re-run after a crash must not escalate it either.
+        // refuses at dedup time, and the worker escalates with the
+        // blocking id for human triage — the dedup identity carries
+        // no fix/CVE identity, so the open incident may be another
+        // maintainer's or for a different CVE, and marking the entry
+        // done would silently drop this fix.
         struct CompletedExecutor;
         impl UpdateExecutor for CompletedExecutor {
             fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
@@ -1869,11 +1886,11 @@ mod tests {
         let executor = CompletedExecutor;
         let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&leap_entry("foo")) {
-            WorkerOutcome::Skipped { reason } => {
+            WorkerOutcome::Escalated { reason } => {
                 assert!(reason.contains("already open"), "{reason}");
                 assert!(reason.contains("1399001"), "{reason}");
             }
-            other => panic!("expected Skipped, got {other:?}"),
+            other => panic!("expected Escalated, got {other:?}"),
         }
         // No filing POST: the dedup refusal stopped it, after the
         // one listing POST.
