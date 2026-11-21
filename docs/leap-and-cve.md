@@ -222,17 +222,37 @@ change, not in the gates:
 - **Different SR target.** The SR goes to the Leap maintenance
   process (maintenance incident / update project for that release),
   not to the devel project — implemented in the worker
-  (`Worker::run_maintenance`): the maintained instances are listed,
-  the incident files from the branch project the listing names
-  (source package is the branch package name, e.g.
-  `foo.openSUSE_Leap_15_6_Update`), the target is
+  (`Worker::run_maintenance`): the maintained instances are listed
+  and the instance whose source project is the target's update
+  project is selected (the listing's source project is the update
+  project, e.g. `openSUSE:Leap:15.6:Update` — maintenance happens
+  there, the release project is frozen), the incident files from
+  the branch project the listing names (source package is the branch
+  package name, e.g. `foo.openSUSE_Leap_15.6_Update`), the target is
   `openSUSE:Maintenance`, and the release project is the target's
   update project when known (`15.6` → `openSUSE:Leap:15.6:Update`)
-  and otherwise omitted for the server to resolve from the link
-  target. No cleanup opt-in: the incident source is the maintenance
-  working area, which the maintainer may reuse. The open-incident
-  dedup is geectl's filing-time check; there is no worker-side
-  open-incident check.
+  and otherwise omitted (geectl documents the server stores a
+  filing-time-resolved value when none is filed; what it resolves
+  from is unverified). No cleanup opt-in: the incident source is
+  the maintenance working area, which the maintainer may reuse. The
+  open-incident dedup is geectl's filing-time check; a duplicate
+  found there maps to `Skipped` (already handled), and there is no
+  worker-side open-incident check.
+  - **Live verification caveat (2026-11-21).** The path is
+  implemented against geectl's API contract and tested against
+  it, but it is not verified end to end against
+  api.opensuse.org: the maintained-instances listing returns no
+  instances for real Leap packages there (verified live for
+  `vim`, `curl`, `bash`, `nfs-utils`, `python3`, `openssl`,
+  `git` — all 404 "no packages found by search criteria", and
+  `osc maintained nfs-utils` fails the same way), because no
+  `:Update` project carries the `OBS:Maintained` attribute. Only
+  15.6 has a known update project; 16.0 and 16.1 have no `:Update`
+  project at all (verified live), and Leap 16.x is Git-tracked
+  (`scmsync`), so the OBS incident model here covers the 15.x
+  line. Whether discovery should stay on the listing, move to an
+  explicit `:Update` branch, or follow the Git-based maintenance
+  flow is an open follow-up, not assumed here.
 - **Same gates.** spec-cleaner full mode, rpmcrab 0E/0W,
   pre-filing adversarial audit evaluated for every product the spec
   builds for, one `.changes` entry per SR, and the CVE changelog
@@ -273,6 +293,9 @@ change, not in the gates:
   SUSE CVE database and the changelog from OBS, and wiring them
   into the validator).
 - The dispatcher (not part of this scaffold for Factory either).
+- Live verification of the maintenance path end to end, and the
+  maintenance-discovery question above (listing vs explicit
+  `:Update` branch vs Git-based flow).
 
 Those are the remaining work. The scaffold provides the named,
 tested seams they plug into. Leap maintenance-incident filing itself
