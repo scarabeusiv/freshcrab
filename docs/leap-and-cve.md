@@ -2,8 +2,10 @@
 
 This is the design for extending freshcrab beyond Factory: validate
 CVEs and submit updates to Leap. It is a **plan + scaffold**; the Leap
-watcher logic, the CVE data-source integration, and Leap SR filing are
-the remaining work. The extension points are:
+watcher logic and the CVE data-source integration are the remaining
+work. Leap maintenance-incident filing is implemented in the worker
+(see "Worker brief changes for Leap" below); the watcher that
+produces Leap entries is the remaining step. The extension points are:
 `src/target.rs` (distribution targets + the per-target update-policy
 hook), `src/cve.rs` (the CVE validation rule + the validator
 interface), the target/kind on queue entries with security-first
@@ -219,8 +221,18 @@ change, not in the gates:
   and adds exactly one `.changes` entry **naming the CVE**.
 - **Different SR target.** The SR goes to the Leap maintenance
   process (maintenance incident / update project for that release),
-  not to the devel project. The exact target per release stays open
-  here (see the 16.0 caveat above).
+  not to the devel project — implemented in the worker
+  (`Worker::run_maintenance`): the maintained instances are listed,
+  the incident files from the branch project the listing names
+  (source package is the branch package name, e.g.
+  `foo.openSUSE_Leap_15_6_Update`), the target is
+  `openSUSE:Maintenance`, and the release project is the target's
+  update project when known (`15.6` → `openSUSE:Leap:15.6:Update`)
+  and otherwise omitted for the server to resolve from the link
+  target. No cleanup opt-in: the incident source is the maintenance
+  working area, which the maintainer may reuse. The open-incident
+  dedup is geectl's filing-time check; there is no worker-side
+  open-incident check.
 - **Same gates.** spec-cleaner full mode, rpmcrab 0E/0W,
   pre-filing adversarial audit evaluated for every product the spec
   builds for, one `.changes` entry per SR, and the CVE changelog
@@ -260,8 +272,10 @@ change, not in the gates:
 - The CVE data-source integration (fetching the CVE list from the
   SUSE CVE database and the changelog from OBS, and wiring them
   into the validator).
-- Leap SR filing (maintenance incident / update project targets).
 - The dispatcher (not part of this scaffold for Factory either).
 
 Those are the remaining work. The scaffold provides the named,
-tested seams they plug into.
+tested seams they plug into. Leap maintenance-incident filing itself
+is already implemented in the worker (see above) — what is still
+missing is the producer of Leap entries, the Leap watcher, so
+`leap-*` targets remain refused at startup.
