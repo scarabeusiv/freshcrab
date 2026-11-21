@@ -17,11 +17,17 @@
 # per-asset checksums, the combined checksums) gets a detached `.asc`
 # signature, signed as the pinned subkey.
 #
-# Toolchain: pinned to 1.99.0, not floating stable — release artifacts
-# must be reproducible. The repo's rust-toolchain.toml says `stable`,
-# which outranks the rustup default the dtolnay action sets, so the
-# build and bump jobs export RUSTUP_TOOLCHAIN to make the pin stick
-# (same pattern as the rust-msrv job in test.yml) and assert it.
+# Toolchain: derived from Cargo.toml `rust-version` — the single source
+# of truth; updating `rust-version` is the one line that moves the
+# release toolchain, and nothing in this file pins a version.
+# `rust-version` is an MSRV floor, and this makes it the release
+# toolchain by construction — bumping it bumps release builds too.
+# Release artifacts must be reproducible, so the toolchain never floats
+# stable. The repo's rust-toolchain.toml says `stable`, which outranks
+# the rustup default the dtolnay action sets, so the build and bump
+# jobs derive the toolchain from the manifest, export it as
+# RUSTUP_TOOLCHAIN to make it stick (same pattern as the rust-msrv job
+# in test.yml), and assert it.
 #
 # Deliberately not here: no benchmark job (freshcrab has no release
 # corpus to A/B against); no crates.io publish (registry versions burn
@@ -128,28 +134,37 @@ jobs:
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
-    env:
-      # rust-toolchain.toml says `stable`, which outranks the rustup
-      # default; export the pin so the release is actually built with
-      # it, and assert below.
-      RUSTUP_TOOLCHAIN: "1.99.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Derive the release toolchain from Cargo.toml `rust-version`.
+      # rust-toolchain.toml says `stable`, which outranks the rustup
+      # default the dtolnay action sets, so export the derived version
+      # as RUSTUP_TOOLCHAIN to make it stick, and assert it below.
+      # $GITHUB_ENV, not job-level env: job-level env cannot see step
+      # outputs. Same extraction as the rust-msrv job in test.yml.
+      - name: Derive the release toolchain from Cargo.toml
+        id: toolchain
+        run: |
+          toolchain=$(sed -n 's/^rust-version = "\([0-9][0-9.]*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$toolchain" || { echo "rust-version not found in Cargo.toml" >&2; exit 1; }
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
         with:
-          # Pinned, not floating stable: release artifacts must be
-          # reproducible; bump deliberately.
-          toolchain: 1.99.0
-      - name: Assert pinned toolchain
+          # Derived from Cargo.toml rust-version, not floating stable:
+          # release artifacts must be reproducible.
+          toolchain: ${{ steps.toolchain.outputs.toolchain }}
+      - name: Assert derived toolchain
         run: |
           rustc --version
-          rustc --version | grep -F -q "1.99.0"
-          # Stronger than the rustc grep alone: proves the pin itself
-          # is active, not merely that stable happens to be 1.99.0.
+          rustc --version | grep -F -q "${{ steps.toolchain.outputs.toolchain }}"
+          # Stronger than the rustc grep alone: proves the derived
+          # toolchain itself is active, not merely that stable happens
+          # to match it.
           rustup show active-toolchain
-          rustup show active-toolchain | grep -F -q "1.99.0"
+          rustup show active-toolchain | grep -F -q "${{ steps.toolchain.outputs.toolchain }}"
       # Releases are built hermetically — no cargo cache, so restored build
       # state can never influence published artifacts.
       - name: Build
@@ -355,10 +370,6 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    env:
-      # Same pin as the build job, for the same reason: the lockfile
-      # the bump writes must come from the pinned toolchain.
-      RUSTUP_TOOLCHAIN: "1.99.0"
     steps:
       - name: Compute the next development version
         id: next
@@ -399,10 +410,20 @@ jobs:
           else
             echo "main already carries $current; nothing to bump"
           fi
+      # Same derivation as the build job, for the same reason: the
+      # lockfile the bump writes must come from the release toolchain.
+      - name: Derive the release toolchain from Cargo.toml
+        id: toolchain
+        if: steps.current.outputs.bump
+        run: |
+          toolchain=$(sed -n 's/^rust-version = "\([0-9][0-9.]*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$toolchain" || { echo "rust-version not found in Cargo.toml" >&2; exit 1; }
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
         if: steps.current.outputs.bump
         with:
-          toolchain: 1.99.0
+          toolchain: ${{ steps.toolchain.outputs.toolchain }}
       - name: Bump every version surface
         if: steps.current.outputs.bump
         env:
