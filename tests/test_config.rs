@@ -13,7 +13,7 @@ fn repo_config_loads_with_broad_defaults() {
     assert!(cfg.exclusions.contains(&"kernel".to_string()));
     assert!(cfg.report_only);
     assert!(!cfg.kill_switch);
-    // Dry-run is the default in this phase.
+    // Dry-run is the default.
     assert!(cfg.dry_run);
     // Only Factory is an implemented target.
     assert_eq!(cfg.targets, vec![Target::Factory]);
