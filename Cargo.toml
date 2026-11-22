@@ -28,8 +28,7 @@ serde_json = "1"
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 # File locking for the queue (flock): serializes concurrent writers.
 fs2 = "0.4"
-# Base64 for the HTTP Basic auth header. Already a transitive
-# dependency via ureq (same version), so this adds no new crate.
+# Base64 for the HTTP Basic auth header.
 base64 = "0.23"
 # The OBS library: the Factory reads, the devel lookup, the open-SR
 # check, and SR filing all come from geectl now; the local OBS client
