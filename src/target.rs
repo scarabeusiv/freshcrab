@@ -1,6 +1,6 @@
 //! Distribution targets: Factory and Leap.
 //!
-//! freshcrab watches Factory today. Leap is the planned second target
+//! freshcrab watches Factory. Leap is the not-yet-implemented second target
 //! (see `docs/leap-and-cve.md`): stable distros backport security patches
 //! instead of bumping versions, so the "is this fixed?" question is
 //! different there — a CVE is fixed when the backported patch is present,
@@ -9,8 +9,8 @@
 //! the implemented / not-yet-implemented gate.
 //!
 //! Only Factory is implemented. A Leap target parses (so the config
-//! shape is real) but the pipeline refuses to run it until the Leap step
-//! lands — see `Target::is_implemented`.
+//! shape is real) but the pipeline refuses to run it — see
+//! `Target::is_implemented`.
 
 use crate::version::is_newer;
 use serde::{Deserialize, Serialize};
@@ -48,7 +48,7 @@ impl Target {
         }
     }
 
-    /// True when the pipeline implements this target. Only Factory today;
+    /// True when the pipeline implements this target. Only Factory;
     /// Leap is scaffolded but not implemented (see `docs/leap-and-cve.md`).
     pub fn is_implemented(&self) -> bool {
         matches!(self, Target::Factory)
@@ -98,7 +98,7 @@ impl<'de> Deserialize<'de> for Target {
 /// currently ships and the candidate upstream version.
 ///
 /// Factory's policy is a plain RPM version comparison. Leap's policy
-/// (later step) is backport-aware: a CVE is fixed when the backported
+/// (not implemented yet) is backport-aware: a CVE is fixed when the backported
 /// patch is present in the Leap package, even if the version did not
 /// rise — so it consults the CVE validator (`crate::cve`) instead of
 /// comparing versions alone. The watcher holds a policy behind this

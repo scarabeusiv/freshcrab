@@ -6,8 +6,7 @@
 //! the changelog for a version names the CVE, the CVE is fixed in that
 //! version; if it does not, it is not. This module holds the rule and
 //! the validator interface. The data-source integration (fetching the
-//! CVE list and the changelog from OBS) is the later Leap step and is
-//! NOT implemented here.
+//! CVE list and the changelog from OBS) is not implemented here.
 //!
 //! Security is the reason this exists: automated agents get exploited,
 //! so the highest-priority work this system does is security fixes, and
@@ -109,8 +108,8 @@ pub fn changelog_names_cve(changelog: &str, cve: &CveId) -> bool {
 
 /// Validates whether CVEs are fixed in a package version.
 ///
-/// The later Leap step implements this against the CVE data source and
-/// the package changelog from OBS; the check it applies is
+/// An implementation applies this against the CVE
+/// data source and the package changelog from OBS; the check it applies is
 /// `changelog_names_cve`. The Factory path never calls a validator:
 /// for Factory, the version comparison alone decides.
 ///
@@ -118,9 +117,9 @@ pub fn changelog_names_cve(changelog: &str, cve: &CveId) -> bool {
 /// `%check` regression test that proves the fix (see
 /// `docs/leap-and-cve.md`). The changelog entry is the tracking layer
 /// (the CVE is claimed fixed); the regression test is the correctness
-/// layer (the CVE is actually fixed, and stays fixed). The later step
-/// implements it by inspecting the spec's `%check` section for a test
-/// exercising the CVE.
+/// layer (the CVE is actually fixed, and stays fixed). The trait
+/// requires the implementation to report whether the package carries a
+/// `%check` regression test exercising the CVE.
 pub trait CveValidator {
     /// Validate one CVE against one version of a package.
     fn validate(
@@ -144,8 +143,7 @@ pub trait CveValidator {
 
 /// A validator that is explicitly not implemented. It exists so the
 /// Factory path (and tests) can prove the seam: calling it is always an
-/// error, never a silent pass. The real implementation is the later
-/// Leap step.
+/// error, never a silent pass.
 pub struct NotImplementedValidator;
 
 impl CveValidator for NotImplementedValidator {

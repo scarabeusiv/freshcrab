@@ -8,8 +8,8 @@
 //!    entries first, then routine version bumps
 //!    (`Queue::pending()`; see `docs/leap-and-cve.md`),
 //! 2. takes at most `concurrency` entries per run (the per-run batch;
-//!    true parallel workers are a later step — the batch is processed
-//!    sequentially here, and the limit bounds how much one run does),
+//!    the batch is processed sequentially, and the limit bounds how
+//!    much one run does),
 //! 3. stops when the daily SR cap is reached (SRs filed today, counted
 //!    from queue entries carrying a filed `sr_id` with today's
 //!    `updated_at`; dry-run filings do not exist, so dry-run never
@@ -25,15 +25,14 @@
 //! the worker, gated by the dry-run guard. In dry-run the dispatcher
 //! logs the would-do plan for each entry and changes no queue state.
 //!
-//! Crash recovery: a run that died mid-dispatch used to strand entries
-//! in `in_progress` (never retried — `Queue::pending` only matches
-//! `pending`). Every run now starts by resetting stranded `in_progress`
-//! entries to `pending`, and the dispatcher no longer pre-marks an entry
-//! before the worker runs: a crash during the worker leaves the entry
-//! `pending`, so the next run retries it, and the worker's dedup
-//! re-check (open SR) is the backstop against filing twice. A filed SR
-//! is saved to the queue file immediately after `mark_filed`, not only
-//! at the end of the batch, so a crash cannot lose the filed id.
+//! Crash recovery: entries stranded in `in_progress` (`Queue::pending`
+//! only matches `pending`) are reset to `pending` at the start of every
+//! run. The dispatcher does not pre-mark an entry before the worker runs:
+//! a crash during the worker leaves the entry `pending`, so the next run
+//! retries it, and the worker's dedup re-check (open SR) is the backstop
+//! against filing twice. A filed SR is saved to the queue file immediately
+//! after `mark_filed`, not only at the end of the batch, so a crash cannot
+//! lose the filed id.
 //!
 //! TOCTOU: the dedup re-check and the filing POST are two separate OBS
 //! calls — OBS has no conditional create — so a submit request filed by
@@ -41,8 +40,8 @@
 //! duplicate. The re-check is a best-effort dedup, not a guarantee.
 //!
 //! Ordering is strict security-first with no aging: under a sustained
-//! security backlog, routine entries can starve. That is the documented
-//! tradeoff for now (security fixes always win).
+//! security backlog, routine entries can starve (security fixes always
+//! win).
 //!
 //! The daily SR cap counts SRs filed in the local queue file only.
 //! Filings made from another host (or by hand) are not counted — the cap

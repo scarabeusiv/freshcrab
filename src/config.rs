@@ -3,7 +3,7 @@
 //! The config file is YAML, but only the documented subset is supported
 //! (see `docs/runbook.md`): top-level `key: value` scalars (string,
 //! integer, boolean) and top-level `key:` followed by `  - item` string
-//! lists. The parser is hand-written and strict: anything outside the
+//! lists. The parser is strict: anything outside the
 //! subset is rejected, so a bad config fails fast instead of being
 //! silently misread. No YAML library is pulled in (standard library
 //! only); the rest of the crate uses serde_json for JSON APIs.
@@ -53,8 +53,8 @@ pub struct Config {
     pub packages: Vec<String>,
     pub exclusions: Vec<String>,
     /// Distributions to watch. Only Factory is implemented; a Leap
-    /// target parses but the pipeline refuses to run it until the Leap
-    /// step lands (see `docs/leap-and-cve.md` and `Target::is_implemented`).
+    /// target parses but the pipeline refuses to run it
+    /// (see `docs/leap-and-cve.md` and `Target::is_implemented`).
     /// Default: `[Factory]`.
     pub targets: Vec<Target>,
     pub concurrency: u32,
@@ -67,7 +67,7 @@ pub struct Config {
     /// that prevents all writes. Default: true.
     pub report_only: bool,
     /// Dry-run mode: when true, nothing is written or filed; components
-    /// print what they WOULD do. Default true in this phase (the watcher
+    /// print what they WOULD do. Default true (the watcher
     /// is report-only anyway). Overridable by `--dry-run` / `--live` and
     /// by the `FRESHCRAB_DRY_RUN` env var.
     pub dry_run: bool,
