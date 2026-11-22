@@ -94,12 +94,12 @@ place.
    (geectl's `SrPayload` — validated, well-formed OBS request XML), executes
    the update steps through the executor, and files the SR to the devel
    project via the OBS API. The executor is the `UpdateExecutor` trait:
-   this phase ships only the `DryRunExecutor` (dry-run: logs the
+   only the `DryRunExecutor` is shipped (dry-run: logs the
    would-do steps and returns `Planned`; live: refuses, so no SR is
    ever filed on a plan that was not executed). The live executor — the
    agent/CI step that actually performs the branch, bump,
    spec-cleaner, OBS build, rpmcrab and audit steps, following
-   `worker/brief.md` — is a later step. Escalates to a human on build
+   `worker/brief.md` — is not implemented yet. Escalates to a human on build
    failure, unfixable findings, a spec logic change, or a conflicting
    SR.
 
@@ -112,8 +112,7 @@ place.
 | 3 | **PyPI JSON API** | `https://pypi.org/pypi/<name>/json`, for Python packages only. |
 | 4 (signal) | **Distrowatch** | A secondary signal only — never confirms a version on its own. |
 
-**Freshmeat is defunct** (shut down in 2014) and is deliberately not
-used.
+**Freshmeat is defunct and is not used.**
 
 **Direct upstream checks** (the package's source URL / GitHub releases)
 confirm a candidate when the collectors disagree or when a version
@@ -164,7 +163,7 @@ in pure Rust in `src/version.rs` — never a naive string compare:
 
 ## Dry-run
 
-Dry-run is the default in this phase, and it is global: one mode
+Dry-run is the default, and it is global: one mode
 governs the watcher, the queue, the dispatcher, and the worker. Every mutating
 operation goes through the single dry-run guard (`src/dry_run.rs`:
 `DryRun::allow`) before any write, API call, or external action. Reads
@@ -177,9 +176,8 @@ the operation proceeds. The effective mode resolves as CLI flag
 
 ## Leap and CVE validation (planned, scaffolded)
 
-Leap and CVE validation are a later step, after the scaffolding is
-reviewed — see `docs/leap-and-cve.md` for the full design. The
-scaffold is already in the code so that step plugs into named,
+Leap and CVE validation are not implemented yet — see
+`docs/leap-and-cve.md` for the full design. The scaffold provides named,
 tested seams:
 
 - **Targets** (`src/target.rs`): a `Target` is `Factory` or
@@ -191,7 +189,7 @@ tested seams:
   fix's changelog (`.changes`) entry must carry the CVE reference,
   and validation compares the changelog against the CVE list. The
   `changelog_names_cve` check is implemented and tested; the
-  `CveValidator` trait is the interface the later step implements
+  `CveValidator` trait is the interface an implementation uses
   against the CVE data source and the OBS changelog. The Factory
   path never calls a validator. The trait also carries a
   `has_regression_test` hook: a backport is not complete without a
@@ -201,7 +199,7 @@ tested seams:
 - **Security-first ordering** (`src/queue.rs`): entries carry a
   kind — `Routine` or `Security` (CVE-driven) — and `pending()`
   returns security entries before routine ones. The Factory path is
-  routine-only for now.
+  routine-only.
 
 Why Leap is different: stable distros backport security patches
 instead of bumping versions, so a CVE is fixed when the backported
@@ -281,7 +279,7 @@ docs/
   architecture.md      this file
   leap-and-cve.md      Leap + CVE validation design (planned, scaffolded)
   runbook.md           run the container, configure the package set, pause, read the queue
-  assets/logo.svg      project icon (hand-built vector, rpmcrab style)
+  assets/logo.svg      project icon
 
 (The opensuse-packaging-skill docs are NOT in this repo: they are
 fetched at image build time from a tagged release, see the Dockerfile.)

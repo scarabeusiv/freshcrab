@@ -27,16 +27,15 @@ to the devel project. Dry-run is the default: the plan and the exact
 SR payload are logged and nothing is filed. What is NOT yet there is
 the live update executor — the agent/CI step that actually performs
 the branch, bump, spec-cleaner, OBS build, rpmcrab and audit steps.
-Until it exists, live mode refuses to file (the entries escalate
+Live mode refuses to file (the entries escalate
 instead), so no SR is ever filed on a plan that was not executed.
 `worker/` holds the agent brief for that step.
 
-Leap and CVE validation are a planned later step, after this
-scaffolding is reviewed — see `docs/leap-and-cve.md`. The scaffold is
-already in place (distribution targets with Leap gated off, the CVE
-validation rule and validator interface, security-first queue
-ordering), but the Leap watcher logic, the CVE data-source
-integration, and Leap SR filing are not implemented.
+Leap and CVE validation are not implemented yet — see
+`docs/leap-and-cve.md`. The scaffold exists (distribution targets with
+Leap gated off, the CVE validation rule and validator interface,
+security-first queue ordering), but the Leap watcher logic, the CVE
+data-source integration, and Leap SR filing are not implemented.
 
 ## Collectors (priority order)
 
@@ -47,7 +46,7 @@ integration, and Leap SR filing are not implemented.
 3. **PyPI JSON API** — for Python packages only.
 4. **Distrowatch** — secondary signal only.
 
-Freshmeat is defunct (shut down in 2014) and is deliberately not used. A
+Freshmeat is defunct and is not used. A
 candidate version is confirmed before queueing when it comes from
 Repology with status `newest` in at least two distinct repos, when at
 least two collectors agree, or when a direct upstream check confirms
@@ -105,7 +104,7 @@ The agent invokes them by name; see `worker/brief.md` and
 
 ## Dry-run
 
-Dry-run is the default in this phase, and it is global: one mode
+Dry-run is the default, and it is global: one mode
 governs the watcher, the queue, the dispatcher, and the worker. In
 dry-run nothing is written or filed — the watcher polls the collectors
 and prints what it WOULD queue, the queue evaluates the dedup rules and
@@ -119,7 +118,7 @@ logged loudly at startup, so it is always obvious which mode is running.
 podman run --rm -v "$PWD/config.yaml:/app/config.yaml:ro" freshcrab --packages foo bar
 
 # Live: writes the queue state file; with a live executor the dispatcher files SRs
-# (the shipped executor refuses live, so nothing is filed until that step lands).
+# (the shipped executor refuses live, so nothing is filed).
 podman run --rm -v "$PWD/config.yaml:/app/config.yaml:ro" freshcrab --live --packages foo bar
 ```
 
@@ -133,7 +132,7 @@ stdout stays machine-readable JSON. See `docs/runbook.md`.
 Dependabot is on (`.github/dependabot.yml`), weekly, for three
 ecosystems: Rust dependencies (`cargo`), GitHub Actions
 (`github-actions`), and the container base image (`docker`). The setup
-is deliberately strict:
+is strict:
 
 - **No grouping** — each dependency update gets its own PR, so nothing
   hides in a group.
@@ -172,12 +171,11 @@ suppressed). No CodeQL rule is disabled or weakened.
 
 Rust is extracted without a build (`build-mode: none`): CodeQL does
 not support `autobuild` for Rust, so there is deliberately no
-autobuild step. That is the correct CodeQL setup for Rust, not a
-weakening.
+autobuild step.
 
 ## Repository protection
 
-`main` is guarded from the start:
+`main` is guarded:
 
 - Pull requests only — no direct pushes, not even for the owner.
 - At least 1 approving review before merge.

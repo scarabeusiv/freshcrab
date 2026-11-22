@@ -3,8 +3,7 @@
 This is the design for extending freshcrab beyond Factory: validate
 CVEs and submit updates to Leap. It is a **plan + scaffold**, not the
 implementation — the Leap watcher logic, the CVE data-source
-integration, and Leap SR filing are a later step, after PR #1 (the
-scaffolding) is reviewed. What exists now is the extension points:
+integration, and Leap SR filing are not implemented yet. The extension points are:
 `src/target.rs` (distribution targets + the per-target update-policy
 hook), `src/cve.rs` (the CVE validation rule + the validator
 interface), the target/kind on queue entries with security-first
@@ -13,8 +12,7 @@ ordering, and the config `targets:` list with Leap gated off.
 ## Security first
 
 Keeping stuff secure is of central importance, because automated
-agents get exploited. That is the rationale for the whole design
-below, stated up front:
+agents get exploited:
 
 - **(a) Security fixes are the highest-priority work the system
   does.** The queue ranks CVE-driven (security) updates above routine
@@ -29,7 +27,7 @@ below, stated up front:
   the CVE is fixed in this version, or it does not.
 - **(c) The system itself must stay secure.** No credentials in the
   repo, the image, or the fixtures — OBS and GitHub credentials come
-  only via environment variables / mounted secrets, as today. The CVE
+  only via environment variables / mounted secrets. The CVE
   sources are public reads and add no new credential surface. Every
   submit request still goes through the review gate (branch
   protection, required review, green CI), and the agent never
@@ -109,9 +107,7 @@ CVE is *actually* fixed). The rule is:
 > the backport applied.**
 
 Why it exists: a green build proves the code compiles, not that the
-hole is closed. The current practice is copy-patch-and-pray — the
-patch is applied, the build goes green, and nobody has shown the
-vulnerability is actually gone. A regression test that fails
+hole is closed. A regression test that fails
 without the patch and passes with it is the proof the fix works.
 It also guards against regressions: if the patch is later dropped,
 or the code drifts so the fix no longer applies, the test goes red
@@ -121,10 +117,10 @@ The test lives in the package (in `%check`, or in the package's
 test suite run from `%check`), and it travels with the backport —
 it is part of the submission, not an afterthought. The validator
 exposes the hook for checking its presence
-(`CveValidator::has_regression_test` in `src/cve.rs`); the later
-step implements it by inspecting the spec's `%check` section for a
-test exercising the CVE. A submission is complete only when both
-halves hold: the changelog names the CVE **and** a regression test
+(`CveValidator::has_regression_test` in `src/cve.rs`); the trait requires
+the implementation to report whether the package carries a `%check`
+regression test exercising the CVE. A submission is complete only when
+both halves hold: the changelog names the CVE **and** a regression test
 is present (or a documented reason why none is feasible — below).
 
 **Feasibility caveat ("where feasible").** Some CVEs have no
@@ -139,7 +135,7 @@ answered, not guess whether it was asked at all.
 
 ## CVE sources (what to consult)
 
-The implementation step needs two inputs per (Leap release, package):
+CVE validation needs two inputs per (Leap release, package):
 
 - **The CVE list: which CVEs affect this package on this release.**
   The source is the **SUSE CVE database**
@@ -149,13 +145,12 @@ The implementation step needs two inputs per (Leap release, package):
   the SUSE Security Advisories (`SUSE-SU-...`) that delivered the
   fix. That table is the per-product, per-package answer to "does
   this CVE affect us, and is it fixed". The exact machine-readable
-  access to it (API vs the per-CVE pages) is an open item for the
-  implementation step — do not assume an endpoint until it is
+  access to it (API vs the per-CVE pages) is not decided — do not assume an endpoint until it is
   verified.
 - **The package changelog: what the Leap package actually
   contains.** The `.changes` file from OBS for the package on the
   Leap project (public API, no credentials — same as the Factory
-  spec reads today). This is the text `changelog_names_cve` runs
+  spec reads). This is the text `changelog_names_cve` runs
   over.
 - **OBS maintenance data (corroboration).** Leap updates are
   delivered through maintenance incidents (`openSUSE:Maintenance`):
@@ -165,11 +160,10 @@ The implementation step needs two inputs per (Leap release, package):
   for a CVE is corroboration that a fix is in flight; the changelog
   check remains the deciding test.
 
-One verified caveat: `openSUSE:Leap:16.0:Update` does **not** exist
-(404, checked 2026-11-19) — Leap 16.0's update delivery is not the
+One caveat: `openSUSE:Leap:16.0:Update` does **not** exist
+(404) — Leap 16.0's update delivery is not the
 same `:Update` project shape as 15.6. The exact Leap SR target per
-release (maintenance incident vs update project) is therefore part
-of the implementation step, not assumed here.
+release (maintenance incident vs update project) is not fixed here.
 
 ## Planned components
 
@@ -180,7 +174,7 @@ of the implementation step, not assumed here.
 (`openSUSE:Factory`, `openSUSE:Leap:16.0`) and `is_implemented()`.
 Config gains a `targets:` list (default `[factory]`). Only Factory
 is implemented; a Leap target parses but the pipeline refuses to
-run it until the Leap step lands. The queue entry carries its
+run it. The queue entry carries its
 target, so Factory and Leap entries can coexist in one queue.
 
 ### CVE validation step in the pipeline
@@ -203,17 +197,17 @@ validator decides: a CVE whose changelog already names it is fixed
 and produces no entry; a CVE the changelog does not name produces
 a security-kind queue entry. The validator interface is
 `CveValidator` in `src/cve.rs`; the data-source-backed
-implementation is the later step.
+implementation is not implemented yet.
 
 ### Queue ordering: security first
 
 Queue entries carry a kind — `Routine` (version bump) or `Security`
 (CVE-driven). `Queue::pending()` returns security entries before
 routine ones, keeping insertion order within a kind. The dispatcher
-(later phase) drains security entries first, and the daily SR cap is
-consumed by security entries first. The Factory path is routine-only
-for now; the ordering rule is already in place, so CVE-driven
-entries slot in above routine ones the moment they arrive.
+drains security entries first, and the daily SR cap is
+consumed by security entries first. The Factory path is routine-only;
+the ordering rule is in place, so CVE-driven
+entries slot in above routine ones.
 
 ### Worker brief changes for Leap
 
@@ -226,8 +220,8 @@ change, not in the gates:
   and adds exactly one `.changes` entry **naming the CVE**.
 - **Different SR target.** The SR goes to the Leap maintenance
   process (maintenance incident / update project for that release),
-  not to the devel project. The exact target per release is set by
-  the implementation step (see the 16.0 caveat above).
+  not to the devel project. The exact target per release is not fixed here
+  (see the 16.0 caveat above).
 - **Same gates.** spec-cleaner full mode, rpmcrab 0E/0W,
   pre-filing adversarial audit evaluated for every product the spec
   builds for, one `.changes` entry per SR, and the CVE changelog
@@ -237,7 +231,7 @@ change, not in the gates:
   not apply, or a fix that changes behaviour escalates to a human
   — same as any other judgment call.
 
-## Extension points already in the code (this scaffold)
+## Extension points in the code (this scaffold)
 
 - `src/target.rs` — `Target` (Factory / Leap), `obs_project()`,
   `is_implemented()` gate, and the `UpdatePolicy` trait with
@@ -252,16 +246,16 @@ change, not in the gates:
 - `src/watcher.rs` — the watcher carries its `target`, a
   replaceable `policy` (`with_policy`), and an optional
   `cve_validator` (`with_cve_validator`, consulted only for
-  non-Factory targets). A Leap target fails loudly today.
+  non-Factory targets). A Leap target fails loudly.
 - `src/queue.rs` — entries carry `target` and `kind`
   (`UpdateKind::Routine` / `UpdateKind::Security`); `pending()`
-  orders security first. Old queue files (no target/kind) still
+  orders security first. Old queue files (no target/kind)
   load with Factory/Routine defaults.
 - `src/config.rs` / `config.yaml` — the `targets:` list (default
   `[factory]`); `src/main.rs` fails fast on an unimplemented target
   rather than silently skipping it.
 
-## Deliberately NOT in this scaffold
+## Not in this scaffold
 
 - The Leap watcher logic (a Leap client reading the Leap project,
   the backport-aware policy implementation).
@@ -269,8 +263,7 @@ change, not in the gates:
   SUSE CVE database and the changelog from OBS, and wiring them
   into the validator).
 - Leap SR filing (maintenance incident / update project targets).
-- The dispatcher (already a later phase for Factory too).
+- The dispatcher (not part of this scaffold for Factory either).
 
-Those are the later step, after PR #1 is reviewed. This scaffold
-exists so that step plugs into named, tested seams instead of
-requiring a rewrite.
+Those are not implemented yet. The scaffold
+provides the named, tested seams they plug into.

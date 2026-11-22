@@ -58,7 +58,7 @@ and the devel project. Nothing else is assumed.
 
 ## Dry-run
 
-Dry-run is the default in this phase, and it is global: the same mode
+Dry-run is the default, and it is global: the same mode
 governs the watcher, the queue, and this worker. The mode is logged
 loudly at startup (`=== freshcrab DRY-RUN mode ===` or `=== freshcrab
 LIVE mode ===`).
@@ -97,10 +97,10 @@ mode is the only mode that branches, commits, builds, or files.
 When escalating, report: the package, the version, the exact blocker,
 and the evidence (build log line, rpmcrab finding, or diff hunk).
 
-## Leap (later phase — not active yet)
+## Leap (not active yet)
 
-Leap work is a later step, after the scaffolding is reviewed (see
-`docs/leap-and-cve.md`). When it lands, the Leap worker differs from
+Leap work is not implemented yet (see
+`docs/leap-and-cve.md`). The Leap worker differs from
 the Factory worker above in the *kind* of change, not in the gates:
 
 - **Backport patch, not version bump.** Apply the upstream fix as a
