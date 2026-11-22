@@ -75,23 +75,23 @@ pub struct QueueEntry {
     pub kind: UpdateKind,
     /// The OBS submit-request id filed for this entry, if any. Set by
     /// the dispatcher when the SR is filed; used to count SRs filed
-    /// today for the daily cap. Old queue files load with None.
+    /// today for the daily cap. Queue files without an `sr_id` field load with `None`.
     #[serde(default)]
     pub sr_id: Option<String>,
     /// CVE ids this entry fixes (security entries). Empty for routine
     /// bumps. Stored as strings; the worker parses them with
-    /// `CveId::parse`. Old queue files load with an empty list.
+    /// `CveId::parse`. Queue files without a `cves` field load with an empty list.
     #[serde(default)]
     pub cves: Vec<String>,
     /// Why this entry was escalated to a human, if it was. Persisted
     /// with the entry (not only in the run's stdout) so triage does not
     /// need a captured run log, and so a re-run does not re-escalate the
     /// same update: an escalated entry stays parked until a newer
-    /// upstream version arrives. Old queue files load with None.
+    /// upstream version arrives. Queue files without an `escalation_reason` field load with `None`.
     #[serde(default)]
     pub escalation_reason: Option<String>,
     /// When the entry was escalated (epoch seconds, like `updated_at`).
-    /// Old queue files load with None.
+    /// Queue files without an `escalated_at` field load with `None`.
     #[serde(default)]
     pub escalated_at: Option<String>,
     pub created_at: String,
