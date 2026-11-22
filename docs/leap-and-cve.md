@@ -249,7 +249,7 @@ change, not in the gates:
   non-Factory targets). A Leap target fails loudly.
 - `src/queue.rs` — entries carry `target` and `kind`
   (`UpdateKind::Routine` / `UpdateKind::Security`); `pending()`
-  orders security first. Old queue files (no target/kind)
+  orders security first. Queue files without target/kind fields
   load with Factory/Routine defaults.
 - `src/config.rs` / `config.yaml` — the `targets:` list (default
   `[factory]`); `src/main.rs` fails fast on an unimplemented target
