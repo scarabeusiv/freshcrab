@@ -5,7 +5,7 @@
 //! `/public/source/...`, which needs no credentials. freshcrab implements
 //! no OBS logic of its own here — no endpoint construction, no URL
 //! building, no directory XML parsing (see docs/architecture.md for the
-//! rule). The spec Version field is still parsed locally: it is a
+//! rule). The spec Version field is parsed locally: it is a
 //! package-file field, not OBS wire XML.
 
 use geectl::error::GeectlError;
@@ -112,9 +112,9 @@ mod tests {
 
     #[test]
     fn get_spec_encodes_plus_in_package_name() {
-        // Geectl percent-encodes `+` in path segments where the old
-        // code passed it raw; the server decodes both to the same
-        // segment, so the canned URL carries the encoded form.
+        // Geectl percent-encodes `+` in path segments; the server decodes
+        // both forms to the same segment, so the canned URL carries the
+        // encoded form.
         let url = "https://api.opensuse.org/public/source/openSUSE:Factory/libdbus-c%2B%2B/libdbus-c%2B%2B.spec";
         let http = FakeHttpClient::new().with(url, "Name: libdbus-c++\nVersion: 0.9.0\n");
         let obs = ObsClient::new(&http);

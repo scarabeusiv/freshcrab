@@ -8,7 +8,7 @@
 //!    `python3-` or `python-`; the prefix is stripped for the PyPI name).
 //! 4. Distrowatch — secondary signal only (HTML table).
 //!
-//! Freshmeat is DEFUNCT (shut down in 2014) and is deliberately NOT used.
+//! Freshmeat is defunct and is not used.
 //!
 //! A candidate version is confirmed before queueing when any of these
 //! hold: it came from Repology with status `newest` in at least two

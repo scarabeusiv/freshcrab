@@ -37,8 +37,8 @@ pub const STATUSES: &[&str] = &["pending", "in_progress", "done", "blocked", "es
 /// What kind of update a queue entry is. Security (CVE-driven) updates
 /// rank above routine version bumps: the dispatcher drains security
 /// entries first (see `docs/leap-and-cve.md`). The Factory path is
-/// routine-only for now; the kind is carried so the ordering rule is
-/// already in place when CVE-driven entries arrive.
+/// routine-only; the kind is carried so the ordering rule is
+/// in place when CVE-driven entries arrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateKind {
@@ -230,7 +230,7 @@ pub struct Queue {
     entries: Vec<QueueEntry>,
     /// The lock file, held open for the Queue's lifetime. It is never
     /// read — it exists only to hold the flock — so the dead-code lint
-    /// is silenced deliberately.
+    /// is silenced.
     #[allow(dead_code)]
     lock_file: Option<std::fs::File>,
 }
@@ -279,13 +279,11 @@ impl Queue {
             .map_err(|e| QueueError(format!("cannot read queue file {}: {e}", self.path)))?;
         let entries: Vec<QueueEntry> = serde_json::from_str(&text)
             .map_err(|e| QueueError(format!("invalid queue file {}: {e}", self.path)))?;
-        // Compact duplicates left by older versions: before the
-        // in-place refresh, `add` pushed a new entry per run, so a
-        // file written by an older version can hold several entries
-        // for one package. Keep the most recently updated entry per
-        // package (latest `updated_at`, later position wins ties) and
-        // drop the rest, so the file converges to one entry per
-        // package on the next save.
+        // Compact duplicates: a file can hold several entries for one
+        // package. Keep the most recently updated entry per package
+        // (latest `updated_at`, later position wins ties) and drop the
+        // rest, so the file converges to one entry per package on the
+        // next save.
         self.entries = compact(entries);
         Ok(())
     }
@@ -437,8 +435,7 @@ impl Queue {
     /// ([`ErrorKind::AuthFailed`]) is returned as an error instead:
     /// with rotated or expired credentials every candidate would
     /// otherwise be skipped one by one and the run would exit 0 with
-    /// an empty batch — the exact silent failure the typed rejection
-    /// exists to remove. When an entry for the package already exists
+    /// an empty batch. When an entry for the package already exists
     /// (done, blocked, or escalated), it is refreshed in place instead
     /// of pushing a duplicate — one entry per package, always.
     ///
@@ -634,9 +631,8 @@ impl Queue {
 
     /// Crash recovery: reset entries stranded in `in_progress` back to
     /// `pending`, so the next dispatch retries them instead of losing
-    /// them (`pending()` only matches `pending`). A crash between the
-    /// old pre-mark and the save used to strand entries forever; the
-    /// dispatcher calls this at the start of every run. Each reset goes
+    /// them (`pending()` only matches `pending`). The dispatcher calls
+    /// this at the start of every run. Each reset goes
     /// through the dry-run guard, so in dry-run it only records the
     /// would-do. Returns how many entries were reset.
     pub fn reset_stale_in_progress(&mut self, dry_run: &DryRun) -> Result<usize, QueueError> {
@@ -1312,8 +1308,8 @@ mod tests {
 
     #[test]
     fn old_queue_file_loads_with_factory_routine_defaults() {
-        // Queue files written before target/kind existed (no such
-        // fields) still load: the defaults are Factory / Routine.
+        // Queue files without target/kind fields load with
+        // Factory / Routine defaults.
         let path = tmp_path();
         let old_json = r#"[{"package": "foo", "factory_version": "1.9", "upstream_version": "2.0", "source": "repology", "status": "pending", "created_at": "1", "updated_at": "1"}]"#;
         fs::write(&path, old_json).unwrap();
@@ -1586,9 +1582,9 @@ mod tests {
 
     #[test]
     fn load_compacts_pre_fix_duplicates() {
-        // A file written before the in-place refresh can hold several
-        // entries per package; opening it keeps only the most
-        // recently updated entry, and the next save persists that.
+        // A file can hold several entries per package; opening it
+        // keeps only the most recently updated entry, and the next
+        // save persists that.
         let path = tmp_path();
         let text = r#"[
           {"package":"foo","factory_version":"1.9","upstream_version":"2.0","source":"repology","status":"pending","target":"factory","kind":"routine","created_at":"100","updated_at":"100"},
@@ -1846,8 +1842,8 @@ mod tests {
 
     #[test]
     fn old_queue_file_loads_without_sr_id_and_cves() {
-        // A queue file written before sr_id/cves existed (no such keys)
-        // still loads, with None / empty defaults.
+        // A queue file without sr_id/cves keys loads with
+        // None / empty defaults.
         let path = tmp_path();
         let text = "[{\"package\": \"foo\", \"factory_version\": \"1.9\", \"upstream_version\": \"2.0\", \"source\": \"repology\", \"status\": \"pending\", \"target\": \"factory\", \"kind\": \"routine\", \"created_at\": \"1\", \"updated_at\": \"1\"}]";
         fs::write(&path, text).unwrap();
@@ -1903,7 +1899,7 @@ mod tests {
         assert_eq!(refreshed.status, "pending");
         assert_eq!(refreshed.sr_id, None);
         assert_eq!(refreshed.cves, vec!["CVE-2026-99999".to_string()]);
-        // The old SR no longer counts toward the daily cap.
+        // The cleared SR id does not count toward the daily cap.
         assert_eq!(q.srs_filed_today(), 0);
         drop(q);
         let _ = fs::remove_file(&path);
@@ -2103,8 +2099,8 @@ mod tests {
 
     #[test]
     fn old_queue_file_loads_without_escalation_fields() {
-        // A queue file written before escalation_reason/escalated_at
-        // existed still loads, with None defaults.
+        // A queue file without escalation_reason/escalated_at loads
+        // with None defaults.
         let path = tmp_path();
         let text = "[{\"package\": \"foo\", \"factory_version\": \"1.9\", \"upstream_version\": \"2.0\", \"source\": \"repology\", \"status\": \"escalated\", \"target\": \"factory\", \"kind\": \"routine\", \"created_at\": \"1\", \"updated_at\": \"1\"}]";
         fs::write(&path, text).unwrap();

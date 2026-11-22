@@ -34,7 +34,7 @@ fn print_usage() {
     eprintln!("  --config <path>     path to config.yaml (default: config.yaml)");
     eprintln!("  --packages <pkg>... check only these packages (overrides the config list)");
     eprintln!("  --queue <path>      path to the queue state file (default: queue.json)");
-    eprintln!("  --dry-run           force dry-run mode (default in this phase)");
+    eprintln!("  --dry-run           force dry-run mode (default)");
     eprintln!("  --live              force live mode (writes the queue; overrides config and env)");
     eprintln!(
         "The watcher runs in report-only mode by default: it prints the queue as JSON and files nothing."
@@ -122,7 +122,7 @@ fn main() -> ExitCode {
 
     // Targets: only Factory is implemented. A Leap target in the config
     // fails fast here rather than being silently skipped (see
-    // docs/leap-and-cve.md). The per-target loop is the later Leap step.
+    // docs/leap-and-cve.md). Leap per-target processing is not implemented yet.
     for target in &config.targets {
         if !target.is_implemented() {
             eprintln!("target {target} is not yet implemented (see docs/leap-and-cve.md)");
@@ -153,7 +153,7 @@ fn main() -> ExitCode {
     // The OBS client carries the credentials for the authenticated
     // endpoints (the open-SR search the dedup checks use, and filing a
     // submit request). Credentials come from the environment only;
-    // without them those calls fail closed, as before. The OBS client
+    // without them those calls fail closed. The OBS client
     // is geectl's, on its own HTTP client: the freshcrab client keeps
     // the freshcrab User-Agent the collectors need, and the OBS client
     // gets geectl's bounded timeouts. It is built before the watcher:

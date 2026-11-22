@@ -88,8 +88,7 @@ fn map_ureq_auth_error(e: ureq::Error) -> HttpError {
 }
 
 /// The value for an HTTP `Authorization: Basic ...` header. Uses the
-/// `base64` crate (already a transitive dependency via ureq), not a
-/// hand-rolled encoder.
+/// `base64` crate (a direct dependency).
 pub fn basic_auth_header(username: &str, password: &str) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     format!(
@@ -261,8 +260,7 @@ impl FakeHttpClient {
 /// 2xx is the body, 404 is a not-found, and any other status is a
 /// plain failure — except on a credentialed call (`auth` true), where
 /// 401/403 is an auth rejection. A missing canned response is a plain
-/// failure (the old "no canned response" error), never a silent
-/// success.
+/// failure, never a silent success.
 fn canned(
     responses: &HashMap<String, (u16, String)>,
     url: &str,

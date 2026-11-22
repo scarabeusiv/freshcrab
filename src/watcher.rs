@@ -28,8 +28,7 @@ use std::fmt;
 /// Error from checking one package.
 ///
 /// The Leap refusal is a distinct variant, not an [`HttpError`]: a
-/// target that is not implemented yet is not an HTTP failure, and
-/// returning it as one hid that distinction from the caller.
+/// target that is not implemented yet is not an HTTP failure.
 #[derive(Debug)]
 pub enum WatchError {
     /// An HTTP request failed (collector or upstream read).
@@ -37,8 +36,7 @@ pub enum WatchError {
     /// A geectl OBS read failed (the Factory spec or package list).
     Obs(GeectlError),
     /// The target is not implemented yet (Leap): the check is refused
-    /// before any network I/O. The Leap step consults the CVE
-    /// validator here (see `docs/leap-and-cve.md`).
+    /// before any network I/O. No validator is consulted.
     LeapNotImplemented,
 }
 
@@ -98,10 +96,10 @@ impl QueueEntry {
 /// mode (in dry-run it prints what it WOULD queue and writes nothing).
 ///
 /// The target, the update policy, and the CVE validator are extension
-/// points for the Leap step (see `docs/leap-and-cve.md`): the target
+/// points for Leap targets (see `docs/leap-and-cve.md`): the target
 /// defaults to Factory, the policy defaults to the Factory version
-/// comparison, and there is no CVE validator. A Leap watcher will be
-/// built with `with_target` / `with_policy` / `with_cve_validator`.
+/// comparison, and there is no CVE validator. A Leap watcher would be built
+/// with `with_target` / `with_policy` / `with_cve_validator`.
 pub struct Watcher<'a> {
     http: &'a dyn HttpClient,
     factory: FactoryClient<'a>,
@@ -110,8 +108,8 @@ pub struct Watcher<'a> {
     target: Target,
     policy: Box<dyn UpdatePolicy + 'a>,
     /// The CVE validator, consulted only for non-Factory targets
-    /// (Leap). The Factory path never calls it, so it is unread until
-    /// the Leap step lands — the dead-code lint is silenced deliberately
+    /// (Leap). The Factory path never calls it, so it is unread until a
+    /// Leap target is implemented — the dead-code lint is silenced
     /// (it is the Leap extension point, not dead code).
     #[allow(dead_code)]
     cve_validator: Option<Box<dyn CveValidator + 'a>>,
@@ -136,14 +134,14 @@ impl<'a> Watcher<'a> {
     }
 
     /// Set the distribution target (Factory by default). Only Factory is
-    /// implemented; a Leap target here is for the later Leap step.
+    /// implemented; a Leap target is refused at check time.
     pub fn with_target(mut self, target: Target) -> Self {
         self.target = target;
         self
     }
 
     /// Replace the update policy (Factory version comparison by
-    /// default). The Leap step plugs in a backport-aware policy here.
+    /// default). A backport-aware policy plugs in here for Leap targets.
     pub fn with_policy(mut self, policy: Box<dyn UpdatePolicy + 'a>) -> Self {
         self.policy = policy;
         self
@@ -164,11 +162,10 @@ impl<'a> Watcher<'a> {
     pub fn check_package(&self, package: &str) -> Result<Option<QueueEntry>, WatchError> {
         // Leap targets are not implemented yet: fail loudly before any
         // network I/O, so no rate-limited collector requests are burned
-        // (and no package names disclosed) for a target that will be
-        // refused. The Leap step consults the CVE validator here (see
-        // `docs/leap-and-cve.md`) to decide whether a CVE is already
-        // fixed by a backport. The Factory path never reaches this
-        // branch, so it never calls a validator.
+        // (and no package names disclosed) for a target that is refused.
+        // No validator is consulted: the check is refused first. The
+        // Factory path never reaches this branch, so it never calls a
+        // validator.
         if self.target.is_leap() {
             return Err(WatchError::LeapNotImplemented);
         }
@@ -220,7 +217,7 @@ impl<'a> Watcher<'a> {
 
     /// Check a list of packages. Returns the queue entries found. A
     /// package whose check fails (e.g. the Factory spec 404s) is logged
-    /// and skipped; one bad package no longer aborts the whole run.
+    /// and skipped; one bad package does not abort the whole run.
     pub fn check_packages(&self, packages: &[&str]) -> Vec<QueueEntry> {
         let mut entries = Vec::new();
         for package in packages {

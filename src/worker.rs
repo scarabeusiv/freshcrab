@@ -18,14 +18,13 @@
 //! 7. files the SR through [`SrFiling`](geectl::obs::SrFiling).
 //!
 //! The update steps themselves (branch, bump, spec-cleaner, OBS build,
-//! rpmcrab, adversarial audit) are performed by the executor. This
-//! phase ships only the [`DryRunExecutor`]: in dry-run it logs the
-//! would-do steps and returns `Planned`; in live mode it refuses, so no
-//! SR is ever filed on a plan that was not actually executed. The live
-//! executor (the agent/CI step, per `worker/brief.md`) is a later step.
-//! That is deliberate: filing a live SR for an update that never
-//! happened would file a bogus request, so the pipeline stops and
-//! escalates instead.
+//! rpmcrab, adversarial audit) are performed by the executor. Only the
+//! [`DryRunExecutor`] is shipped: in dry-run it logs the would-do steps
+//! and returns `Planned`; in live mode it refuses, so no SR is ever filed
+//! on a plan that was not actually executed. The live executor (the
+//! agent/CI step, per `worker/brief.md`) is not implemented yet. Filing a
+//! live SR for an update that never happened would file a bogus request,
+//! so the pipeline stops and escalates instead.
 //!
 //! Dry-run / live boundary: every mutating step goes through the single
 //! dry-run guard (`DryRun::allow`). In dry-run the worker logs the full
@@ -106,7 +105,7 @@ pub trait UpdateExecutor {
     fn execute(&self, plan: &UpdatePlan, dry_run: &DryRun) -> Result<Execution, String>;
 }
 
-/// The executor shipped in this phase: in dry-run it logs the would-do
+/// The shipped executor: in dry-run it logs the would-do
 /// steps (branch, bump, spec-cleaner, build, rpmcrab, audit) and returns
 /// [`Execution::Planned`]; in live mode it refuses, because the live
 /// executor is the agent/CI step and does not exist yet. Refusing is
@@ -573,8 +572,8 @@ fn format_changes_date(epoch_secs: u64) -> String {
     format!("{weekday} {month_name} {day} {hh:02}:{mm:02}:{ss:02} UTC {year}")
 }
 
-/// Days since the Unix epoch -> (year, month, day). Howard Hinnant's
-/// civil_from_days algorithm (public domain).
+/// Days since the Unix epoch -> (year, month, day). The civil_from_days
+/// algorithm (public domain).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
@@ -662,7 +661,6 @@ mod tests {
 
     #[test]
     fn format_changes_date_known_day() {
-        // 2026-11-19 12:00:00 UTC was a Thursday.
         assert_eq!(
             format_changes_date(1_795_089_600),
             "Thu Nov 19 12:00:00 UTC 2026"
