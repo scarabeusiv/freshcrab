@@ -157,7 +157,7 @@ The freshness workflow is separate from `test.yml`, so a freshness
 failure does not block feature PRs — but it is visible (badge above)
 and it stays red until the Dependabot PR is merged. The repo is kept
 green by merging Dependabot PRs promptly, not by relaxing the checks.
-If a check turns out too noisy in practice, it is relaxed deliberately
+If a check turns out too noisy in practice, it is relaxed
 in a PR with a reason — never silently.
 
 ## Code scanning
@@ -170,7 +170,7 @@ workflow fails the PR when it finds issues (default behaviour — not
 suppressed). No CodeQL rule is disabled or weakened.
 
 Rust is extracted without a build (`build-mode: none`): CodeQL does
-not support `autobuild` for Rust, so there is deliberately no
+not support `autobuild` for Rust, so there is no
 autobuild step.
 
 ## Repository protection
