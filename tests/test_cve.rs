@@ -1,5 +1,5 @@
 //! Integration tests for CVE validation: the changelog rule and the
-//! not-yet-implemented validator stub.
+//! unimplemented validator stub.
 
 use freshcrab::cve::{
     changelog_names_cve, CveId, CveValidation, CveValidator, NotImplementedValidator,
@@ -41,6 +41,6 @@ fn stub_validator_fails_loudly() {
         .has_regression_test("foo", "1.9", &cve)
         .unwrap_err();
     assert!(err.0.contains("not implemented"));
-    // The validation outcome type exists for the later step.
+    // The validation outcome type exists for the Leap step.
     assert_ne!(CveValidation::Fixed, CveValidation::NotFixed);
 }
