@@ -25,8 +25,8 @@ Copy `config.yaml` and edit it:
 
 ```yaml
 # Distributions to watch. Only `factory` is implemented; a Leap target
-# (e.g. `leap-16.0`) parses but the pipeline refuses to run it until
-# the Leap step lands (see docs/leap-and-cve.md).
+# (e.g. `leap-16.0`) parses but the pipeline refuses to run it
+# (see docs/leap-and-cve.md).
 targets:
   - factory
 
@@ -140,7 +140,8 @@ In dry-run (the default) every entry is `planned`: the plan and the
 exact SR payload are logged to stderr, nothing is filed, and the queue
 entry stays `pending`. In live mode the worker files the SR
 (`POST /request?cmd=create`) and the entry is marked `done` with the
-request id — but only once the live executor exists. Until then, live
+request id — once the live executor exists. The live executor is not
+implemented yet: live
 mode refuses to file (the update steps were not performed) and the
 entry escalates instead. Set `home_project` in `config.yaml` (or
 `OSC_USERNAME` in the environment) so the worker can resolve the
@@ -179,8 +180,8 @@ The watcher prints the queue as JSON (one entry per package behind):
 ]
 ```
 
-`target` is the distribution (`factory` today; Leap targets are a
-planned later step — see `docs/leap-and-cve.md`). `kind` is
+`target` is the distribution (`factory`; Leap targets are not
+implemented yet — see `docs/leap-and-cve.md`). `kind` is
 `routine` (version bump) or `security` (CVE-driven); security
 entries are dispatched before routine ones. The persistent queue
 state file (`queue.json`, written by the queue module) holds the
