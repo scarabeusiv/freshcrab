@@ -98,8 +98,9 @@ impl QueueEntry {
 /// The target, the update policy, and the CVE validator are extension
 /// points for Leap targets (see `docs/leap-and-cve.md`): the target
 /// defaults to Factory, the policy defaults to the Factory version
-/// comparison, and there is no CVE validator. A Leap watcher would be built
-/// with `with_target` / `with_policy` / `with_cve_validator`.
+/// comparison, and there is no CVE validator. The target, policy, and
+/// validator are settable via `with_target` / `with_policy` /
+/// `with_cve_validator`.
 pub struct Watcher<'a> {
     http: &'a dyn HttpClient,
     factory: FactoryClient<'a>,
