@@ -129,9 +129,9 @@ jobs:
         include:
           # Both legs pinned, not floating: a latest rollover must
           # never ship the two arches from different OS baselines.
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-26.04, target: x86_64-unknown-linux-gnu }
           # Native arm64 runner: no cross toolchain to maintain.
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-26.04-arm, target: aarch64-unknown-linux-gnu }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
