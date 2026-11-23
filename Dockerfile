@@ -42,9 +42,9 @@ RUN cargo build --release --locked
 # carries just the skill docs.
 FROM registry.opensuse.org/opensuse/tumbleweed:latest AS skill
 
-ARG PACKAGING_SKILL_TAG=v3.24.3
+ARG PACKAGING_SKILL_TAG=v3.27.0
 # The commit the tag points to, pinned alongside it and verified below.
-ARG PACKAGING_SKILL_SHA=57f5e9ddd0eacecc9bf21eb6dc60ac99acf21d64
+ARG PACKAGING_SKILL_SHA=9843825b6e0eaf745e6bb645873921d631cfbf7b
 
 RUN zypper --non-interactive refresh && \
     zypper --non-interactive install --no-recommends git \

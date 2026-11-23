@@ -212,10 +212,10 @@ them by name:
 | `spec-cleaner` | the spec cleaner | `spec-cleaner -i --remove-groups --suse-copyright <spec>` (full mode, final step) |
 | `osc` | the OBS client | branch, build, commit, file SRs via the OBS API |
 | `bugwarden` | the Bugzilla helper | read bugs, post comments |
-| opensuse-packaging-skill docs | the packaging skill (fetched at build time, tag v3.24.3) | read at `/usr/share/doc/freshcrab/opensuse-packaging-skill/` — `SKILL.md` first, then the `references/` section for the block in progress |
+| opensuse-packaging-skill docs | the packaging skill (fetched at build time, tag v3.27.0) | read at `/usr/share/doc/freshcrab/opensuse-packaging-skill/` — `SKILL.md` first, then the `references/` section for the block in progress |
 
 The skill docs are NOT in this repo. They are fetched at image build
-time from tag v3.24.3 of openSUSE/openSUSE-packaging-skill (see the
+time from tag v3.27.0 of openSUSE/openSUSE-packaging-skill (see the
 `ARG PACKAGING_SKILL_TAG` / `ARG PACKAGING_SKILL_SHA` in the Dockerfile —
 the build verifies the clone matches the pinned SHA, so a tag that moves
 fails the build instead of silently changing the image) and copied into the image.
