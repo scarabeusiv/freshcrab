@@ -1,0 +1,7 @@
+# actionlint 1.7.12 predates the ubuntu-26.04 runner images (GA 2026-09-17)
+# and flags the labels unknown. Drop this file once actionlint ships
+# a release whose bundled label list includes them.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm
