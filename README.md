@@ -96,7 +96,7 @@ openSUSE repos — nothing is built from source:
 - `bugwarden` — the Bugzilla helper.
 - opensuse-packaging-skill docs — at
   `/usr/share/doc/freshcrab/opensuse-packaging-skill/` (fetched at
-  build time from tag v3.24.3 of openSUSE/openSUSE-packaging-skill,
+  build time from tag v3.27.0 of openSUSE/openSUSE-packaging-skill,
   not in the repo; see `docs/runbook.md`).
 
 The agent invokes them by name; see `worker/brief.md` and
