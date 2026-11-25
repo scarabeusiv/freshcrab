@@ -2,9 +2,12 @@
 #
 # Strictness is intentional: every dependency update gets its own PR
 # (no grouping — nothing hidden in a group), weekly, and the open-PR
-# limit is set high enough that no update is ever suppressed. Each PR
-# goes through the same branch protection as any other change (green CI
-# + at least 1 approving review); Dependabot PRs are NOT auto-merged.
+# limit is set high enough that no update is ever suppressed. One
+# exception: github/codeql-action/init and .../analyze are grouped (see
+# the github-actions entry below) — CodeQL requires both steps at the
+# same version, so separate PRs mix versions and can never go green.
+# Each PR goes through the same branch protection as any other change
+# (green CI + at least 1 approving review); Dependabot PRs are NOT auto-merged.
 # The repo is kept green by merging Dependabot PRs promptly, not by
 # relaxing the checks — see the "Keeping dependencies fresh" section in
 # the README.
@@ -34,6 +37,14 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 100
+    groups:
+      # CodeQL requires init and analyze at the same version: a
+      # workflow mixing versions fails outright, so separate PRs for the
+      # two steps can never go green. Group them into a single PR.
+      codeql-action:
+        patterns:
+          - "github/codeql-action/init"
+          - "github/codeql-action/analyze"
     # dtolnay/rust-toolchain is pinned to a commit on its stable branch
     # (see test.yml); commits on the toolchain branches are
     # garbage-collected upstream, so dependabot must not "helpfully"
