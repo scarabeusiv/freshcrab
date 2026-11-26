@@ -129,10 +129,7 @@ if [ "$manifest" != "$new" ] || [ "$locked" != "$new" ]; then
 fi
 # git grep exits 1 on no match (clean) and 0 on a match (stale), but
 # 2-plus on a real error (bad pathspec, corrupt index): only exit 1
-# is tolerated, anything else fails loudly. The geectl-pin workflow
-# and deny.toml are excluded: both cite the pinned geectl
-# dependency's version (the pinned geectl tag), not this repo's, so they
-# legitimately still carry the old string after a bump.
+# is tolerated, anything else fails loudly.
 stale_tmp=$(mktemp)
 stale_rc=0
 # The old version must match as a whole token, not a substring: a
@@ -140,7 +137,7 @@ stale_rc=0
 # it (a 10.x release contains the 0.x string). The ERE requires a
 # non-digit, non-dot (or a line edge) on both sides, so a v-prefixed
 # or quoted occurrence still matches while the longer one does not.
-git grep -E -l "(^|[^0-9.])$old_re([^0-9.]|$)" -- ':!Cargo.lock' ':!Cargo.toml' ':!.github/workflows/geectl-pin.yml' ':!deny.toml' >"$stale_tmp" || stale_rc=$?
+git grep -E -l "(^|[^0-9.])$old_re([^0-9.]|$)" -- ':!Cargo.lock' ':!Cargo.toml' >"$stale_tmp" || stale_rc=$?
 if [ "$stale_rc" -gt 1 ]; then
   echo "stale-version check failed (git grep exit $stale_rc)" >&2
   exit 1

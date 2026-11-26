@@ -7,9 +7,9 @@
 //! User-Agent that links to the project repository, as Repology requires
 //! for bulk clients.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Mutex;
 
 pub const USER_AGENT: &str = "freshcrab/0.1 (https://github.com/scarabeusiv/freshcrab)";
 
@@ -204,9 +204,9 @@ impl HttpClient for UreqClient {
 pub struct FakeHttpClient {
     responses: HashMap<String, (u16, String)>,
     post_responses: HashMap<String, (u16, String)>,
-    posted: RefCell<Vec<(String, String)>>,
-    posted_auth: RefCell<Vec<bool>>,
-    authed_gets: RefCell<Vec<String>>,
+    posted: Mutex<Vec<(String, String)>>,
+    posted_auth: Mutex<Vec<bool>>,
+    authed_gets: Mutex<Vec<String>>,
 }
 
 impl FakeHttpClient {
@@ -240,19 +240,19 @@ impl FakeHttpClient {
     /// The POSTs made through this client, as (url, body) pairs, in
     /// order. Tests assert on this; production never calls it.
     pub fn posted(&self) -> Vec<(String, String)> {
-        self.posted.borrow().clone()
+        self.posted.lock().unwrap().clone()
     }
 
     /// Whether each recorded POST carried HTTP Basic auth, in order
     /// (parallel to `posted()`). Tests assert the filing POST was
     /// authenticated; production never calls it.
     pub fn posted_auth(&self) -> Vec<bool> {
-        self.posted_auth.borrow().clone()
+        self.posted_auth.lock().unwrap().clone()
     }
 
     /// The URLs fetched with Basic auth, in order.
     pub fn authed_gets(&self) -> Vec<String> {
-        self.authed_gets.borrow().clone()
+        self.authed_gets.lock().unwrap().clone()
     }
 }
 
@@ -289,14 +289,15 @@ impl HttpClient for FakeHttpClient {
 
     fn get_auth(&self, url: &str, username: &str, password: &str) -> Result<String, HttpError> {
         let _ = (username, password);
-        self.authed_gets.borrow_mut().push(url.to_string());
+        self.authed_gets.lock().unwrap().push(url.to_string());
         canned(&self.responses, url, "no canned response", true)
     }
 
     fn post(&self, url: &str, body: &str, auth: Option<(&str, &str)>) -> Result<String, HttpError> {
-        self.posted_auth.borrow_mut().push(auth.is_some());
+        self.posted_auth.lock().unwrap().push(auth.is_some());
         self.posted
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push((url.to_string(), body.to_string()));
         canned(
             &self.post_responses,
@@ -338,14 +339,21 @@ pub fn map_obs_credentials_error(e: &geectl::error::GeectlError) -> geectl::erro
     use geectl::error::GeectlError;
     // The parenthetical is geectl's fixed no-credentials wording
     // (`ObsClient` in geectl's obs.rs): freshcrab has no password-file
-    // variable, so the whole phrase maps to the `OSC_*` pair. The
-    // single-name replaces below cover any other `GEECTL_OBS_*`
+    // variable, so the whole phrase maps to the `OSC_*` pair. geectl
+    // 0.2.2 also offers an API-key alternative
+    // (`GEECTL_OBS_APIKEY[_FILE]`); freshcrab reads no API key, so
+    // that alternative is dropped from the phrase instead of named.
+    // The single-name replaces below cover any other `GEECTL_OBS_*`
     // mention; `GEECTL_OBS_PASSWORD_FILE` goes first because it
     // contains `GEECTL_OBS_PASSWORD` as a prefix.
     let context = e
         .context
         .replace(
             "(GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            "(OSC_USERNAME + OSC_PASSWORD)",
+        )
+        .replace(
+            "(GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
             "(OSC_USERNAME + OSC_PASSWORD)",
         )
         .replace("GEECTL_OBS_PASSWORD_FILE", "OSC_PASSWORD")
@@ -417,6 +425,18 @@ impl geectl::http::HttpClient for FakeHttpClient {
         ))
     }
 
+    fn post_json_with(
+        &self,
+        url: &str,
+        _body: &str,
+        _credentials: &geectl::auth::Credentials,
+    ) -> Result<String, geectl::error::GeectlError> {
+        Err(geectl::error::GeectlError::new(
+            geectl::error::ErrorKind::NetworkError,
+            format!("no canned post_json_with response for {url}"),
+        ))
+    }
+
     fn post_text(
         &self,
         url: &str,
@@ -426,6 +446,30 @@ impl geectl::http::HttpClient for FakeHttpClient {
         Err(geectl::error::GeectlError::new(
             geectl::error::ErrorKind::NetworkError,
             format!("no canned post_text response for {url}"),
+        ))
+    }
+
+    fn put_json_with(
+        &self,
+        url: &str,
+        _body: &str,
+        _credentials: &geectl::auth::Credentials,
+    ) -> Result<String, geectl::error::GeectlError> {
+        Err(geectl::error::GeectlError::new(
+            geectl::error::ErrorKind::NetworkError,
+            format!("no canned put_json_with response for {url}"),
+        ))
+    }
+
+    fn patch_json_with(
+        &self,
+        url: &str,
+        _body: &str,
+        _credentials: &geectl::auth::Credentials,
+    ) -> Result<String, geectl::error::GeectlError> {
+        Err(geectl::error::GeectlError::new(
+            geectl::error::ErrorKind::NetworkError,
+            format!("no canned patch_json_with response for {url}"),
         ))
     }
 
@@ -461,6 +505,18 @@ impl geectl::http::HttpClient for FakeHttpClient {
         Err(geectl::error::GeectlError::new(
             geectl::error::ErrorKind::NetworkError,
             format!("no canned delete response for {url}"),
+        ))
+    }
+
+    fn delete_json_with(
+        &self,
+        url: &str,
+        _body: &str,
+        _credentials: &geectl::auth::Credentials,
+    ) -> Result<String, geectl::error::GeectlError> {
+        Err(geectl::error::GeectlError::new(
+            geectl::error::ErrorKind::NetworkError,
+            format!("no canned delete_json_with response for {url}"),
         ))
     }
 }
@@ -588,6 +644,16 @@ mod tests {
         assert_eq!(mapped.kind(), ErrorKind::ConfigError);
         assert_eq!(
             mapped.context,
+            "checking for open submit requests requires OBS credentials (OSC_USERNAME + OSC_PASSWORD)"
+        );
+        // The 0.2.2 wording offers an API-key alternative freshcrab
+        // does not read: it is dropped, not named.
+        let api_key = GeectlError::new(
+            ErrorKind::ConfigError,
+            "checking for open submit requests requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
+        );
+        assert_eq!(
+            map_obs_credentials_error(&api_key).context,
             "checking for open submit requests requires OBS credentials (OSC_USERNAME + OSC_PASSWORD)"
         );
         // An error that names no GEECTL_OBS_* variable passes through.
