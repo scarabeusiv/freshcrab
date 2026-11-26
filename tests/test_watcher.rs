@@ -93,7 +93,7 @@ fn pypi_fixture_version() {
 fn dry_run_watcher_prints_would_queue_and_writes_nothing() {
     // In dry-run the watcher still polls the collectors and prints what it
     // WOULD queue; the queue state is untouched (there is no queue file
-    // here at all — the watcher never writes one).
+    // here at all — the watcher writes none).
     let dry_run = DryRun::new(true);
     let repology = r#"[{"repo": "fedora_41", "version": "2.0", "status": "newest"}, {"repo": "debian_12", "version": "2.0", "status": "newest"}]"#;
     let http = FakeHttpClient::new()

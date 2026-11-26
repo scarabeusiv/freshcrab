@@ -11,7 +11,7 @@
 # version, not this repo's), so there are no doc sentences or generated
 # files to rewrite — unlike rpmcrab's script, there is no `make gen` and
 # no version-consistency gate to run afterwards; the script ends with its
-# own consistency check instead. Historical mentions are left alone.
+# own consistency check instead.
 set -euo pipefail
 
 # No leading zeros: Cargo rejects them, and only after the tree is edited.
@@ -37,7 +37,7 @@ fi
 # the script creates and, on any nonzero exit, restores the two
 # version surfaces. EXIT (not ERR) is what makes explicit `exit 1`
 # validation failures restore too — ERR never fires for an explicit
-# exit, so a post-edit drift/mismatch/stale failure used to leave a
+# exit, so a post-edit drift/mismatch/stale failure would leave a
 # dirty tree behind. Installed after the clean-tree precondition: a
 # failure before this point has edited nothing, so there is nothing
 # to restore.
@@ -105,11 +105,11 @@ subst "/^\[package\]/,/^\[/s/^\([[:space:]]*version[[:space:]]*=[[:space:]]*\)\"
 
 # -p freshcrab updates only this crate's lock entry; dependencies stay
 # put. Anything more (a newer cargo rewriting the lock format, say)
-# does not belong in a version bump.
+# is out of scope for a version bump.
 cargo update -p freshcrab --quiet
 # Compare against HEAD, not the worktree: a staged pre-existing edit
 # would otherwise evade the check. Both surfaces must move exactly
-# one line each (the version line); anything more does not belong in
+# one line each (the version line); anything more is out of scope for
 # a version bump.
 toml_diff=$(git diff HEAD --numstat -- Cargo.toml | cut -f1-2)
 lock_diff=$(git diff HEAD --numstat -- Cargo.lock | cut -f1-2)

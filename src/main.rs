@@ -122,7 +122,7 @@ fn main() -> ExitCode {
 
     // Targets: only Factory is implemented. A Leap target in the config
     // fails fast here rather than being silently skipped (see
-    // docs/leap-and-cve.md). Leap per-target processing is not implemented yet.
+    // docs/leap-and-cve.md). Leap per-target processing is the remaining work.
     for target in &config.targets {
         if !target.is_implemented() {
             eprintln!("target {target} is not yet implemented (see docs/leap-and-cve.md)");
@@ -143,8 +143,8 @@ fn main() -> ExitCode {
 
     if config.kill_switch {
         // The human message goes to stderr; stdout stays valid JSON
-        // (an empty report) so `freshcrab | jq` does not break exactly
-        // when the pipeline is paused.
+        // (an empty report) so `freshcrab | jq` keeps working when the
+        // pipeline is paused.
         eprintln!("kill switch is on: pipeline paused, nothing queued.");
         println!("[]");
         return ExitCode::from(0);
@@ -331,7 +331,7 @@ fn main() -> ExitCode {
     // files submit requests to the devel projects. Dry-run (default
     // true) still applies: the worker logs the plan and the exact SR
     // payload and files nothing. The live executor is the agent/CI
-    // step and does not exist yet, so in live mode the DryRunExecutor
+    // step and is the remaining work, so in live mode the DryRunExecutor
     // refuses and the entries escalate instead of filing.
     let executor = DryRunExecutor;
     let worker = Worker::new(
@@ -368,9 +368,9 @@ fn main() -> ExitCode {
 /// variable is unset or empty. The pair is validated with geectl's
 /// `validate_basic` (no `:` in the username, non-empty password), so
 /// a malformed pair fails fast here instead of 401ing at the first
-/// request. geectl's own resolver is not used: it reads the
-/// `GEECTL_OBS_*` variables, which are the wrong names for freshcrab
-/// users.
+/// request. geectl's own resolver reads the `GEECTL_OBS_*` variables,
+/// which are the wrong names for freshcrab users, so freshcrab resolves
+/// credentials itself.
 fn obs_credentials_from_env() -> Result<Option<Credentials>, GeectlError> {
     let username = std::env::var("OSC_USERNAME")
         .ok()

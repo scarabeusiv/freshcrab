@@ -19,12 +19,10 @@ pub const USER_AGENT: &str = "freshcrab/0.1 (https://github.com/scarabeusiv/fres
 /// a distinct variant: the caller can tell an auth rejection apart
 /// from a 500 or a transport failure, so credential rotation fails
 /// the run loudly instead of yielding per-package skips. A 401/403
-/// on an unauthenticated read is [`HttpError::Other`] — there are no
-/// credentials to reject, so a proxy 401 on a public read must not
-/// fail the whole run. A 404 is a distinct variant too
+/// on an unauthenticated read is [`HttpError::Other`] — a proxy 401 on
+/// a public read leaves the run going. A 404 is a distinct variant too
 /// ([`HttpError::NotFound`]): the status, not the error text, decides
-/// it, so a mapping can never mistake another failure for a missing
-/// resource. Any other failure is [`HttpError::Other`].
+/// it, so a mapping matches a missing resource only by its status. Any other failure is [`HttpError::Other`].
 #[derive(Debug)]
 pub enum HttpError {
     /// The server rejected the credentials (HTTP 401/403). Carries
@@ -63,8 +61,7 @@ impl fmt::Display for HttpError {
 impl std::error::Error for HttpError {}
 
 /// Map a ureq error to [`HttpError`] for an unauthenticated read:
-/// every failure is a plain failure. A 401/403 here is not an auth
-/// rejection — there are no credentials to reject.
+/// every failure is a plain failure, 401/403 included.
 fn map_ureq_error(e: ureq::Error) -> HttpError {
     match e {
         ureq::Error::StatusCode(404) => HttpError::NotFound(e.to_string()),
@@ -102,15 +99,14 @@ pub fn basic_auth_header(username: &str, password: &str) -> String {
 /// `get` is the unauthenticated read (collectors, the OBS public API).
 /// The authenticated calls are for the OBS API endpoints that 401
 /// without credentials: `get_auth` (the open-submit-request search) and
-/// `post` (filing a submit request). Credentials are passed per call,
-/// never stored in the client, so a collector request can never carry
-/// OBS credentials to a third party.
+/// `post` (filing a submit request). Credentials are passed per call and
+/// live outside the client, so collector requests stay unauthenticated.
 pub trait HttpClient {
     fn get(&self, url: &str) -> Result<String, HttpError>;
 
     /// A GET with HTTP Basic auth. The default implementation ignores
-    /// the credentials and calls `get` (for fakes that do not model
-    /// auth); real clients apply the `Authorization` header.
+    /// the credentials and calls `get` (for fakes without an auth model);
+    /// real clients apply the `Authorization` header.
     fn get_auth(&self, url: &str, username: &str, password: &str) -> Result<String, HttpError> {
         let _ = (username, password);
         self.get(url)
@@ -180,9 +176,9 @@ impl HttpClient for UreqClient {
         if let Some((username, password)) = auth {
             req = req.header("Authorization", basic_auth_header(username, password));
         }
-        // Only a credentialed POST can be an auth rejection: with no
-        // credentials there is nothing to reject, so a 401/403 is a
-        // plain failure (the same split as `get` vs `get_auth`).
+        // Only a credentialed POST can be an auth rejection: without
+        // credentials a 401/403 is a plain failure (the same split as
+        // `get` vs `get_auth`).
         let map_err = if auth.is_some() {
             map_ureq_auth_error
         } else {
@@ -245,7 +241,7 @@ impl FakeHttpClient {
 
     /// Whether each recorded POST carried HTTP Basic auth, in order
     /// (parallel to `posted()`). Tests assert the filing POST was
-    /// authenticated; production never calls it.
+    /// authenticated; production leaves it unused.
     pub fn posted_auth(&self) -> Vec<bool> {
         self.posted_auth.lock().unwrap().clone()
     }
@@ -260,7 +256,7 @@ impl FakeHttpClient {
 /// 2xx is the body, 404 is a not-found, and any other status is a
 /// plain failure — except on a credentialed call (`auth` true), where
 /// 401/403 is an auth rejection. A missing canned response is a plain
-/// failure, never a silent success.
+/// failure.
 fn canned(
     responses: &HashMap<String, (u16, String)>,
     url: &str,
@@ -367,7 +363,7 @@ pub fn map_obs_credentials_error(e: &geectl::error::GeectlError) -> geectl::erro
 /// `#[cfg(test)]`: integration tests link the library without
 /// `cfg(test)`, so a test-gated impl would be invisible to them and
 /// `tests/test_sr.rs` could not build a geectl client over the fake.
-/// Production never uses this impl — the binary builds a geectl
+/// Production leaves this impl unused — the binary builds a geectl
 /// `UreqClient` for the OBS client.
 impl geectl::http::HttpClient for FakeHttpClient {
     fn get(&self, url: &str) -> Result<String, geectl::error::GeectlError> {
@@ -394,7 +390,7 @@ impl geectl::http::HttpClient for FakeHttpClient {
             // `require_credentials_transport` both accept it); the
             // no-credentials ConfigError is raised by `ObsClient`
             // methods (`has_open_sr`, `create_request`) before any
-            // HTTP call, so it is never the fake's to produce.
+            // HTTP call, so the fake leaves it unproduced.
             _ => <Self as HttpClient>::get(self, url).map_err(|e| map_geectl_error(&e)),
         }
     }
@@ -617,8 +613,7 @@ mod tests {
     #[test]
     fn ureq_mappers_map_404_by_status() {
         // The real client's mappers decide 404 by status, like the
-        // fake's `canned`: a 404 is NotFound on both paths, never a
-        // plain failure, and never an auth rejection.
+        // fake's `canned`: a 404 maps to NotFound on both paths.
         let err = map_ureq_error(ureq::Error::StatusCode(404));
         assert!(err.is_not_found());
         assert!(!err.is_auth_rejected());
@@ -646,8 +641,7 @@ mod tests {
             mapped.context,
             "checking for open submit requests requires OBS credentials (OSC_USERNAME + OSC_PASSWORD)"
         );
-        // The 0.2.2 wording offers an API-key alternative freshcrab
-        // does not read: it is dropped, not named.
+        // The 0.2.2 wording offers an API-key alternative; freshcrab drops it.
         let api_key = GeectlError::new(
             ErrorKind::ConfigError,
             "checking for open submit requests requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",

@@ -3,8 +3,8 @@ name: dependency-review
 on:
   pull_request:
 
-# PR-only: cancel a superseded run of the same workflow on the same
-# ref, like test.yml does for pull requests.
+# PR-only: a newer run cancels the previous run of the same workflow
+# on the same ref, like test.yml does for pull requests.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

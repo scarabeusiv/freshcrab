@@ -10,16 +10,15 @@ OBS, validates it, and submits the update to the devel project.
 ## OBS access rule
 
 All OBS interaction goes through geectl's library. freshcrab implements
-no OBS logic of its own: no OBS client of its own, no request/response XML
+no OBS logic of its own: it has no OBS client, no request/response XML
 handling, no endpoint construction, no OBS URL building. The Factory
 reads (`src/factory.rs`: the spec via `cat`, the package list via
 `list_packages`), the devel lookup, the open-SR check, and SR filing
 all run through geectl.
 
 Any new OBS need goes to geectl first and freshcrab picks it up from a
-geectl release; it is never implemented locally. Reviewers enforce
-this: a freshcrab PR adding OBS logic is refused, not refactored in
-place.
+geectl release; local implementation stays out. Reviewers enforce
+this: a freshcrab PR adding OBS logic is refused.
 
 ## Components
 
@@ -95,11 +94,11 @@ place.
    the update steps through the executor, and files the SR to the devel
    project via the OBS API. The executor is the `UpdateExecutor` trait:
    only the `DryRunExecutor` is shipped (dry-run: logs the
-   would-do steps and returns `Planned`; live: refuses, so no SR is
-   ever filed on a plan that was not executed). The live executor — the
-   agent/CI step that actually performs the branch, bump,
-   spec-cleaner, OBS build, rpmcrab and audit steps, following
-   `worker/brief.md` — is not implemented yet. Escalates to a human on build
+   would-do steps and returns `Planned`; live: refuses, so an SR is filed
+   only on a plan that was executed). The live executor — the agent/CI step
+   that actually performs the branch, bump, spec-cleaner, OBS build,
+   rpmcrab and audit steps, following `worker/brief.md` — is the
+   remaining work. Escalates to a human on build
    failure, unfixable findings, a spec logic change, or a conflicting
    SR.
 
@@ -110,9 +109,9 @@ place.
 | 1 (primary) | **Repology** (repology.org) | Newest version across hundreds of distros and upstreams, JSON API (`GET /api/v1/project/<name>`). Statuses: newest, devel, unique, outdated, legacy, rolling, noscheme, incorrect, untrusted, ignored. Rate limit 1 request/second — the collector paces itself. |
 | 2 | **Anitya / release-monitoring.org** | Upstream releases (GitHub, GitLab, PyPI, ...), JSON API (`GET /api/v2/projects/?name=<name>`). |
 | 3 | **PyPI JSON API** | `https://pypi.org/pypi/<name>/json`, for Python packages only. |
-| 4 (signal) | **Distrowatch** | A secondary signal only — never confirms a version on its own. |
+| 4 (signal) | **Distrowatch** | A secondary signal only — it confirms a version only with another source. |
 
-**Freshmeat is defunct and is not used.**
+**Freshmeat is excluded as a source.**
 
 **Direct upstream checks** (the package's source URL / GitHub releases)
 confirm a candidate when the collectors disagree or when a version
@@ -123,19 +122,19 @@ needs a second source.
 A candidate version is queued only when it is confirmed:
 
 - the Repology candidate has status `newest` in at least two distinct
-  repos (a single `newest` entry is a max, not a consensus, so it does
-  not confirm on its own), or
+  repos (a single `newest` entry is a max, not a consensus, so it
+  confirms only with another source), or
 - at least two collectors agree on the same version (RPM version
   equality), or
 - a direct upstream check confirms the version.
 
-A Distrowatch-only candidate never confirms alone. A pre-release
-(`1.0~rc1`, `2.0~beta`) is never newer than the released version.
+A Distrowatch-only candidate confirms only with another source. A pre-release
+(`1.0~rc1`, `2.0~beta`) stays below the released version.
 
 ## Version comparison
 
 Comparison is proper RPM version comparison (`rpmvercmp`), implemented
-in pure Rust in `src/version.rs` — never a naive string compare:
+in pure Rust in `src/version.rs` — version-segment ordering:
 
 - numeric segments compare numerically (`1.10` > `1.9`),
 - `~` sorts before everything including the end (a tilde version is a
@@ -147,13 +146,12 @@ in pure Rust in `src/version.rs` — never a naive string compare:
 
 ## Gate rules (for the worker phase)
 
-- Branch from the devel project, never from Factory directly.
+- Branch from the devel project; Factory takes submissions from devel only.
 - One `.changes` entry per package per SR, describing the net change.
 - spec-cleaner in full mode as the final step; if its output is wrong,
-  fix spec-cleaner, never hand-pick parts of its diff.
+  fix spec-cleaner and apply its diff whole.
 - rpmcrab over the built RPMs: target 0 errors / 0 warnings. Findings
-  are fixed, never filtered. Info-severity findings are not fix
-  targets.
+  are fixed at the cause. Info-severity findings stay informational.
 - Pre-filing adversarial audit over the exact final diff, evaluated
   for every product the spec builds for (openSUSE / Leap / SLE /
   SL Micro).
@@ -176,13 +174,13 @@ the operation proceeds. The effective mode resolves as CLI flag
 
 ## Leap and CVE validation (planned, scaffolded)
 
-Leap and CVE validation are not implemented yet — see
+Leap and CVE validation are the remaining work — see
 `docs/leap-and-cve.md` for the full design. The scaffold provides named,
 tested seams:
 
 - **Targets** (`src/target.rs`): a `Target` is `Factory` or
   `Leap { version }`, with the OBS project and an
-  implemented/not-yet-implemented gate. Config has a `targets:`
+  implemented/planned gate. Config has a `targets:`
   list (default `[factory]`); a Leap target parses but the pipeline
   refuses to run it. Queue entries carry their target.
 - **CVE validation** (`src/cve.rs`): the rule is that a security
@@ -191,7 +189,7 @@ tested seams:
   `changelog_names_cve` check is implemented and tested; the
   `CveValidator` trait is the interface an implementation uses
   against the CVE data source and the OBS changelog. The Factory
-  path never calls a validator. The trait also carries a
+  path skips the validator. The trait also carries a
   `has_regression_test` hook: a backport is not complete without a
   `%check` regression test that fails on the unpatched code and
   passes with the fix (or a documented reason why none is
@@ -207,12 +205,13 @@ patch is present (the changelog names it), not when the version
 number rises. Security is the highest-priority work the system does
 (see `docs/leap-and-cve.md` for the security-first rationale: the
 queue ordering, the changelog verification, and the system itself
-staying secure — no credentials in the repo/image/fixtures, every
-SR through the review gate, no bypassing the dedup/review checks).
+staying secure — credentials outside the repo/image/fixtures, every
+SR through the review gate, the dedup/review checks in the path for
+every submission).
 
 ## Secrets
 
-No credentials are read from the repo. OBS credentials (oscrc) and the
+Credentials live outside the repo. OBS credentials (oscrc) and the
 GitHub token are injected via environment variables / mounted secrets
 (GitHub Actions secrets in CI, a mounted file in the container). The
 Factory and devel-project reads use the OBS public API and need no
@@ -223,7 +222,7 @@ unchecked dedup. The credentials are read from the `OSC_USERNAME` /
 `OSC_PASSWORD` environment variables; the search uses them (HTTP Basic
 auth) when present, and filing a submit request requires them (the OBS
 API accepts HTTP Basic auth with oscrc credentials). The values are
-never logged.
+Logging excludes the values.
 
 ## Layout
 
@@ -247,7 +246,7 @@ src/
   target.rs            distribution targets (Factory / Leap) + the
                        per-target update-policy hook
   cve.rs               CVE validation: the changelog-carries-the-CVE rule
-                       + the validator interface (not yet implemented)
+                       + the validator interface (planned)
   watcher.rs           collectors + confirmation + Factory compare
   queue.rs             queue state file, deduplication, security-first
                        ordering (kind: routine / security); filed SR ids
@@ -281,6 +280,6 @@ docs/
   runbook.md           run the container, configure the package set, pause, read the queue
   assets/logo.svg      project icon
 
-(The opensuse-packaging-skill docs are NOT in this repo: they are
+(The opensuse-packaging-skill docs live outside this repo: they are
 fetched at image build time from a tagged release, see the Dockerfile.)
 ```

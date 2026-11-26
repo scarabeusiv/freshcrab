@@ -4,14 +4,14 @@
 //! changelog (`.changes`) entry must carry the CVE reference. Validation
 //! compares the package's changelog entries against the CVE list — if
 //! the changelog for a version names the CVE, the CVE is fixed in that
-//! version; if it does not, it is not. This module holds the rule and
+//! version; otherwise it is unfixed. This module holds the rule and
 //! the validator interface. The data-source integration (fetching the
-//! CVE list and the changelog from OBS) is not implemented here.
+//! CVE list and the changelog from OBS) is the remaining work.
 //!
 //! Security is the reason this exists: automated agents get exploited,
 //! so the highest-priority work this system does is security fixes, and
 //! the changelog check is the verification that a security fix actually
-//! landed — not a version number going up, which a backport does not do.
+//! landed: the changelog names the fix, while the version number stays put.
 
 use std::fmt;
 
@@ -70,7 +70,7 @@ impl std::error::Error for CveError {}
 pub enum CveValidation {
     /// The changelog for this version names the CVE: the fix is present.
     Fixed,
-    /// The changelog for this version does not name the CVE: not fixed.
+    /// The changelog for this version lacks the CVE: unfixed.
     NotFixed,
     /// Could not determine (changelog or CVE data unavailable).
     Unknown,
@@ -80,11 +80,10 @@ pub enum CveValidation {
 ///
 /// Case-insensitive on the id. The match must be a standalone id: a
 /// digit right after means the changelog names a longer number that
-/// merely starts with this id (`CVE-2026-123` does not match a
-/// changelog that names `CVE-2026-1234`), and an alphanumeric right
-/// before means the match is part of a longer token (`XCVE-2026-12345`
-/// does not match `CVE-2026-12345`). Returns false for an empty
-/// changelog.
+/// merely starts with this id (`CVE-2026-123` skips a changelog that
+/// names `CVE-2026-1234`), and an alphanumeric right before means the
+/// match is part of a longer token (`XCVE-2026-12345` skips
+/// `CVE-2026-12345`). An empty changelog returns false.
 pub fn changelog_names_cve(changelog: &str, cve: &CveId) -> bool {
     let haystack = changelog.to_ascii_lowercase();
     let needle = cve.as_str().to_ascii_lowercase();
@@ -110,7 +109,7 @@ pub fn changelog_names_cve(changelog: &str, cve: &CveId) -> bool {
 ///
 /// An implementation applies this against the CVE
 /// data source and the package changelog from OBS; the check it applies is
-/// `changelog_names_cve`. The Factory path never calls a validator:
+/// `changelog_names_cve`. The Factory path skips the validator:
 /// for Factory, the version comparison alone decides.
 ///
 /// `has_regression_test` is the second half of the evidence: the
@@ -141,9 +140,9 @@ pub trait CveValidator {
     ) -> Result<bool, CveError>;
 }
 
-/// A validator that is explicitly not implemented. It exists so the
-/// Factory path (and tests) can prove the seam: calling it is always an
-/// error, never a silent pass.
+/// A validator that is explicitly unimplemented. It exists so the
+/// Factory path (and tests) can prove the seam: calling it always
+/// errors.
 pub struct NotImplementedValidator;
 
 impl CveValidator for NotImplementedValidator {
@@ -246,8 +245,7 @@ mod tests {
         let cve = CveId::parse("CVE-2026-12345").unwrap();
         let err = validator.validate("foo", "1.9", &cve).unwrap_err();
         assert!(err.0.contains("not implemented"));
-        // The regression-test hook fails loudly too, never silently
-        // reporting "no test" or "test present".
+        // The regression-test hook fails loudly too.
         let err = validator
             .has_regression_test("foo", "1.9", &cve)
             .unwrap_err();

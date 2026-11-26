@@ -44,8 +44,8 @@
 //! win).
 //!
 //! The daily SR cap counts SRs filed in the local queue file only.
-//! Filings made from another host (or by hand) are not counted — the cap
-//! is a local guard, not a global one.
+//! Filings made from another host (or by hand) fall outside the cap —
+//! the cap is a local guard.
 
 use crate::config::Config;
 use crate::dry_run::DryRun;
@@ -216,8 +216,8 @@ impl<'a> Dispatcher<'a> {
                     // problem: stop the batch and fail the run loudly
                     // instead of escalating package by package. The
                     // entry stays pending — the next run retries it
-                    // once the credentials are fixed. The queue is not
-                    // saved again here: filings already made are safe
+                    // once the credentials are fixed. The queue skips a second save here:
+                    // filings already made are safe
                     // (each was saved immediately, `mark_filed` + `save`
                     // per filing), but this entry's still-pending state
                     // and any earlier in-memory mutations (escalations,
@@ -991,9 +991,9 @@ mod tests {
         queue.save(&live).unwrap();
         drop(queue);
 
-        // A non-ASCII package name is not a valid OBS name: the
+        // A non-ASCII package name fails the OBS-name check: the
         // worker's devel lookup rejects it and the entry escalates
-        // instead of reaching the network with a bad name.
+        // before reaching the network with a bad name.
         let mut queue = Queue::open(&path).unwrap();
         let http = FakeHttpClient::new();
         let obs = ObsClient::new(&http);

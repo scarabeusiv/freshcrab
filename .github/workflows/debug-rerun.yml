@@ -12,16 +12,16 @@
 #   diagnose. `cancelled` and `neutral` stay excluded.
 # - Only the first attempt of a run (run_attempt == 1): a failing debug
 #   re-run is attempt 2, so it can never trigger another re-run.
-# - Only the workflows listed below: test. release is deliberately
-#   excluded (a failed release re-run could re-publish), as are CodeQL,
-#   actionlint, dependency-review, typos, freshness, toolchain-pin and Bump opensuse-packaging-skill tag, whose re-runs
-#   have side effects or gain nothing from debug logs. (There is no
+# - Only the workflows listed below: test. Release is excluded (a
+#   failed release re-run could re-publish), as are CodeQL,
+#   actionlint, dependency-review, typos, freshness, toolchain-pin and Bump opensuse-packaging-skill tag: their re-runs
+#   carry side effects, and only test gains from debug logs. (There is no
 #   live workflow here; the live suite lives in geectl.)
-# - This workflow never watches itself: it is not in the list, and the
-#   job also refuses any event whose workflow is this one.
+# - This workflow stays off its own list, and the job also refuses any
+#   event whose workflow is this one.
 #
 # Note: a workflow_run-triggered workflow only fires once its file is on
-# the default branch, so this becomes active when this change merges.
+# the default branch.
 # Debug logs are verbose; secrets stay masked in them (GitHub masks
 # registered secrets), and the watched run uses no real credentials.
 #

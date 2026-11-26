@@ -2,7 +2,7 @@
 //!
 //! Every mutating operation in the codebase goes through the single guard
 //! here (`DryRun::allow`) before any write, API call, or external action.
-//! No component mutates state without consulting it.
+//! Every component consults it before mutating state.
 //!
 //! - In dry-run, the operation is skipped and the would-do plan is printed
 //!   (to stderr, so stdout stays machine-readable) and recorded, so tests
@@ -81,7 +81,7 @@ impl DryRun {
     }
 
     /// Record (and print) a would-do decision, e.g. a would-skip with its
-    /// reason. Does not gate anything; use `allow` for that.
+    /// reason. Gating is `allow`'s job.
     pub fn note(&self, message: &str) {
         if self.enabled {
             let line = format!("[dry-run] {message}");
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn resolve_empty_env_falls_back_to_config() {
-        // An empty env var is unset, not an error.
+        // An empty env var counts as unset.
         assert!(resolve(None, Some("".to_string()), true).unwrap().enabled());
         assert!(!resolve(None, Some("   ".to_string()), false)
             .unwrap()

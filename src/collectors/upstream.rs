@@ -8,7 +8,7 @@
 //! GitHub: it lists the repository releases via the GitHub API and looks
 //! for a tag whose version (leading `v` stripped) equals the candidate
 //! (by RPM comparison). The repository (owner/repo) is supplied per
-//! package by the caller; there is no guessing from the package name.
+//! package by the caller; the package name plays no part in it.
 
 use crate::http::{HttpClient, HttpError};
 use crate::version::rpmvercmp;
@@ -21,7 +21,7 @@ pub trait UpstreamChecker {
     fn confirm(&self, package: &str, version: &str) -> Result<bool, HttpError>;
 }
 
-/// No upstream check configured: never confirms.
+/// An upstream check that confirms nothing.
 pub struct NoUpstreamChecker;
 
 impl UpstreamChecker for NoUpstreamChecker {
@@ -72,7 +72,7 @@ impl<'a> UpstreamChecker for GithubReleasesChecker<'a> {
         // The repo is caller-supplied config; validate its shape before
         // interpolating it into the URL (a `?` or `/` in it would rewrite
         // the request). Dot-only segments (`.`, `..`) are rejected too:
-        // they pass the charset check but are not repository names.
+        // they pass the charset check but fail the repository-name check.
         let segments: Vec<&str> = self.repo.split('/').collect();
         let valid = segments.len() == 2
             && segments.iter().all(|seg| {
@@ -120,7 +120,7 @@ mod tests {
         assert!(checker.confirm("foo", "2.0").is_err());
         let checker = GithubReleasesChecker::new(&http, "not-a-repo");
         assert!(checker.confirm("foo", "2.0").is_err());
-        // Dot-only segments are not repository names.
+        // Dot-only segments fail the repository-name check.
         let checker = GithubReleasesChecker::new(&http, "owner/..");
         assert!(checker.confirm("foo", "2.0").is_err());
         let checker = GithubReleasesChecker::new(&http, "../repo");

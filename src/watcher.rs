@@ -8,8 +8,8 @@
 //! entry when the upstream version is newer. Report-only by default: it
 //! queues and reports, and files nothing.
 //!
-//! In dry-run mode the watcher still polls the collectors (reads are not
-//! gated) and prints exactly what it WOULD queue — package, Factory
+//! In dry-run mode the watcher still polls the collectors (reads run
+//! ungated) and prints exactly what it WOULD queue — package, Factory
 //! version, newest upstream version, collector source — and writes
 //! nothing to the queue.
 
@@ -27,16 +27,16 @@ use std::fmt;
 
 /// Error from checking one package.
 ///
-/// The Leap refusal is a distinct variant, not an [`HttpError`]: a
-/// target that is not implemented yet is not an HTTP failure.
+/// The Leap refusal is a distinct variant from [`HttpError`]: a
+/// planned target fails as a config error.
 #[derive(Debug)]
 pub enum WatchError {
     /// An HTTP request failed (collector or upstream read).
     Http(HttpError),
     /// A geectl OBS read failed (the Factory spec or package list).
     Obs(GeectlError),
-    /// The target is not implemented yet (Leap): the check is refused
-    /// before any network I/O. No validator is consulted.
+    /// The target is planned (Leap): the check is refused before any
+    /// network I/O, before any validator runs.
     LeapNotImplemented,
 }
 
@@ -109,8 +109,8 @@ pub struct Watcher<'a> {
     target: Target,
     policy: Box<dyn UpdatePolicy + 'a>,
     /// The CVE validator, consulted only for non-Factory targets
-    /// (Leap). The Factory path never calls it, so it is unread until a
-    /// Leap target is implemented — the dead-code lint is silenced
+    /// (Leap). The Factory path skips it, so it is unread until a
+    /// Leap target lands — the dead-code lint is silenced
     /// (it is the Leap extension point, not dead code).
     #[allow(dead_code)]
     cve_validator: Option<Box<dyn CveValidator + 'a>>,
@@ -150,7 +150,7 @@ impl<'a> Watcher<'a> {
 
     /// Attach a CVE validator. It is consulted only for non-Factory
     /// targets (Leap): for Factory the version comparison alone
-    /// decides, so the Factory path never calls a validator.
+    /// decides, so the Factory path skips the validator.
     pub fn with_cve_validator(mut self, validator: Box<dyn CveValidator + 'a>) -> Self {
         self.cve_validator = Some(validator);
         self
@@ -161,12 +161,11 @@ impl<'a> Watcher<'a> {
     /// prints what it WOULD queue and returns the entry (the caller
     /// decides whether to persist it; the queue also consults dry-run).
     pub fn check_package(&self, package: &str) -> Result<Option<QueueEntry>, WatchError> {
-        // Leap targets are not implemented yet: fail loudly before any
+        // Leap targets are planned: fail loudly before any
         // network I/O, so no rate-limited collector requests are burned
-        // (and no package names disclosed) for a target that is refused.
-        // No validator is consulted: the check is refused first. The
-        // Factory path never reaches this branch, so it never calls a
-        // validator.
+        // (and no package names disclosed) for a refused target.
+        // The check is refused first, before any validator runs. The
+        // Factory path skips this branch and its validator.
         if self.target.is_leap() {
             return Err(WatchError::LeapNotImplemented);
         }
@@ -218,7 +217,7 @@ impl<'a> Watcher<'a> {
 
     /// Check a list of packages. Returns the queue entries found. A
     /// package whose check fails (e.g. the Factory spec 404s) is logged
-    /// and skipped; one bad package does not abort the whole run.
+    /// and skipped; one bad package leaves the run going.
     pub fn check_packages(&self, packages: &[&str]) -> Vec<QueueEntry> {
         let mut entries = Vec::new();
         for package in packages {
@@ -394,7 +393,7 @@ mod tests {
     #[test]
     fn check_package_distrowatch_only_is_not_queued() {
         // Distrowatch alone (not multi-source, no second collector, no
-        // upstream check) does not confirm.
+        // upstream check) stays unconfirmed.
         let http = FakeHttpClient::new()
             .with("https://repology.org/api/v1/project/foo", "[]")
             .with(
@@ -531,7 +530,7 @@ mod tests {
         }
     }
 
-    /// A policy that never says an update is needed.
+    /// A policy that reports no update needed.
     struct NeverUpdate;
 
     impl UpdatePolicy for NeverUpdate {
@@ -552,7 +551,7 @@ mod tests {
     #[test]
     fn custom_policy_is_honoured() {
         // An up-to-date package is queued when the policy says so, and
-        // a behind package is not queued when the policy says otherwise:
+        // a behind package stays out of the queue when the policy says otherwise:
         // the version comparison is behind the policy hook.
         let http = FakeHttpClient::new()
             .with(
@@ -659,9 +658,8 @@ mod tests {
 
     #[test]
     fn single_anitya_only_is_not_queued() {
-        // A single non-multi-source collector (Anitya alone) does not
-        // confirm: it needs a second collector agreeing or an upstream
-        // check.
+        // A single non-multi-source collector (Anitya alone) confirms only
+        // with a second collector agreeing or an upstream check.
         let http = FakeHttpClient::new()
             .with("https://repology.org/api/v1/project/foo", "[]")
             .with(

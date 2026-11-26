@@ -13,12 +13,12 @@
 //!
 //! In dry-run mode every mutation goes through the dry-run guard
 //! (`crate::dry_run::DryRun`): the dedup rules are still evaluated (reads
-//! are not gated) and the decision is printed (would-enqueue / would-skip
-//! + reason), but nothing is added and nothing is persisted.
+//! run ungated) and the decision is printed (would-enqueue / would-skip
+//! + reason); the queue stays unchanged.
 //!
 //! An escalated entry is parked with its reason and timestamp (see
-//! `QueueEntry::escalation_reason`): re-adding the same update does not
-//! re-run the dedup checks and does not re-escalate it — the entry stays
+//! `QueueEntry::escalation_reason`): re-adding the same update skips
+//! the dedup checks and the re-escalation — the entry stays
 //! escalated until a newer upstream version arrives (a new update) or a
 //! human clears it.
 
@@ -84,10 +84,9 @@ pub struct QueueEntry {
     #[serde(default)]
     pub cves: Vec<String>,
     /// Why this entry was escalated to a human, if it was. Persisted
-    /// with the entry (not only in the run's stdout) so triage does not
-    /// need a captured run log, and so a re-run does not re-escalate the
-    /// same update: an escalated entry stays parked until a newer
-    /// upstream version arrives. Queue files without an `escalation_reason` field load with `None`.
+    /// with the entry, so triage reads it from the entry, and so a
+    /// re-run skips re-escalating the same update: an escalated entry stays
+    /// parked until a newer upstream version arrives. Queue files without an `escalation_reason` field load with `None`.
     #[serde(default)]
     pub escalation_reason: Option<String>,
     /// When the entry was escalated (epoch seconds, like `updated_at`).
@@ -249,8 +248,7 @@ impl Queue {
         // non-blocking (fail fast): a second writer errors out
         // immediately instead of hanging behind the first.
         let lock_path = format!("{path}.lock");
-        // The lock file is never written to — it exists only to hold
-        // the flock — so it is opened without truncation.
+        // The lock file holds the flock only — it is opened without truncation.
         let lock_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -297,8 +295,8 @@ impl Queue {
         let text = serde_json::to_string_pretty(&self.entries)
             .map_err(|e| QueueError(format!("cannot serialize queue: {e}")))?;
         // A unique tmp name (pid + nanoseconds, created with O_EXCL)
-        // so two writers can never share a tmp file, and fsync before
-        // the atomic rename so a crash cannot leave a torn queue file.
+        // so two writers get distinct tmp files, and fsync before
+        // the atomic rename so a crash leaves the queue file intact.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -456,8 +454,8 @@ impl Queue {
             return Ok(None);
         }
         // An escalated entry is parked: the same update (same upstream
-        // version) is not re-run, so the dedup API calls are not made
-        // and the entry is not re-escalated on every run. A newer
+        // version) skips the dedup API calls and the re-escalation on
+        // every run. A newer
         // upstream version is a new update and refreshes the entry
         // below (clearing the old escalation).
         if let Some(existing) = self.entries.iter().find(|e| e.package == entry.package) {
@@ -497,8 +495,7 @@ impl Queue {
                 Ok(false) => {}
                 Err(e) => {
                     // An auth failure (rotated or expired OBS
-                    // credentials) is not a per-package skip: it
-                    // would strike every candidate, so propagate it
+                    // credentials) strikes every candidate, so propagate it
                     // and let the caller fail the run loudly.
                     if e.kind() == ErrorKind::AuthFailed {
                         return Err(e);
@@ -605,7 +602,7 @@ impl Queue {
     /// Escalate the entry for `package` to a human, persisting the
     /// reason and the time (epoch seconds). Unlike `set_status`, the
     /// reason is stored on the entry, not only in the run's stdout, so
-    /// triage does not need a captured log — and the entry stays parked
+    /// triage reads the reason from the entry — and the entry stays parked
     /// (see `add`) until a newer upstream version arrives. In dry-run,
     /// logs the would-do and changes nothing.
     pub fn escalate(

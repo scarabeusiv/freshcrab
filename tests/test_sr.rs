@@ -53,7 +53,7 @@ fn dry_run_logs_payload_and_posts_nothing() {
     let filing = SrFiling::new(&obs, &dry);
     let result = filing.file(&payload()).unwrap();
     assert_eq!(result, None);
-    // No POST was made.
+    // The POST count is zero.
     assert!(http.posted().is_empty());
     // The dry-run plan records the would-file action. The filing runs
     // through geectl's DryRun, so the lines land in geectl's plan, not
@@ -115,7 +115,7 @@ fn live_without_credentials_fails_closed() {
     let obs = ObsClient::new(&http);
     let filing = SrFiling::new(&obs, &live);
     assert!(filing.file(&payload()).is_err());
-    // Nothing was posted.
+    // The POST count is zero.
     assert!(http.posted().is_empty());
 }
 

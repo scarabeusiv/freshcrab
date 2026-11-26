@@ -4,7 +4,7 @@
 # the dependency tree are allowed. A new dependency bringing any other
 # license fails `cargo deny check` in the weekly freshness workflow,
 # and the fix is a deliberate PR (add the license here with a reason,
-# or replace the dependency) — never a silent relaxation.
+# or replace the dependency).
 #
 # The allow list below is exactly the set of SPDX identifiers present
 # in the tree (see `cargo metadata --format-version 1`): the bulk of
@@ -28,10 +28,9 @@ allow = [
 ]
 
 [advisories]
-# `vulnerability` has no setting any more (cargo-deny always checks
-# vulnerabilities, and a hit fails the check). Scope "all": check every
-# crate (workspace and transitive) for unmaintained / unsound
-# advisories. A hit fails the check.
+# cargo-deny always checks vulnerabilities, and a hit fails the check.
+# Scope "all": check every crate (workspace and transitive) for
+# unmaintained / unsound advisories. A hit fails the check.
 unmaintained = "all"
 unsound = "all"
 yanked = "deny"
@@ -39,7 +38,6 @@ yanked = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# No git sources: the geectl library comes from crates.io now; its
+# No git sources: the geectl library comes from crates.io; its
 # OBS surface (Factory reads, devel lookup, open-SR check, SR filing)
-# lives in geectl (staging step 3 of the migration). No git source
-# is permitted.
+# lives in geectl.

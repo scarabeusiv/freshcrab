@@ -8,18 +8,16 @@
 #      zypper from the openSUSE repos. Nothing is built from source in the
 #      runtime stage.
 #
-# The opensuse-packaging-skill docs are not a distro package and are not
-# vendored in this repo; they are fetched at build time from the tagged
+# The opensuse-packaging-skill docs come from outside the distro packages
+# and outside this repo; they are fetched at build time from the tagged
 # release of openSUSE/openSUSE-packaging-skill (see the skill stage) and
 # copied into the image at /usr/share/doc/freshcrab/opensuse-packaging-skill/
 # (see docs/runbook.md). The tag is bumped by the weekly skill-tag-bump
-# workflow: Dependabot's docker ecosystem only tracks FROM image tags, not
-# a git-clone branch, so it cannot bump this tag. The commit SHA is
-# pinned alongside the tag and the build verifies the clone matches it,
-# so a mutable tag that moves fails the build instead of silently
-# changing what the image contains.
+# workflow: Dependabot's docker ecosystem tracks FROM image tags only.
+# The commit SHA is pinned alongside the tag and the build verifies the
+# clone matches it, so a mutable tag that moves fails the build.
 #
-# No secrets are baked into the image. OBS credentials (oscrc) and the
+# Secrets stay outside the image. OBS credentials (oscrc) and the
 # GitHub token are injected at run time via environment variables or a
 # mounted file.
 

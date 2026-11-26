@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn tmp_path() -> String {
-    // A process-wide counter (not just the clock) makes the path
+    // A process-wide counter alongside the clock makes the path
     // unique: parallel tests can otherwise share a nanosecond and
     // collide on the same queue file.
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -74,9 +74,9 @@ In dry-run, the worker prints the full plan and takes no action:
 - rpmcrab gate: the RPMs it WOULD lint and the 0E/0W target;
 - SR target: the devel project it WOULD file to.
 
-No branch, no commit, no build, no SR. Every mutating step goes
-through the single dry-run guard before it acts; no step mutates state
-without consulting it. When a step is skipped in dry-run, the plan line
+Dry-run produces a plan only. Every mutating step goes through the
+single dry-run guard before it acts; each step consults the guard
+before mutating state. When a step is skipped in dry-run, the plan line
 says what WOULD have happened and why.
 
 To run live, pass `--live` (or set `FRESHCRAB_DRY_RUN=false`). Live
@@ -89,7 +89,7 @@ mode is the only mode that branches, commits, builds, or files.
   call (a deliberate design, an upstream bug, a false positive needing a
   tightening issue).
 - The version bump forces a spec logic change (a new dependency, a
-  dropped patch that no longer applies, a build-system change).
+  dropped patch, a build-system change).
 - An open submit request already targets the package, or the devel
   project already has the new version (deduplication missed it).
 - The package is on the exclusion list (never auto-update it).
@@ -99,7 +99,7 @@ and the evidence (build log line, rpmcrab finding, or diff hunk).
 
 ## Leap (not active yet)
 
-Leap work is not implemented yet (see
+Leap work is the remaining work (see
 `docs/leap-and-cve.md`). The Leap worker differs from
 the Factory worker above in the *kind* of change, not in the gates:
 
@@ -118,8 +118,8 @@ the Factory worker above in the *kind* of change, not in the gates:
   the backport applied. The changelog is the claim; the test is the
   proof. If no test is feasible (a race condition, an environment
   the test cannot construct), document why in the SR text and the
-  `.changes` entry instead of skipping silently — "no test" without
-  a stated reason is a gap, not a judgment call.
+  `.changes` entry — "no test" without a stated reason is a gap, not
+  a judgment call.
 - **Same gates.** spec-cleaner full mode, rpmcrab 0E/0W, pre-filing
   adversarial audit for every product the spec builds for, one
   `.changes` entry per SR. A CVE with no clean backport, a patch

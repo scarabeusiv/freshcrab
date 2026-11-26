@@ -6,9 +6,8 @@
 //! rows: within a `<tr>`, the first two `<td>` cells are (package,
 //! version), with any nested tags stripped. Pairing inside a row (not
 //! across the whole document) means a stray cell in an ad or header row
-//! cannot misalign the package rows, and stripping tags means a nested
-//! `<a>` cannot pollute the version string. No regex crate is used; the
-//! scan is a plain string search.
+//! cannot misalign the package rows, and stripping tags keeps a nested
+//! `<a>` out of the version string. The scan is a plain string search.
 
 use crate::collectors::{Candidate, Collector};
 use crate::http::{HttpClient, HttpError};
@@ -52,8 +51,8 @@ fn table_cells(html: &str) -> Vec<String> {
 }
 
 /// Parse a Distrowatch package table. Returns the version of `package`,
-/// or None when it is not listed. Cells are paired (name, version)
-/// inside each `<tr>` row, never across rows.
+/// or None for an unlisted package. Cells are paired (name, version)
+/// inside each `<tr>` row.
 pub fn parse_distrowatch_page(html: &str, package: &str) -> Option<Candidate> {
     let mut rest = html;
     while let Some(tr) = rest.find("<tr") {
@@ -135,7 +134,7 @@ mod tests {
 
     #[test]
     fn nested_link_in_version_cell_is_stripped() {
-        // A nested `<a>` inside the version cell must not pollute the
+        // A nested `<a>` inside the version cell stays out of the
         // version string.
         let html = r#"<table>
 <tr><td class="pkg">foo</td><td><a href="/package/foo">2.0</a></td></tr>
@@ -146,9 +145,8 @@ mod tests {
 
     #[test]
     fn stray_cell_in_another_row_does_not_misalign() {
-        // A single-cell row (ad / header) before the package row must
-        // not shift the pairing: cells pair inside a row, never across
-        // the whole document.
+        // A single-cell row (ad / header) before the package row leaves the
+        // pairing alone: cells pair inside a row.
         let html = r#"<table>
 <tr><td colspan="2">advertisement</td></tr>
 <tr><td class="pkg">foo</td><td>2.0</td></tr>

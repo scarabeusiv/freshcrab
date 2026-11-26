@@ -26,9 +26,8 @@ on:
 permissions:
   contents: read
 
-# Cancel a superseded run of the same workflow on the same ref, but only
-# for pull requests. (Goes beyond rpmcrab, whose codeql.yml has no
-# concurrency block; added per plusky's request on the geectl review.)
+# A newer run cancels the previous run of the same workflow on the
+# same ref, but only for pull requests.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -50,7 +49,7 @@ jobs:
           - language: actions
             build-mode: none
     steps:
-      # Pinned to the v4 tag's commit so the actions cannot move under us;
+      # Pinned to the v4 tag's commit so the actions stay fixed;
       # Dependabot tracks SHA pins and proposes updates.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -24,18 +24,17 @@ the concurrency limit and the daily SR cap), the worker re-checks the
 deduplication rules, builds the update plan (one `.changes` entry, the
 SR description) and the exact SR payload, and files the submit request
 to the devel project. Dry-run is the default: the plan and the exact
-SR payload are logged and nothing is filed. What is NOT yet there is
-the live update executor — the agent/CI step that actually performs
-the branch, bump, spec-cleaner, OBS build, rpmcrab and audit steps.
-Live mode refuses to file (the entries escalate
-instead), so no SR is ever filed on a plan that was not executed.
+SR payload are logged and nothing is filed. The live update executor is the remaining work — the agent/CI step
+that performs the branch, bump, spec-cleaner, OBS build, rpmcrab and
+audit steps. Live mode refuses to file (the entries escalate
+instead), so an SR is filed only on a plan that was executed.
 `worker/` holds the agent brief for that step.
 
-Leap and CVE validation are not implemented yet — see
+Leap and CVE validation are the remaining work — see
 `docs/leap-and-cve.md`. The scaffold exists (distribution targets with
 Leap gated off, the CVE validation rule and validator interface,
-security-first queue ordering), but the Leap watcher logic, the CVE
-data-source integration, and Leap SR filing are not implemented.
+security-first queue ordering); the Leap watcher logic, the CVE
+data-source integration, and Leap SR filing are still open.
 
 ## Collectors (priority order)
 
@@ -46,7 +45,7 @@ data-source integration, and Leap SR filing are not implemented.
 3. **PyPI JSON API** — for Python packages only.
 4. **Distrowatch** — secondary signal only.
 
-Freshmeat is defunct and is not used. A
+Freshmeat is excluded as a source. A
 candidate version is confirmed before queueing when it comes from
 Repology with status `newest` in at least two distinct repos, when at
 least two collectors agree, or when a direct upstream check confirms
@@ -73,7 +72,7 @@ instead:
 podman run --rm -v "$PWD/my-config.yaml:/app/config.yaml:ro" freshcrab
 ```
 
-OBS credentials are never read from the repo. In CI they come from GitHub
+OBS credentials live outside the repo. In CI they come from GitHub
 Actions secrets; in the container they are injected via environment
 variables or a mounted file (see `docs/runbook.md`). The Factory and
 devel-project reads use the OBS public API and need no credentials. The
@@ -136,8 +135,8 @@ is strict:
 
 - **No grouping** — each dependency update gets its own PR, so nothing
   hides in a group.
-- **No PR limit that suppresses updates** — the open-PR limit is set
-  high enough that every update is surfaced.
+- **Every update gets a PR** — the open-PR limit is set high enough
+  that every update is surfaced.
 - Dependabot PRs go through the same branch protection as any other
   change (green CI + at least 1 approving review) and are **not**
   auto-merged.
@@ -158,7 +157,7 @@ failure does not block feature PRs — but it is visible (badge above)
 and it stays red until the Dependabot PR is merged. The repo is kept
 green by merging Dependabot PRs promptly, not by relaxing the checks.
 If a check turns out too noisy in practice, it is relaxed
-in a PR with a reason — never silently.
+in a PR with a reason.
 
 ## Code scanning
 
@@ -166,23 +165,23 @@ CodeQL runs on every PR, on push to `main`, and weekly
 (`.github/workflows/codeql.yml`), with the `security-and-quality`
 query suite — security plus code quality, the strictest suite, not
 security-only. Findings appear in the repo's Security tab, and the
-workflow fails the PR when it finds issues (default behaviour — not
-suppressed). No CodeQL rule is disabled or weakened.
+workflow fails the PR when it finds issues (default behaviour).
+All CodeQL rules run enabled.
 
-Rust is extracted without a build (`build-mode: none`): CodeQL does
-not support `autobuild` for Rust, so there is no
+Rust is extracted without a build (`build-mode: none`): CodeQL's
+`autobuild` covers other languages, not Rust, so there is no
 autobuild step.
 
 ## Repository protection
 
 `main` is guarded:
 
-- Pull requests only — no direct pushes, not even for the owner.
+- Pull requests only — direct pushes are blocked, even for the owner.
 - At least 1 approving review before merge.
 - The CI test workflow must pass, and branches must be up to date
   before merging.
-- Linear history (rebase-only merges); no force pushes, no branch
-  deletion.
+- Linear history (rebase-only merges); force pushes and branch
+  deletion are blocked.
 - Conversation resolution required before merging.
 - Enforced for admins too — the rule binds everyone.
 
@@ -193,7 +192,7 @@ disabled), delete head branches on merge, auto-merge allowed.
 
 - `packages`: the set to monitor. Empty means all of Factory except
   `exclusions`.
-- `exclusions`: packages never auto-updated (hand-maintained or special).
+- `exclusions`: packages outside auto-update (hand-maintained or special).
 - `concurrency`: the per-run batch — how many queued entries one dispatch run handles.
 - `daily_sr_cap`: maximum submit requests filed per day.
 - `kill_switch`: when `true`, the pipeline pauses entirely.
@@ -229,7 +228,7 @@ src/
   target.rs            distribution targets (Factory / Leap) + the
                        per-target update-policy hook
   cve.rs               CVE validation: the changelog-carries-the-CVE rule
-                       + the validator interface (not yet implemented)
+                       + the validator interface (planned)
   watcher.rs           collectors + confirmation + Factory compare
   queue.rs             queue state file, deduplication
   geectl (dependency)  OBS client for the Factory reads, the dedup

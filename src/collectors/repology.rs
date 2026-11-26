@@ -9,13 +9,13 @@
 //! The collector takes the highest version (by RPM comparison) among
 //! entries with status `newest`, but only when at least two distinct
 //! repos report that version: `newest` is a max, not a consensus, so
-//! one inflated repo entry must not confirm on its own. A single
+//! one inflated repo entry confirms only with another source. A single
 //! `newest` repo returns the candidate as not-multi-source, so the
 //! confirmation rule falls through to agreement with another collector
 //! or to the direct upstream check. When no entry is `newest`, it falls
 //! back to the highest version among release statuses (`unique`,
 //! `outdated`, `legacy`, `rolling`). Development, incorrect, untrusted,
-//! and ignored entries are never used.
+//! and ignored entries stay out.
 //!
 //! Rate limit: 1 request per second. Every request identifies itself with
 //! a User-Agent linking to the project repository (see `crate::http`).
@@ -45,7 +45,7 @@ struct RepologyPackage {
 }
 
 /// Parse a Repology `/api/v1/project/<name>` response. Returns the newest
-/// version, or None when there is no usable release entry.
+/// version, or None for a response with no usable release entry.
 pub fn parse_repology_response(body: &str) -> Option<Candidate> {
     let packages: Vec<RepologyPackage> = serde_json::from_str(body).ok()?;
     if packages.is_empty() {
@@ -55,7 +55,7 @@ pub fn parse_repology_response(body: &str) -> Option<Candidate> {
     // Prefer the highest version among `newest` entries — but only
     // when at least two distinct repos report that version. A single
     // `newest` entry is a max, not a consensus: one inflated repo entry
-    // must not confirm on its own. With a single newest repo the
+    // confirms only with another source. With a single newest repo the
     // candidate is returned as not-multi-source, so the confirmation
     // rule falls through to agreement with another collector or to the
     // direct upstream check.
@@ -180,7 +180,7 @@ mod tests {
             {"repo": "debian_12", "version": "1.10", "status": "outdated"}
         ]"#;
         let candidate = parse_repology_response(body).unwrap();
-        // 1.10 > 1.9 by RPM comparison (not lexicographic).
+        // 1.10 > 1.9 by RPM comparison.
         assert_eq!(candidate.version, "1.10");
         assert!(!candidate.multi_source);
     }
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn single_newest_repo_does_not_confirm() {
         // Hostile: one repo at `newest` is a max, not a consensus.
-        // The candidate is returned, but not multi-source, so the
+        // The candidate is returned as not-multi-source, so the
         // confirmation rule falls through to agreement / upstream.
         let body = r#"[
             {"repo": "opensuse_tumbleweed", "version": "1.9", "status": "outdated"},
