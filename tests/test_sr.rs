@@ -84,7 +84,7 @@ fn live_posts_xml_and_returns_request_id() {
     let obs = obs_with_creds(&http);
     let filing = SrFiling::new(&obs, &live);
     let result = filing.file(&payload()).unwrap();
-    assert_eq!(result, Some("1400001".to_string()));
+    assert_eq!(result.map(|filed| filed.id), Some("1400001".to_string()));
     let posted = http.posted();
     assert_eq!(http.posted_auth(), vec![true]);
     assert_eq!(posted.len(), 1);

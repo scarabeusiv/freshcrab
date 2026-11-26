@@ -266,9 +266,13 @@ impl<'a> Worker<'a> {
     /// Drive one queue entry through the pipeline. See the module docs
     /// for the steps and the dry-run / live boundary.
     pub fn run(&self, entry: &QueueEntry) -> WorkerOutcome {
-        // 1. Resolve the devel project (public API read).
-        let devel_project = match self.obs.devel_project(&entry.package) {
-            Ok(Some(project)) => project,
+        // 1. Resolve the devel project (public API read) against
+        // Factory, the target the one-argument lookup read before.
+        let devel_project = match self
+            .obs
+            .devel_project(geectl::obs::FACTORY_PROJECT, &entry.package)
+        {
+            Ok(Some((project, _devel_package))) => project,
             Ok(None) => return WorkerOutcome::NoDevelProject,
             Err(e) => {
                 return obs_failure(
@@ -370,7 +374,10 @@ impl<'a> Worker<'a> {
                 let result = filing.file(&payload);
                 self.dry_run.merge_plan(&geectl_dry.plan());
                 match result {
-                    Ok(Some(sr_id)) => WorkerOutcome::Filed { sr_id, plan },
+                    Ok(Some(filed)) => WorkerOutcome::Filed {
+                        sr_id: filed.id,
+                        plan,
+                    },
                     Ok(None) => WorkerOutcome::Planned {
                         plan,
                         payload: Some(payload),
@@ -644,8 +651,8 @@ mod tests {
         };
         FakeHttpClient::new()
             .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-                "<directory name=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\"/></directory>",
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
             )
             .with(
                 "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
@@ -795,8 +802,8 @@ mod tests {
         let dry = DryRun::new(true);
         let http = FakeHttpClient::new()
             .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-                "<directory name=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\"/></directory>",
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
             )
             .with(
                 "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
@@ -820,8 +827,8 @@ mod tests {
         let dry = DryRun::new(true);
         let http = FakeHttpClient::new()
             .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-                "<directory name=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\"/></directory>",
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
             )
             .with(
                 "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
@@ -867,8 +874,8 @@ mod tests {
     fn run_no_devel_project() {
         let dry = DryRun::new(true);
         let http = FakeHttpClient::new().with(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-            "<directory name=\"foo\"></directory>",
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"></package>",
         );
         let obs = ObsClient::new(&http);
         let executor = DryRunExecutor;
@@ -1002,8 +1009,8 @@ mod tests {
         // escalates fail-closed instead of filing on an unchecked dedup.
         let dry = DryRun::new(true);
         let http = FakeHttpClient::new().with(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-            "<directory name=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\"/></directory>",
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
         );
         let obs = ObsClient::new(&http);
         let executor = DryRunExecutor;
@@ -1023,8 +1030,8 @@ mod tests {
         let dry = DryRun::new(true);
         let http = FakeHttpClient::new()
             .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-                "<directory name=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\"/></directory>",
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
             )
             .with(
                 "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",

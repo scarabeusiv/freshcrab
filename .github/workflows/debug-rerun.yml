@@ -14,8 +14,7 @@
 #   re-run is attempt 2, so it can never trigger another re-run.
 # - Only the workflows listed below: test. release is deliberately
 #   excluded (a failed release re-run could re-publish), as are CodeQL,
-#   actionlint, dependency-review, typos, freshness, geectl-pin,
-#   toolchain-pin and Bump opensuse-packaging-skill tag, whose re-runs
+#   actionlint, dependency-review, typos, freshness, toolchain-pin and Bump opensuse-packaging-skill tag, whose re-runs
 #   have side effects or gain nothing from debug logs. (There is no
 #   live workflow here; the live suite lives in geectl.)
 # - This workflow never watches itself: it is not in the list, and the

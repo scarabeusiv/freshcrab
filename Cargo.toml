@@ -32,14 +32,10 @@ fs2 = "0.4"
 base64 = "0.23"
 # The OBS library: the Factory reads, the devel lookup, the open-SR
 # check, and SR filing all come from geectl now; the local OBS client
-# is deleted. Pinned to
-# the v0.2.0 tag's reviewed rev (d8c3140, tagged 2026-11-21) — a tag
-# is mutable, so a tag pin would let `cargo update -p geectl`
-# silently advance the dependency; a rev pin cannot move. Bump by
-# changing the rev (and the tag in this comment) in a reviewed PR;
-# .github/workflows/geectl-pin.yml fails loudly when a newer geectl
-# release exists.
-geectl = { git = "https://github.com/scarabeusiv/geectl", rev = "d8c314016fe125f94e7bc940427f84e97759f0df" }
+# is deleted. Taken from crates.io (0.2.3, released 2026-11-27);
+# Dependabot's weekly cargo updates propose each new geectl release
+# as its own PR — bump by changing the version in a reviewed PR.
+geectl = "0.2"
 
 [lints.rust]
 unsafe_code = "forbid"

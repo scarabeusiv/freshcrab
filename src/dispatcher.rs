@@ -324,9 +324,9 @@ mod tests {
         };
         FakeHttpClient::new()
             .with(
-                &format!("https://api.opensuse.org/public/source/openSUSE:Factory/{package}"),
+                &format!("https://api.opensuse.org/public/source/openSUSE:Factory/{package}/_meta"),
                 &format!(
-                    "<directory name=\"{package}\"><devel project=\"devel:languages:python\" package=\"{package}\"/></directory>"
+                    "<package name=\"{package}\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"{package}\"/></package>"
                 ),
             )
             .with(
@@ -415,8 +415,8 @@ mod tests {
         let dry = DryRun::new(true);
         let http = http_for("routine-pkg", "1.9", 0)
             .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/sec-pkg",
-                "<directory name=\"sec-pkg\"><devel project=\"devel:languages:python\" package=\"sec-pkg\"/></directory>",
+                "https://api.opensuse.org/public/source/openSUSE:Factory/sec-pkg/_meta",
+                "<package name=\"sec-pkg\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"sec-pkg\"/></package>",
             )
             .with(
                 "https://api.opensuse.org/public/source/devel:languages:python/sec-pkg/sec-pkg.spec",
@@ -460,9 +460,9 @@ mod tests {
         for pkg in ["a", "b", "c"] {
             http = http
                 .with(
-                    &format!("https://api.opensuse.org/public/source/openSUSE:Factory/{pkg}"),
+                    &format!("https://api.opensuse.org/public/source/openSUSE:Factory/{pkg}/_meta"),
                     &format!(
-                        "<directory name=\"{pkg}\"><devel project=\"devel:languages:python\" package=\"{pkg}\"/></directory>"
+                        "<package name=\"{pkg}\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"{pkg}\"/></package>"
                     ),
                 )
                 .with(
@@ -514,8 +514,8 @@ mod tests {
         let mut queue = Queue::open(&path).unwrap();
         let http = http_for("foo", "1.9", 0)
             .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/bar",
-                "<directory name=\"bar\"><devel project=\"devel:languages:python\" package=\"bar\"/></directory>",
+                "https://api.opensuse.org/public/source/openSUSE:Factory/bar/_meta",
+                "<package name=\"bar\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>",
             )
             .with(
                 "https://api.opensuse.org/public/source/devel:languages:python/bar/bar.spec",
@@ -621,8 +621,8 @@ mod tests {
         let http = http_for("foo", "1.9", 0)
             .with_status(&search_url_for("foo"), 401, "unauthorized")
             .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/bar",
-                "<directory name=\"bar\"><devel project=\"devel:languages:python\" package=\"bar\"/></directory>",
+                "https://api.opensuse.org/public/source/openSUSE:Factory/bar/_meta",
+                "<package name=\"bar\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>",
             )
             .with(
                 "https://api.opensuse.org/public/source/devel:languages:python/bar/bar.spec",
@@ -778,8 +778,8 @@ mod tests {
         // the reason on the entry instead of only printing it.
         let mut queue = Queue::open(&path).unwrap();
         let http = FakeHttpClient::new().with(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-            "<directory name=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\"/></directory>",
+            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
         );
         let obs = ObsClient::new(&http);
         let executor = DryRunExecutor;
@@ -833,8 +833,8 @@ mod tests {
         let mut queue = Queue::open(&path).unwrap();
         let http = FakeHttpClient::new()
             .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/foo",
-                "<directory name=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\"/></directory>",
+                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
+                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
             )
             .with(
                 "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",

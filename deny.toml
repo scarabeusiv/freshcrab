@@ -39,12 +39,7 @@ yanked = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# The geectl library is the only git source: freshcrab's OBS surface
-# (Factory reads, devel lookup, open-SR check, SR filing) lives in
-# geectl now
-# (staging step 3 of the migration), pinned to a reviewed rev in
-# Cargo.toml (d8c3140, the v0.2.0 tag). A rev pin cannot advance on
-# its own; bumping it is a deliberate PR, and
-# .github/workflows/geectl-pin.yml fails loudly when a newer geectl
-# release exists. No other git source is permitted.
-allow-git = ["https://github.com/scarabeusiv/geectl"]
+# No git sources: the geectl library comes from crates.io now; its
+# OBS surface (Factory reads, devel lookup, open-SR check, SR filing)
+# lives in geectl (staging step 3 of the migration). No git source
+# is permitted.
