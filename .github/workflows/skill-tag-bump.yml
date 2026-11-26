@@ -99,8 +99,8 @@ jobs:
           # Scope the docs replacements to the two live tag mentions
           # (the "tag <version> of openSUSE/openSUSE-packaging-skill"
           # phrase and the "(fetched at build time, tag <version>)"
-          # phrase): a global `s/tag X/tag Y/g` would also rewrite a
-          # historical mention of the current tag.
+          # phrase): a global `s/tag X/tag Y/g` would also rewrite other
+          # mentions of the current tag.
           sed -i "s|tag ${current_esc} of openSUSE/openSUSE-packaging-skill|tag ${latest} of openSUSE/openSUSE-packaging-skill|g" README.md docs/runbook.md
           sed -i "s|(fetched at build time, tag ${current_esc})|(fetched at build time, tag ${latest})|" docs/runbook.md
           grep -q "^ARG PACKAGING_SKILL_TAG=${latest}$" Dockerfile || { echo "tag update failed" >&2; exit 1; }
@@ -111,4 +111,4 @@ jobs:
           git add Dockerfile README.md docs/runbook.md
           git commit -m "chore: bump opensuse-packaging-skill to ${latest}"
           git push origin "${branch}"
-          gh pr create --base main --title "chore: bump opensuse-packaging-skill to ${latest}" --body "New tagged release ${latest} of openSUSE/openSUSE-packaging-skill (was ${current})."
+          gh pr create --base main --title "chore: bump opensuse-packaging-skill to ${latest}" --body "New tagged release ${latest} of openSUSE/openSUSE-packaging-skill."

@@ -24,7 +24,7 @@ podman run --rm -v "$PWD/config.yaml:/app/config.yaml:ro" freshcrab --packages f
 Copy `config.yaml` and edit it:
 
 ```yaml
-# Distributions to watch. Only `factory` is implemented; a Leap target
+# Distributions to watch. Only `factory` runs; a Leap target
 # (e.g. `leap-16.0`) parses but the pipeline refuses to run it
 # (see docs/leap-and-cve.md).
 targets:
@@ -35,7 +35,7 @@ packages:
   - curl
   - git
 
-# Never auto-update these.
+# Outside auto-update:
 exclusions:
   - gcc
   - qemu
@@ -75,7 +75,7 @@ plan for each queued entry (the update steps, the SR description, the
 one `.changes` entry, and the exact SR payload — source/target
 project and package, the full request XML) and take no action. Every
 mutating operation goes through the single dry-run guard
-(`src/dry_run.rs`); no component mutates state without consulting it.
+(`src/dry_run.rs`); every component consults it before mutating state.
 
 The mode resolves as CLI flag > env var > config file:
 
@@ -140,10 +140,9 @@ In dry-run (the default) every entry is `planned`: the plan and the
 exact SR payload are logged to stderr, nothing is filed, and the queue
 entry stays `pending`. In live mode the worker files the SR
 (`POST /request?cmd=create`) and the entry is marked `done` with the
-request id — once the live executor exists. The live executor is not
-implemented yet: live
-mode refuses to file (the update steps were not performed) and the
-entry escalates instead. Set `home_project` in `config.yaml` (or
+request id — once the live executor exists. The live executor is the
+remaining work: live mode refuses to file (the update steps were not
+performed) and the entry escalates instead. Set `home_project` in `config.yaml` (or
 `OSC_USERNAME` in the environment) so the worker can resolve the
 branch project; without it, live filing escalates and dry-run planning
 notes the gap.
@@ -152,9 +151,9 @@ Durability: every run starts by resetting entries stranded in
 `in_progress` by a crashed earlier run back to `pending`, and a filed
 SR is saved to the queue file immediately (not only at the end of the
 batch). An escalated entry is parked with its reason and timestamp in
-`queue.json` — it is not re-dispatched until a newer upstream version
-arrives. The daily SR cap counts SRs filed in the local queue file
-only; filings from another host are not counted.
+`queue.json` — it stays parked until a newer upstream version arrives.
+The daily SR cap counts SRs filed in the local queue file only;
+filings from another host fall outside the cap.
 
 ## Pause via the kill switch
 
@@ -180,8 +179,8 @@ The watcher prints the queue as JSON (one entry per package behind):
 ]
 ```
 
-`target` is the distribution (`factory`; Leap targets are not
-implemented yet — see `docs/leap-and-cve.md`). `kind` is
+`target` is the distribution (`factory`; Leap targets are planned —
+see `docs/leap-and-cve.md`). `kind` is
 `routine` (version bump) or `security` (CVE-driven); security
 entries are dispatched before routine ones. The persistent queue
 state file (`queue.json`, written by the queue module) holds the
@@ -218,16 +217,16 @@ The skill docs are NOT in this repo. They are fetched at image build
 time from tag v3.27.0 of openSUSE/openSUSE-packaging-skill (see the
 `ARG PACKAGING_SKILL_TAG` / `ARG PACKAGING_SKILL_SHA` in the Dockerfile —
 the build verifies the clone matches the pinned SHA, so a tag that moves
-fails the build instead of silently changing the image) and copied into the image.
+fails the build) and copied into the image.
 They are the only thing in the image that is not a distro package.
 The tag is bumped by the weekly skill-tag-bump workflow
 (`.github/workflows/skill-tag-bump.yml`), which opens a PR when a new
-tag is released — Dependabot's docker ecosystem only tracks FROM image
-tags, so it cannot bump this one.
+tag is released — Dependabot's docker ecosystem tracks FROM image
+tags only.
 
 ## Credentials
 
-No secrets are in the image. OBS credentials (oscrc) and the GitHub
+Secrets stay outside the image. OBS credentials (oscrc) and the GitHub
 token are injected at run time:
 
 - **In the container:** mount a file or pass environment variables,
@@ -251,7 +250,7 @@ podman run --rm -e OSC_USERNAME=scarabeus_iv -e OSC_PASSWORD=... \
   -v "$PWD/config.yaml:/app/config.yaml:ro" freshcrab --packages foo
 ```
 
-The values are never logged. Without them the dedup check fails
+Logging excludes the values. Without them the dedup check fails
 closed as above, and any live filing attempt fails loudly instead of
 filing anonymously.
 

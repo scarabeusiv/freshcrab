@@ -2,10 +2,10 @@
 #
 # Strictness is intentional: every dependency update gets its own PR
 # (no grouping — nothing hidden in a group), weekly, and the open-PR
-# limit is set high enough that no update is ever suppressed. One
+# limit is set high enough that every update gets a PR. One
 # exception: github/codeql-action/init and .../analyze are grouped (see
 # the github-actions entry below) — CodeQL requires both steps at the
-# same version, so separate PRs mix versions and can never go green.
+# same version, so separate PRs mix versions and stay red.
 # Each PR goes through the same branch protection as any other change
 # (green CI + at least 1 approving review); Dependabot PRs are NOT auto-merged.
 # The repo is kept green by merging Dependabot PRs promptly, not by
@@ -40,15 +40,15 @@ updates:
     groups:
       # CodeQL requires init and analyze at the same version: a
       # workflow mixing versions fails outright, so separate PRs for the
-      # two steps can never go green. Group them into a single PR.
+      # two steps stay red. Group them into a single PR.
       codeql-action:
         patterns:
           - "github/codeql-action/init"
           - "github/codeql-action/analyze"
     # dtolnay/rust-toolchain is pinned to a commit on its stable branch
     # (see test.yml); commits on the toolchain branches are
-    # garbage-collected upstream, so dependabot must not "helpfully"
-    # move it. A monthly workflow (.github/workflows/toolchain-pin.yml)
+    # garbage-collected upstream, so dependabot skips it. A monthly
+    # workflow (.github/workflows/toolchain-pin.yml)
     # nudges a re-pin before the SHA is GC'd.
     ignore:
       - dependency-name: "dtolnay/rust-toolchain"

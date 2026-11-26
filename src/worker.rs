@@ -20,9 +20,9 @@
 //! The update steps themselves (branch, bump, spec-cleaner, OBS build,
 //! rpmcrab, adversarial audit) are performed by the executor. Only the
 //! [`DryRunExecutor`] is shipped: in dry-run it logs the would-do steps
-//! and returns `Planned`; in live mode it refuses, so no SR is ever filed
-//! on a plan that was not actually executed. The live executor (the
-//! agent/CI step, per `worker/brief.md`) is not implemented yet. Filing a
+//! and returns `Planned`; in live mode it refuses, so an SR is filed
+//! only on a plan that was actually executed. The live executor (the
+//! agent/CI step, per `worker/brief.md`) is the remaining work. Filing a
 //! live SR for an update that never happened would file a bogus request,
 //! so the pipeline stops and escalates instead.
 //!
@@ -63,8 +63,8 @@ pub struct UpdatePlan {
     /// The OBS home project the branch lives in. None when it could not
     /// be resolved (no `home_project` in config, no OBS credentials):
     /// the plan is still built and logged, but no SR payload can be
-    /// built from it — an unresolved branch project is an error, not a
-    /// placeholder (see `payload_from_plan`): a payload with a made-up
+    /// built from it — an unresolved branch project is an error (see
+    /// `payload_from_plan`): a payload with a made-up
     /// source project would file to the wrong place.
     pub branch_project: Option<String>,
     pub kind: UpdateKind,
@@ -79,8 +79,8 @@ pub struct UpdatePlan {
     pub cves: Vec<CveId>,
     /// The `%check` CVE regression-test requirement, for security
     /// entries: add a test that fails on the unpatched code and passes
-    /// with the fix, or document why none is feasible. None for routine
-    /// bumps (no CVE, no regression test required).
+    /// with the fix, or document why none is feasible. Routine bumps
+    /// carry None (no CVE, no regression test required).
     pub cve_regression_test: Option<String>,
 }
 
@@ -95,8 +95,8 @@ pub enum Execution {
 
 /// Executes the update steps for a plan (branch, bump, spec-cleaner,
 /// OBS build, rpmcrab, adversarial audit). The SR is filed only after
-/// the executor reports [`Execution::Completed`] — never on a plan
-/// alone.
+/// the executor reports [`Execution::Completed`]; a plan alone
+/// files nothing.
 pub trait UpdateExecutor {
     /// Execute the update steps for `plan`. Returns [`Execution::Planned`]
     /// in dry-run (steps logged, nothing executed) or
@@ -108,9 +108,9 @@ pub trait UpdateExecutor {
 /// The shipped executor: in dry-run it logs the would-do
 /// steps (branch, bump, spec-cleaner, build, rpmcrab, audit) and returns
 /// [`Execution::Planned`]; in live mode it refuses, because the live
-/// executor is the agent/CI step and does not exist yet. Refusing is
-/// the safe answer: a live SR must never be filed for an update that
-/// was not actually performed.
+/// executor is the agent/CI step and is the remaining work. Refusing is
+/// the safe answer: a live SR is filed only for an update that was
+/// actually performed.
 pub struct DryRunExecutor;
 
 impl UpdateExecutor for DryRunExecutor {
@@ -195,28 +195,27 @@ fn filing_failure(e: &GeectlError) -> WorkerOutcome {
 pub enum WorkerOutcome {
     /// The dedup re-check says the update is already handled (the devel
     /// project already has the version, or an open SR targets the
-    /// package). No SR is filed.
+    /// package). The SR stays unfiled.
     Skipped { reason: String },
     /// No devel project could be resolved for the package. The entry
-    /// escalates; the worker cannot file without a target.
+    /// escalates; filing needs a target.
     NoDevelProject,
     /// Dry-run: the full plan and (when the branch project resolved)
-    /// the exact SR payload were logged and verified; nothing was filed
-    /// and nothing changed. `payload` is None when the branch project
+    /// the exact SR payload were logged and verified; the run leaves
+    /// everything unchanged. `payload` is None when the branch project
     /// could not be resolved (see `UpdatePlan::branch_project`).
     Planned {
         plan: UpdatePlan,
         payload: Option<SrPayload>,
     },
     /// The update could not be completed (a check failed, the plan was
-    /// invalid, or live mode has no live executor). Escalate with the
+    /// invalid, or live mode lacks its executor). Escalate with the
     /// reason.
     Escalated { reason: String },
     /// The OBS API rejected the credentials (401/403) on a check or on
     /// filing. This is a run-level failure — bad or rotated
-    /// credentials — not a per-package problem: the dispatcher stops
-    /// the batch and fails the run loudly instead of escalating
-    /// package by package. The entry stays pending for the next run.
+    /// credentials: the dispatcher stops the batch and fails the run
+    /// loudly. The entry stays pending for the next run.
     AuthRejected { reason: String },
     /// Live: the SR was filed. Carries the OBS request id.
     Filed { sr_id: String, plan: UpdatePlan },
@@ -267,7 +266,7 @@ impl<'a> Worker<'a> {
     /// for the steps and the dry-run / live boundary.
     pub fn run(&self, entry: &QueueEntry) -> WorkerOutcome {
         // 1. Resolve the devel project (public API read) against
-        // Factory, the target the one-argument lookup read before.
+        // Factory, the target the one-argument lookup reads.
         let devel_project = match self
             .obs
             .devel_project(geectl::obs::FACTORY_PROJECT, &entry.package)
@@ -324,10 +323,10 @@ impl<'a> Worker<'a> {
             }
         };
         // 6. Build the SR payload. When the branch project is
-        // unresolved, there is no payload to build: in dry-run that is
+        // unresolved, the payload stays unbuilt: in dry-run that is
         // a planned outcome with a clear note (the plan is still
-        // logged); in live mode it is an escalation (nothing may be
-        // filed without a source project).
+        // logged); in live mode it is an escalation (filing needs a
+        // source project).
         let payload = match payload_from_plan(&plan) {
             Ok(payload) => Some(payload),
             Err(e) => {
@@ -357,8 +356,8 @@ impl<'a> Worker<'a> {
                 let Some(payload) = payload else {
                     // Completed implies live, and live requires a
                     // resolved branch project (step 6 escalates
-                    // otherwise), so this is unreachable — but never
-                    // file on a missing payload.
+                    // otherwise), so this is unreachable — and filing
+                    // needs a payload.
                     return WorkerOutcome::Escalated {
                         reason: "cannot file: no SR payload was built".to_string(),
                     };

@@ -3,5 +3,5 @@
 # The spellchecker runs in CI (typos.yml) over the whole repo. The
 # default dictionary is used; add a word to [default.extend-words]
 # only when it is a real word the dictionary does not know (a project
-# name, an API term), never to silence a genuine typo.
+# name, an API term).
 [default.extend-words]

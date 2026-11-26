@@ -36,12 +36,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      # Pinned to the v4 tag's commit so the action cannot move under us;
+      # Pinned to the v4 tag's commit so the action stays fixed;
       # Dependabot tracks SHA pins and proposes updates.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned to the stable-branch HEAD (2026-11-15) so the toolchain
+      # Pinned to the stable-branch HEAD so the toolchain
       # action is reproducible; update the SHA to move it. The toolchain
       # itself comes from rust-toolchain.toml (stable + rustfmt/clippy).
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca

@@ -22,19 +22,17 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # TLS backend pinned explicitly: default features off, rustls on,
-# so the transport cannot silently change if ureq's defaults move.
-# gzip stays on (it was a default) so compressed collector responses
-# keep working.
+# so the transport stays fixed if ureq's defaults move.
+# gzip stays on so compressed collector responses keep working.
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 # File locking for the queue (flock): serializes concurrent writers.
 fs2 = "0.4"
 # Base64 for the HTTP Basic auth header.
 base64 = "0.23"
 # The OBS library: the Factory reads, the devel lookup, the open-SR
-# check, and SR filing all come from geectl now; the local OBS client
-# is deleted. Taken from crates.io (0.2.3, released 2026-11-27);
-# Dependabot's weekly cargo updates propose each new geectl release
-# as its own PR — bump by changing the version in a reviewed PR.
+# check, and SR filing all come from geectl. Taken from crates.io
+# (0.2.3); Dependabot's weekly cargo updates propose each new geectl
+# release as its own PR — bump by changing the version in a reviewed PR.
 geectl = "0.2"
 
 [lints.rust]
@@ -43,6 +41,6 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 # Pedantic is informative locally; CI uses -D warnings on the default set only
-# (do not enable pedantic as warn-as-error — it blocks scaffolding with style
+# (pedantic stays allow: as warn-as-error it blocks scaffolding with style
 # nits).
 pedantic = { level = "allow", priority = -1 }

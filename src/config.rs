@@ -52,7 +52,7 @@ const KNOWN_KEYS: &[&str] = &[
 pub struct Config {
     pub packages: Vec<String>,
     pub exclusions: Vec<String>,
-    /// Distributions to watch. Only Factory is implemented; a Leap
+    /// Distributions to watch. Only Factory runs; a Leap
     /// target parses but the pipeline refuses to run it
     /// (see `docs/leap-and-cve.md` and `Target::is_implemented`).
     /// Default: `[Factory]`.
@@ -216,7 +216,7 @@ fn parse_subset(text: &str) -> Result<HashMap<String, Value>, ConfigError> {
             return Err(ConfigError(format!("line {lineno}: empty list item")));
         }
 
-        // A top-level key must not be indented.
+        // A top-level key sits at column zero.
         if line.starts_with(' ') {
             return Err(ConfigError(format!(
                 "line {lineno}: unexpected indentation (only list items may be indented)"
@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(cfg.targets, vec![Target::Factory]);
 
         // A Leap target parses — it is present in the config shape but
-        // not implemented; the pipeline refuses to run it (see
+        // planned; the pipeline refuses to run it (see
         // Target::is_implemented and docs/leap-and-cve.md).
         let cfg = load_config_text("targets:\n  - factory\n  - leap-16.0\n").unwrap();
         assert_eq!(
@@ -473,8 +473,8 @@ mod tests {
         assert!(load_config_text("concurrency: -1\n").is_err());
         assert!(load_config_text("concurrency: three\n").is_err());
         assert!(load_config_text("concurrency: true\n").is_err());
-        // A leading `+` is not a config integer (Rust's parser would
-        // accept it; the subset does not).
+        // A leading `+` fails the config-integer check (Rust's parser would
+        // accept it; the subset rejects it).
         assert!(load_config_text("concurrency: +3\n").is_err());
     }
 

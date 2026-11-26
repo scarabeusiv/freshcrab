@@ -3,10 +3,10 @@
 //! The Factory reads are geectl's public reads: `ObsClient::cat` for the
 //! spec and `ObsClient::list_packages` for the package list, both over
 //! `/public/source/...`, which needs no credentials. freshcrab implements
-//! no OBS logic of its own here — no endpoint construction, no URL
-//! building, no directory XML parsing (see docs/architecture.md for the
-//! rule). The spec Version field is parsed locally: it is a
-//! package-file field, not OBS wire XML.
+//! no OBS logic of its own here: endpoint construction, URL building,
+//! and directory XML parsing all live in geectl (see
+//! docs/architecture.md for the rule). The spec Version field is parsed
+//! locally: it is a package-file field, not OBS wire XML.
 
 use geectl::error::GeectlError;
 use geectl::obs::ObsClient;

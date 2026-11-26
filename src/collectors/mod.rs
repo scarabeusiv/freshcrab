@@ -44,7 +44,7 @@ pub struct Candidate {
 /// `%XX`. `+` is a literal plus in a path segment, and `:` is legal
 /// there (OBS project names are `openSUSE:Factory`-shaped). Package and
 /// project names come from config / the CLI / the network, so they are
-/// never interpolated raw — a name containing `/`, `?`, `&` or `=`
+/// always encoded — a name containing `/`, `?`, `&` or `=`
 /// would otherwise rewrite the request URL.
 pub(crate) fn encode_path(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -89,7 +89,7 @@ pub(crate) fn valid_obs_name(name: &str) -> bool {
 }
 
 /// A version collector. `latest_version` returns the newest version the
-/// collector knows for `package`, or None when it has no record of it.
+/// collector knows for `package`, or None for an unknown package.
 pub trait Collector {
     fn name(&self) -> &'static str;
     fn latest_version(&self, package: &str) -> Result<Option<Candidate>, HttpError>;
@@ -97,8 +97,7 @@ pub trait Collector {
 
 /// Query all collectors in priority order and return the candidates found.
 /// A collector that errors is skipped (its error is logged here, so an
-/// outage does not look identical to "no updates"); it does not fail
-/// the whole run.
+/// outage reads differently from "no updates"); the run goes on.
 pub fn collect(package: &str, collectors: &[Box<dyn Collector + '_>]) -> Vec<Candidate> {
     let mut out = Vec::new();
     for collector in collectors {
@@ -163,8 +162,7 @@ pub fn pypi_name(package: &str) -> Option<String> {
         .strip_prefix("python3-")
         .or_else(|| package.strip_prefix("python-"))?;
     // A bare `python-` / `python3-` prefix maps to an empty PyPI name,
-    // which would query `/pypi//json`; treat it as "not a Python
-    // package" instead.
+    // which would query `/pypi//json`; treat it as an empty name.
     if rest.is_empty() {
         None
     } else {
@@ -251,7 +249,7 @@ mod tests {
         assert_eq!(pypi_name("python-foo"), Some("foo".to_string()));
         assert_eq!(pypi_name("foo"), None);
         assert_eq!(pypi_name("python3"), None);
-        // A bare prefix is not a Python package (empty PyPI name).
+        // A bare prefix is an empty PyPI name.
         assert_eq!(pypi_name("python-"), None);
         assert_eq!(pypi_name("python3-"), None);
     }

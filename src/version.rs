@@ -39,7 +39,7 @@ pub fn rpmvercmp(a: &str, b: &str) -> Ordering {
     let mut j = 0usize;
 
     while i < a.len() || j < b.len() {
-        // Skip separators (not alnum, not ~, not ^).
+        // Skip separators (anything outside alnum, `~`, `^`).
         while i < a.len() && !is_alnum(a[i]) && a[i] != '~' && a[i] != '^' {
             i += 1;
         }
@@ -156,8 +156,7 @@ fn parse_epoch(version: &str) -> (u64, &str) {
     if let Some((epoch, rest)) = version.split_once(':') {
         if !epoch.is_empty() && epoch.chars().all(|c| c.is_ascii_digit()) {
             // A huge epoch saturates to u64::MAX (it sorts above every
-            // real epoch) instead of falling through to 0, which would
-            // sort it below everything.
+            // real epoch); falling through to 0 would sort it below everything.
             return (epoch.parse::<u64>().unwrap_or(u64::MAX), rest);
         }
     }
@@ -210,7 +209,7 @@ mod tests {
 
     #[test]
     fn numeric_segments() {
-        // Numeric comparison, not lexicographic: 1.10 > 1.9.
+        // Numeric comparison: 1.10 > 1.9.
         assert_eq!(rpmvercmp("1.10", "1.9"), Ordering::Greater);
         assert_eq!(rpmvercmp("1.9", "1.10"), Ordering::Less);
         assert_eq!(rpmvercmp("2.0", "10.0"), Ordering::Less);
@@ -309,7 +308,7 @@ mod tests {
     #[test]
     fn huge_epoch_saturates_to_max() {
         // A 21-digit epoch overflows u64: it saturates to MAX (sorts
-        // above every real epoch) instead of wrapping to 0.
+        // above every real epoch).
         assert_eq!(
             compare_evr("99999999999999999999999:1.0", "1:9.9"),
             Ordering::Greater

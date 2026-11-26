@@ -25,7 +25,7 @@ fn targets_parse_and_gate() {
     let cfg = load_config_text("").unwrap();
     assert_eq!(cfg.targets, vec![Target::Factory]);
 
-    // A Leap target parses but is not implemented (see
+    // A Leap target parses but is planned (see
     // docs/leap-and-cve.md).
     let cfg = load_config_text("targets:\n  - leap-16.0\n").unwrap();
     assert_eq!(

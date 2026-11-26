@@ -98,7 +98,7 @@ impl<'de> Deserialize<'de> for Target {
 /// currently ships and the candidate upstream version.
 ///
 /// Factory's policy is a plain RPM version comparison. Leap's policy
-/// (not implemented yet) is backport-aware: a CVE is fixed when the backported
+/// (planned) is backport-aware: a CVE is fixed when the backported
 /// patch is present in the Leap package, even if the version did not
 /// rise — so it consults the CVE validator (`crate::cve`) instead of
 /// comparing versions alone. The watcher holds a policy behind this

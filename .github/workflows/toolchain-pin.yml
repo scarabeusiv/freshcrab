@@ -1,15 +1,14 @@
 # Monthly re-pin nudge for the dtolnay/rust-toolchain SHA pin.
 #
 # test.yml, freshness.yml, and release.yml pin dtolnay/rust-toolchain
-# to a commit on its stable branch (Dependabot must not move it — see
+# to a commit on its stable branch (Dependabot skips it — see
 # dependabot.yml). Commits on the toolchain branches are
-# garbage-collected upstream, so a stale pin silently breaks every
-# Rust job at once. This workflow runs monthly and fails loudly when
+# garbage-collected upstream, so a stale pin breaks every Rust job at once. This workflow runs monthly and fails loudly when
 # the pin is gone (GC'd) or older than 45 days, so it is re-pinned
 # before it breaks. When it fails, re-pin: take the current stable
 # HEAD (`gh api repos/dtolnay/rust-toolchain/commits/stable --jq .sha`)
 # and update the SHA in test.yml, freshness.yml, AND release.yml (they
-# must match), plus the date in the pin comments.
+# must match).
 name: toolchain-pin
 
 on:
@@ -21,7 +20,7 @@ on:
 permissions:
   contents: read
 
-# Monthly + manual: never run two pin checks at once.
+# Monthly + manual: one pin check at a time.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -31,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # Pinned to the v4 tag's commit so the action cannot move under us;
+      # Pinned to the v4 tag's commit so the action stays fixed;
       # Dependabot tracks SHA pins and proposes updates.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -49,7 +48,7 @@ jobs:
           sha="${pinned}"
           # The pin must still resolve: a GC'd commit 404s here.
           if ! commit_json=$(gh api "repos/dtolnay/rust-toolchain/commits/${sha}"); then
-            echo "pinned dtolnay SHA ${sha} no longer resolves (garbage-collected?); re-pin to the current stable HEAD" >&2
+            echo "pinned dtolnay SHA ${sha} does not resolve (garbage-collected?); re-pin to the current stable HEAD" >&2
             exit 1
           fi
           commit_date=$(printf '%s' "${commit_json}" | jq -r '.commit.committer.date')
