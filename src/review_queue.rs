@@ -3317,6 +3317,63 @@ mod tests {
         let _ = fs::remove_file(format!("{path}.lock"));
     }
 
+    /// The Gitea arm of discovery searches the instance globally
+    /// and must return every open pull request, past geectl's
+    /// 500-entry bound (10 pages of 50). Against geectl 0.2.3 the
+    /// search fails on page 11 ("the list of pull requests on the
+    /// instance has more than 500 entries"); the unbounded read
+    /// (geectl #492) returns them all. The search runs through the
+    /// real geectl client over a canned HTTP transport — the
+    /// transport is the fake, the search code is real — and drives
+    /// it with the same query discovery builds (Gitea backend, open
+    /// states, no repo scope).
+    #[test]
+    fn gitea_search_returns_more_than_500_open_pull_requests() {
+        // 501 open pull requests: 10 full pages of 50, plus 1 on
+        // page 11. Page 11 is the probe: a list of exactly 500
+        // answers an empty page 11 and is returned, so the extra
+        // item is what makes the bound fail.
+        let mut http = crate::http::FakeHttpClient::new();
+        for page in 1..=11 {
+            let count = if page == 11 { 1 } else { 50 };
+            let start = (page - 1) * 50;
+            let issues: Vec<String> = (0..count)
+                .map(|i| {
+                    let number = start + i + 1;
+                    format!(
+                        r#"{{"number": {number}, "user": {{"login": "someone"}}, "title": "change {number}", "body": "A test PR body.", "labels": [], "state": "open", "pull_request": {{"merged": false, "draft": false}}, "repository": {{"full_name": "openSUSE/factory"}}}}"#
+                    )
+                })
+                .collect();
+            http = http.with(
+                &format!(
+                    "https://src.opensuse.org/api/v1/repos/issues/search?type=pulls&state=open&page={page}&limit=50"
+                ),
+                &format!("[{}]", issues.join(",")),
+            );
+        }
+        let gitea = GiteaClient::with_base(
+            &http,
+            "https://src.opensuse.org",
+            Credentials::Bearer {
+                token: "test-token".to_string(),
+            },
+        )
+        .unwrap();
+        let client = PullRequestClient::new(None, Some(&gitea));
+        let query = PullRequestSearch {
+            backend: Some(PullRequestBackend::Gitea),
+            states: vec![PullRequestStatus::Open],
+            ..PullRequestSearch::default()
+        };
+        let summaries = PullRequestSource::search(&client, &query).unwrap();
+        assert_eq!(summaries.len(), 501);
+        assert_eq!(
+            summaries[500].reference.to_string(),
+            "gitea:openSUSE/factory#501"
+        );
+    }
+
     /// An HTTP client that fails every request. The skipped-arm
     /// test never reaches it (the arm is skipped before any client
     /// is built), so its methods are never called.
