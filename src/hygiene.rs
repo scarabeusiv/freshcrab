@@ -38,6 +38,7 @@ use geectl::obs::{
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Days a package must fail everywhere that counts before it is
 /// long-broken.
@@ -112,8 +113,7 @@ pub fn repo_is_tumbleweed(repo: &Repository) -> bool {
 /// home (a branch of a branch nests the marker, which the suffix
 /// form still matches).
 pub fn is_branch_of(source_project: &str, project: &str) -> bool {
-    source_project == project
-        || source_project.ends_with(&format!(":branches:{project}"))
+    source_project == project || source_project.ends_with(&format!(":branches:{project}"))
 }
 
 /// True when the request integrated `package` out of `project`: a
@@ -332,11 +332,7 @@ pub fn sweep_obsolete_repositories(
 /// with the package as a source; the project/branch filter runs here
 /// because a same-named package in another project, or a request
 /// whose submit action covers another package, must not count.
-fn ever_integrated(
-    obs: &ObsClient,
-    project: &str,
-    package: &str,
-) -> Result<bool, GeectlError> {
+fn ever_integrated(obs: &ObsClient, project: &str, package: &str) -> Result<bool, GeectlError> {
     let search = RequestSearch::new()
         .source_packages(vec![package.to_string()])
         .states(vec![RequestState::Accepted])
@@ -365,9 +361,7 @@ pub fn sweep_long_broken(
         .map_err(map_credentials_error)?
         .into_iter()
         .collect();
-    let packages = obs
-        .list_packages(project)
-        .map_err(map_credentials_error)?;
+    let packages = obs.list_packages(project).map_err(map_credentials_error)?;
     let meta = obs
         .project_meta_authenticated(project)
         .map_err(map_credentials_error)?;
@@ -592,24 +586,21 @@ mod tests {
     fn tumbleweed_is_the_factory_path() {
         assert!(repo_is_tumbleweed(&repo_named(
             "openSUSE_Tumbleweed",
-            vec![(
-                "openSUSE:Factory".to_string(),
-                "standard".to_string()
-            )]
+            vec![("openSUSE:Factory".to_string(), "standard".to_string())]
         )));
         assert!(!repo_is_tumbleweed(&repo_named(
             "openSUSE_Leap_15.6",
-            vec![(
-                "openSUSE:Leap:15.6".to_string(),
-                "standard".to_string()
-            )]
+            vec![("openSUSE:Leap:15.6".to_string(), "standard".to_string())]
         )));
         assert!(!repo_is_tumbleweed(&repo_named("standard", vec![])));
     }
 
     #[test]
     fn branch_detection_is_exact() {
-        assert!(is_branch_of("devel:languages:python", "devel:languages:python"));
+        assert!(is_branch_of(
+            "devel:languages:python",
+            "devel:languages:python"
+        ));
         assert!(is_branch_of(
             "home:scarabeus_iv:branches:devel:languages:python",
             "devel:languages:python"
@@ -618,7 +609,10 @@ mod tests {
             "home:scarabeus_iv:branches:home:scarabeus_iv:branches:devel:languages:python",
             "devel:languages:python"
         ));
-        assert!(!is_branch_of("devel:languages:ruby", "devel:languages:python"));
+        assert!(!is_branch_of(
+            "devel:languages:ruby",
+            "devel:languages:python"
+        ));
         // A subproject of another project is not a branch of this one.
         assert!(!is_branch_of("bar:foo", "foo"));
         assert!(!is_branch_of(
@@ -632,7 +626,10 @@ mod tests {
         let now = 1_800_000_000u64;
         let cutoff = now - BROKEN_DURATION_SECS;
         // Last success just inside the threshold: not sustained.
-        assert!(!sustained_broken(&[job("succeeded", Some(cutoff + 1))], now));
+        assert!(!sustained_broken(
+            &[job("succeeded", Some(cutoff + 1))],
+            now
+        ));
         // Last success just outside: sustained.
         assert!(sustained_broken(&[job("succeeded", Some(cutoff - 1))], now));
         // Failures only, window reaching past the cutoff: sustained.
