@@ -1664,8 +1664,8 @@ pub fn read_signals(
     // never disproven: the list flattens persons and groups with
     // no discriminator, so a group-member author who matches no
     // name reads as unknown, not as a non-maintainer. An empty
-    // list proves there is no maintainer at all. Gitea has no
-    // such read here.
+    // list proves no maintainer in the package/project ancestry
+    // the owner search walks. Gitea has no such read here.
     let is_package_maintainer = match record.backend.as_str() {
         "obs" => match split_project_package(&pr.target.repository) {
             Some((target_project, target_package)) => {
@@ -2008,7 +2008,8 @@ fn parse_diff(text: &str) -> DiffSignal {
         // changes:` line can only be a section header: hunk lines
         // carry a `+`, `-`, ` `, or `@@` prefix.
         match line {
-            "changes files:" | "spec files:" | "old:" | "new:" | "other changes:" => {
+            "changes files:" | "spec files:" | "dsc files:" | "old:" | "new:"
+            | "other changes:" => {
                 in_tarball_contents = false;
             }
             _ => {}
@@ -2172,36 +2173,36 @@ fn parse_diff(text: &str) -> DiffSignal {
     }
 }
 
-/// True for a `++++++` marker naming tarball contents: an archive
-/// filename, or an `old -> new` tarball change. A plain file
-/// (`_patchinfo`, a spec, a service file) is a package file, not
-/// tarball contents — the `other changes:` section label alone
-/// cannot tell them apart.
+/// True for a `++++++` marker naming tarball contents. OBS's
+/// diff generator (`BSSrcServer::Srcdiff::srcdiff`, the `doarchive`
+/// regex) tardiffs exactly `.tar`, `.tgz`, `.tar.gz`,
+/// `.tar.bz2`, `.tbz`, `.tar.xz`, `.tar.zst`, `.tar.zstd`,
+/// `.gem`, `.obscpio`, `.livebuild`, `.zip`; everything else gets
+/// a plain filediff — including bare `.gz`/`.bz2`/`.xz`/`.zst`
+/// (decompressed and diffed) and `.tbz2`/`.txz`/`.tzst`/`.7z`/`.rar`.
+/// A `old -> new` rename marker is a tardiff only when the new
+/// side is an archive; a renamed plain file gets a plain filediff.
 fn is_tarball_marker(marker: &str) -> bool {
-    if marker.contains(" -> ") {
-        return true;
-    }
+    // A rename names tarball contents only when the new side is
+    // an archive.
+    let name = match marker.split_once(" -> ") {
+        Some((_, new)) => new,
+        None => marker,
+    };
     // A new archive is still an archive.
-    let name = marker
-        .strip_suffix(" (new)")
-        .unwrap_or(marker)
-        .to_lowercase();
-    name.ends_with(".tar.gz")
+    let name = name.strip_suffix(" (new)").unwrap_or(name).to_lowercase();
+    name.ends_with(".tar")
         || name.ends_with(".tgz")
+        || name.ends_with(".tar.gz")
         || name.ends_with(".tar.bz2")
-        || name.ends_with(".tbz2")
+        || name.ends_with(".tbz")
         || name.ends_with(".tar.xz")
-        || name.ends_with(".txz")
         || name.ends_with(".tar.zst")
-        || name.ends_with(".tzst")
-        || name.ends_with(".tar")
+        || name.ends_with(".tar.zstd")
+        || name.ends_with(".gem")
+        || name.ends_with(".obscpio")
+        || name.ends_with(".livebuild")
         || name.ends_with(".zip")
-        || name.ends_with(".gz")
-        || name.ends_with(".bz2")
-        || name.ends_with(".xz")
-        || name.ends_with(".zst")
-        || name.ends_with(".7z")
-        || name.ends_with(".rar")
 }
 
 /// The file path from a `---`/`+++` header line: strip a trailing
@@ -3757,7 +3758,7 @@ mod tests {
     // `---`/`+++`, no `diff --git`. The tarball change under
     // `other changes:` is not a package file, so README.md is not
     // in `files` and does not break the scope.
-    const OBS_MODIFY_DIFF: &str = "changes files:\n--------------\n--- shadowsocks-v2ray-plugin.changes\n+++ shadowsocks-v2ray-plugin.changes\n@@ -1,0 +2,19 @@\n+Fri May 29 13:26:53 UTC 2026 - Hillwood Yang <hillwoodroc@gmail.com>\n+\n+- Update version to 5.49.0\n+  * Update v2ray-core to 5.49.0\n+  * Update vendor (boo#1260328 and CVE-2026-33186)\n+\n+-------------------------------------------------------------------\n+Thu Feb 12 12:51:31 UTC 2026 - Hillwood Yang <hillwood@opensuse.org>\n+\n+- Update version to 5.44.1\n\nold:\n----\n  v2ray-plugin-5.37.0.tar.gz\n\nnew:\n----\n  v2ray-plugin-5.49.0.tar.gz\n\nspec files:\n-----------\n--- shadowsocks-v2ray-plugin.spec\n+++ shadowsocks-v2ray-plugin.spec\n@@ -1,7 +1,7 @@\n #\n # spec file for package shadowsocks-v2ray-plugin\n #\n-# Copyright (c) 2025 SUSE LLC and contributors\n+# Copyright (c) 2026 SUSE LLC and contributors\n #\n # All modifications and additions to the file contributed by third parties\n # remain the property of their copyright owners, unless otherwise agreed\n@@ -27,7 +27,7 @@\n %define   import_path     %{provider_prefix}\n \n Name:           shadowsocks-v2ray-plugin\n-Version:        5.37.0\n+Version:        5.49.0\n Release:        0\n Summary:        SIP003 plugin for shadowsocks\n License:        MIT\n@@ -36,7 +36,9 @@\n Source0:        https://github.com/teddysun/v2ray-plugin/archive/v%{version}/%{repo}-%{version}.tar.gz\n Source1:        vendor.tar.gz\n BuildRequires:  fdupes\n+# BuildRequires:  golang-github-v2fly-v2ray-core >= 5.44.1\n BuildRequires:  golang-packaging\n+BuildRequires:  golang(API) >= 1.25\n AutoReqProv:    Off\n BuildRoot:      %{_tmppath}/%{name}-%{version}-build\n %{go_provides}\n\nother changes:\n--------------\n\n++++++ v2ray-plugin-5.37.0.tar.gz -> v2ray-plugin-5.49.0.tar.gz\n--- README.md\n+++ README.md\n@@ -2,7 +2,7 @@\n \n [![CircleCI](https://circleci.com/gh/shadowsocks/v2ray-plugin.svg?style=shield)](https://circleci.com/gh/shadowsocks/v2ray-plugin)\n [![Releases](https://img.shields.io/github/downloads/shadowsocks/v2ray-plugin/total.svg)](https://github.com/repo/releases)\n-[![Language: Go](https://img.shields.io/badge/go-1.20+-blue.svg)](https://github.com/repo/search?l=go)\n+[![Language: Go](https://img.shields.io/badge/go-1.25+-blue.svg)](https://github.com/repo/search?l=go)\n [![Go Report Card](https://goreportcard.com/badge/github.com/repo/report)](https://goreportcard.com/report/github.com/repo/report)\n\n++++++ vendor.tar.gz\n\nnew:\n----\n  _patchinfo\n\nother changes:\n--------------\n\n++++++ _patchinfo (new)\n--- _patchinfo\n+++ _patchinfo\n@@ -0,0 +1,20 @@\n+<patchinfo incident=\"19707\">\n+  <issue tracker=\"bnc\" id=\"1260328\">VUL-0: CVE-2026-33186: shadowsocks-v2ray-plugin: google.golang.org/grpc: authorization bypass due to improper validation of the HTTP/2 :path pseudo-header</issue>\n+  <issue tracker=\"cve\" id=\"2026-33186\"/>\n+  <packager>hillwood</packager>\n+  <rating>critical</rating>\n+  <category>security</category>\n+  <summary>Security update for shadowsocks-v2ray-plugin</summary>\n+  <description>This update for shadowsocks-v2ray-plugin fixes the following issues:\n+\n+- Update version to 5.49.0\n+  * Update v2ray-core to 5.49.0\n+  * Update vendor (boo#1260328 and CVE-2026-33186)\n+\n+- Update version to 5.44.1\n+  * Update v2ray-core to v5.44.1\n+\n+- Update version to 5.41.0\n+  * Update v2ray-core to v5.41.0\n+</description>\n+</patchinfo>\n";
+    const OBS_MODIFY_DIFF: &str = "changes files:\n--------------\n--- shadowsocks-v2ray-plugin.changes\n+++ shadowsocks-v2ray-plugin.changes\n@@ -1,0 +2,19 @@\n+Fri May 29 13:26:53 UTC 2026 - Hillwood Yang <hillwoodroc@gmail.com>\n+\n+- Update version to 5.49.0\n+  * Update v2ray-core to 5.49.0\n+  * Update vendor (boo#1260328 and CVE-2026-33186)\n+\n+-------------------------------------------------------------------\n+Thu Feb 12 12:51:31 UTC 2026 - Hillwood Yang <hillwood@opensuse.org>\n+\n+- Update version to 5.44.1\n\nold:\n----\n  v2ray-plugin-5.37.0.tar.gz\n\nnew:\n----\n  v2ray-plugin-5.49.0.tar.gz\n\nspec files:\n-----------\n--- shadowsocks-v2ray-plugin.spec\n+++ shadowsocks-v2ray-plugin.spec\n@@ -1,7 +1,7 @@\n #\n # spec file for package shadowsocks-v2ray-plugin\n #\n-# Copyright (c) 2025 SUSE LLC and contributors\n+# Copyright (c) 2026 SUSE LLC and contributors\n #\n # All modifications and additions to the file contributed by third parties\n # remain the property of their copyright owners, unless otherwise agreed\n@@ -27,7 +27,7 @@\n %define   import_path     %{provider_prefix}\n \n Name:           shadowsocks-v2ray-plugin\n-Version:        5.37.0\n+Version:        5.49.0\n Release:        0\n Summary:        SIP003 plugin for shadowsocks\n License:        MIT\n@@ -36,7 +36,9 @@\n Source0:        https://github.com/teddysun/v2ray-plugin/archive/v%{version}/%{repo}-%{version}.tar.gz\n Source1:        vendor.tar.gz\n BuildRequires:  fdupes\n+# BuildRequires:  golang-github-v2fly-v2ray-core >= 5.44.1\n BuildRequires:  golang-packaging\n+BuildRequires:  golang(API) >= 1.25\n AutoReqProv:    Off\n BuildRoot:      %{_tmppath}/%{name}-%{version}-build\n %{go_provides}\n\nother changes:\n--------------\n\n++++++ v2ray-plugin-5.37.0.tar.gz -> v2ray-plugin-5.49.0.tar.gz\n--- README.md\n+++ README.md\n@@ -2,7 +2,7 @@\n \n [![CircleCI](https://circleci.com/gh/shadowsocks/v2ray-plugin.svg?style=shield)](https://circleci.com/gh/shadowsocks/v2ray-plugin)\n [![Releases](https://img.shields.io/github/downloads/shadowsocks/v2ray-plugin/total.svg)](https://github.com/repo/releases)\n-[![Language: Go](https://img.shields.io/badge/go-1.20+-blue.svg)](https://github.com/repo/search?l=go)\n+[![Language: Go](https://img.shields.io/badge/go-1.25+-blue.svg)](https://github.com/repo/search?l=go)\n [![Go Report Card](https://goreportcard.com/badge/github.com/repo/report)](https://goreportcard.com/report/github.com/repo/report)\n\n++++++ vendor.tar.gz\n(207384 lines skipped)\n\nnew:\n----\n  _patchinfo\n\nother changes:\n--------------\n\n++++++ _patchinfo (new)\n--- _patchinfo\n+++ _patchinfo\n@@ -0,0 +1,20 @@\n+<patchinfo incident=\"19707\">\n+  <issue tracker=\"bnc\" id=\"1260328\">VUL-0: CVE-2026-33186: shadowsocks-v2ray-plugin: google.golang.org/grpc: authorization bypass due to improper validation of the HTTP/2 :path pseudo-header</issue>\n+  <issue tracker=\"cve\" id=\"2026-33186\"/>\n+  <packager>hillwood</packager>\n+  <rating>critical</rating>\n+  <category>security</category>\n+  <summary>Security update for shadowsocks-v2ray-plugin</summary>\n+  <description>This update for shadowsocks-v2ray-plugin fixes the following issues:\n+\n+- Update version to 5.49.0\n+  * Update v2ray-core to 5.49.0\n+  * Update vendor (boo#1260328 and CVE-2026-33186)\n+\n+- Update version to 5.44.1\n+  * Update v2ray-core to v5.44.1\n+\n+- Update version to 5.41.0\n+  * Update v2ray-core to v5.41.0\n+</description>\n+</patchinfo>\n";
 
     // OBS plain-text diff that is a pure version bump: only the
     // spec `Version:` and a new changelog entry.
@@ -3766,6 +3767,12 @@ mod tests {
     // OBS plain-text diff for a new package (obs:1274565, trimmed):
     // `++++++ new ... file:` markers, no `--- /dev/null`.
     const OBS_NEW_DIFF: &str = "changes files:\n--------------\n\n++++++ new changes file:\n--- python-pyproject-examples.changes\n+++ python-pyproject-examples.changes\n@@ -0,0 +1,9 @@\n+-------------------------------------------------------------------\n+Thu Feb 27 10:00:28 UTC 2025 - ecsos <ecsos@opensuse.org>\n+\n+- Add %{?sle15_python_module_pythons}\n+\n+-------------------------------------------------------------------\n+Fri Jul 26 07:14:39 UTC 2024 - Steve Kowalik <steven.kowalik@suse.com>\n+\n+- Initial release of 2023.6.30\n\nnew:\n----\n  pyproject_examples-2023.6.30.tar.gz\n  python-pyproject-examples.changes\n  python-pyproject-examples.spec\n\nspec files:\n-----------\n\n++++++ new spec file:\n--- python-pyproject-examples.spec\n+++ python-pyproject-examples.spec\n@@ -0,0 +1,61 @@\n+#\n+# spec file for package python-pyproject-examples\n+#\n+# Copyright (c) 2024 SUSE LLC\n+#\n+Name:           python-pyproject-examples\n+Version:        2023.6.30\n+Release:        0\n+Summary:        Example pyproject.toml configs for testing\n+License:        MIT\n";
+
+    // OBS `other changes:` markers: a `.gem` is tarball contents
+    // to skip; a `.txz` and a bare `.gz` are not in OBS's tardiff
+    // list, so they are parsed as package files; a renamed patch
+    // is a plain filediff, not a tardiff.
+    const OBS_ARCHIVE_MARKERS_DIFF: &str = "other changes:\n--------------\n\n++++++ foo-1.0.gem\n--- data/foo.rb\n+++ data/foo.rb\n@@ -1 +1 @@\n-old\n+new\n\n++++++ bar-1.0.txz\n--- bar-1.0.txz\n+++ bar-1.0.txz\n@@ -1 +1 @@\n-old\n+new\n\n++++++ data.gz\n--- data.gz\n+++ data.gz\n@@ -1 +1 @@\n-old\n+new\n\n++++++ foo-1.0.patch -> foo-2.0.patch\n--- foo-1.0.patch\n+++ foo-2.0.patch\n@@ -1 +1 @@\n-old\n+new\n";
 
     // A spec-only `%description` bullet edit: not a version bump.
     // The `- ` bullet counts as a changelog line only inside a
@@ -3980,6 +3987,20 @@ mod tests {
         // A new package is not a version bump.
         assert!(!diff.version_bump_only);
         assert_eq!(diff.new_version.as_deref(), Some("2023.6.30"));
+    }
+
+    #[test]
+    fn parse_diff_obs_archive_markers() {
+        let diff = parse_diff(OBS_ARCHIVE_MARKERS_DIFF);
+        // The gem's contents are tarball contents: skipped.
+        // The .txz, the bare .gz, and the renamed patch are plain
+        // filediffs: parsed.
+        assert_eq!(
+            diff.files,
+            vec!["bar-1.0.txz", "data.gz", "foo-1.0.patch", "foo-2.0.patch"]
+        );
+        assert!(diff.patches_changed);
+        assert!(!diff.version_bump_only);
     }
 
     #[test]
