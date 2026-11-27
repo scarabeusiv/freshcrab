@@ -1,5 +1,5 @@
 ---
-# Release: build binaries, sign them, create the GitHub release.
+# Release: build binaries, sign them, create the GitHub release, publish the crate to crates.io.
 #
 # Triggered by a bare `v`-prefixed tag (vX.Y.Z only). The version is the tag minus the `v` and must
 # equal the [package] version in Cargo.toml, or the run fails before
@@ -29,11 +29,12 @@
 # in test.yml), and assert it.
 #
 # Deliberately not here: no benchmark job (freshcrab has no release
-# corpus to A/B against); no crates.io publish (registry versions burn
-# the version number; re-add once the release cadence is settled);
-# no OBS submission; no tag-signature verification (rpmcrab does not
-# do it either). Modeled on plusky/rpmcrab's release.yml, adapted for
-# a single crate with no system dependencies.
+# corpus to A/B against), no OBS submission, and no tag-signature
+# verification (rpmcrab does not do it either). crates.io publish is
+# its own job after the GitHub release; registry versions are
+# immutable, so a re-run skips a version already on the registry.
+# Modeled on plusky/rpmcrab's release.yml, adapted for a single crate
+# with no system dependencies.
 name: release
 on:
   push:
@@ -352,6 +353,54 @@ jobs:
             gh release create "$tag" --notes-file notes.md dist/*
           fi
 
+  # Publish the crate to crates.io after the GitHub release is out, so a
+  # failed registry publish never burns a version without a release
+  # behind it. A re-run skips a version already on the registry.
+  publish-crates-io:
+    if: github.event_name == 'push'
+    needs: [check-version, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Same derivation as the build job: publish verifies the package
+      # by building it, so the verification build uses the release
+      # toolchain.
+      - name: Derive the release toolchain from Cargo.toml
+        id: toolchain
+        run: |
+          toolchain=$(sed -n 's/^rust-version = "\([0-9][0-9.]*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$toolchain" || { echo "rust-version not found in Cargo.toml" >&2; exit 1; }
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: ${{ steps.toolchain.outputs.toolchain }}
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.check-version.outputs.version }}"
+          # The token is required: a missing secret fails the job rather
+          # than attempting an unauthenticated publish.
+          test -n "${CARGO_REGISTRY_TOKEN:-}" || { echo "::error::CRATES_IO_TOKEN is not set; refusing to publish" >&2; exit 1; }
+          # Registry versions are immutable: a re-run over an already
+          # published version skips instead of failing the release.
+          # crates.io rejects curl's default User-Agent at the edge, so
+          # the lookup carries a descriptive one; only a 404 reads as
+          # "not published yet" and any other unexpected status fails
+          # loudly instead of publishing over an unknown state.
+          code=$(curl -sS -A "freshcrab-release" -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/freshcrab/$version")
+          case "$code" in
+            200) echo "freshcrab $version is already on crates.io; skipping"; exit 0 ;;
+            404) ;;
+            *) echo "::error::crates.io lookup for freshcrab $version returned HTTP $code" >&2; exit 1 ;;
+          esac
+          cargo publish --locked
+
   # Opens the post-release development bump (X.Y.Z -> X.Y.(Z+1)) as a PR
   # with auto-merge on, so main stops carrying the shipped version as
   # soon as the release is out. The PR still needs its human approval,
@@ -362,7 +411,7 @@ jobs:
   # the job updates the same branch and PR.
   post-release-bump:
     if: github.event_name == 'push'
-    needs: [check-version, release]
+    needs: [check-version, release, publish-crates-io]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
