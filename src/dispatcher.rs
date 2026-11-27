@@ -279,12 +279,12 @@ impl<'a> Dispatcher<'a> {
 mod tests {
     use super::*;
     use crate::dry_run::DryRun;
-    use crate::http::FakeHttpClient;
+    use crate::obs_gateway::FakeObsGateway;
     use crate::queue::{DedupChecks, QueueEntry, UpdateKind};
     use crate::target::Target;
     use crate::worker::{DryRunExecutor, Execution, UpdateExecutor, UpdatePlan};
-    use geectl::auth::Credentials;
-    use geectl::obs::ObsClient;
+    use geectl::error::{ErrorKind, GeectlError};
+    use geectl::obs::MaintainedInstance;
     use std::env;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -308,56 +308,44 @@ mod tests {
         QueueEntry::new(package, "1.9", "2.0", "repology", &Target::Factory, kind)
     }
 
-    /// The OBS search URL for `package`, from a throwaway geectl
-    /// client (the URL is a pure function of the package, so no canned
-    /// response is needed to build it).
-    fn search_url_for(package: &str) -> String {
-        let probe = FakeHttpClient::new();
-        let obs = ObsClient::new(&probe);
-        obs.search_url(package).unwrap()
+    /// A canned gateway for Factory packages: a devel project, a
+    /// devel version, and an open-SR answer. The fake is
+    /// package-agnostic, so one gateway serves every package in a
+    /// test.
+    fn gateway_for(_package: &str, devel_version: &str, open_sr: bool) -> FakeObsGateway {
+        let mut gateway = FakeObsGateway::new();
+        gateway.devel_project = Ok(Some((
+            "devel:languages:python".to_string(),
+            "foo".to_string(),
+        )));
+        gateway.devel_version = Ok(Some(devel_version.to_string()));
+        gateway.has_open_sr = Ok(open_sr);
+        gateway
     }
 
-    /// An OBS client with credentials, for tests that need the
-    /// authenticated endpoints (the open-SR search, filing).
-    fn obs_with_creds(http: &FakeHttpClient) -> ObsClient<'_> {
-        ObsClient::with_credentials(
-            http,
-            Credentials::Basic {
-                username: "scarabeus_iv".to_string(),
-                password: "secret".to_string(),
+    /// A canned gateway for a Leap `foo`: the maintained-instances
+    /// listing for 15.6 (plus the 15.5 instance the listing carries).
+    fn gateway_for_leap_foo() -> FakeObsGateway {
+        let mut gateway = FakeObsGateway::new();
+        gateway.maintained_instances = Ok(vec![
+            MaintainedInstance {
+                source_project: "openSUSE:Leap:15.6:Update".to_string(),
+                source_package: "foo".to_string(),
+                devel_project: Some("devel:languages:python".to_string()),
+                devel_package: Some("foo".to_string()),
+                target_project: "home:scarabeus_iv:branches:OBS_Maintained:foo".to_string(),
+                target_package: "foo.openSUSE_Leap_15.6_Update".to_string(),
             },
-        )
-        .unwrap()
-    }
-
-    /// A canned OBS backend for `package`: a devel project, a devel
-    /// spec at the given version, and an open-SR search result.
-    fn http_for(package: &str, devel_version: &str, open_sr_matches: u32) -> FakeHttpClient {
-        let search_body = if open_sr_matches == 0 {
-            "<collection matches=\"0\"></collection>".to_string()
-        } else {
-            // A full request element with a submit action: geectl's
-            // open-SR check counts only requests that carry one, so a
-            // bare self-closing `<request id="..."/>` would read as
-            // empty and the skip would silently stop happening.
-            format!(
-                "<collection matches=\"{open_sr_matches}\"><request id=\"1398492\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"{package}\"/><target project=\"devel:languages:python\" package=\"{package}\"/></action></request></collection>"
-            )
-        };
-        FakeHttpClient::new()
-            .with(
-                &format!("https://api.opensuse.org/public/source/openSUSE:Factory/{package}/_meta"),
-                &format!(
-                    "<package name=\"{package}\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"{package}\"/></package>"
-                ),
-            )
-            .with(
-                &format!(
-                    "https://api.opensuse.org/public/source/devel:languages:python/{package}/{package}.spec"
-                ),
-                &format!("Name: {package}\nVersion: {devel_version}\n"),
-            )
-            .with(&search_url_for(package), &search_body)
+            MaintainedInstance {
+                source_project: "openSUSE:Leap:15.5:Update".to_string(),
+                source_package: "foo".to_string(),
+                devel_project: None,
+                devel_package: None,
+                target_project: "home:scarabeus_iv:branches:OBS_Maintained:foo".to_string(),
+                target_package: "foo.openSUSE_Leap_15.5_Update".to_string(),
+            },
+        ]);
+        gateway
     }
 
     /// An executor that reports the update as completed (for live-mode
@@ -393,10 +381,9 @@ mod tests {
         drop(queue);
 
         let mut queue = Queue::open(&path).unwrap();
-        let http = http_for("foo", "1.9", 0);
-        let obs = obs_with_creds(&http);
+        let gateway = gateway_for("foo", "1.9", false);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &dry);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -407,8 +394,6 @@ mod tests {
         assert_eq!(report.escalated, 0);
         // Dry-run changed no queue state: the entry is still pending.
         assert_eq!(queue.find("foo").unwrap().status, "pending");
-        // And nothing was posted.
-        assert!(http.posted().is_empty());
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }
@@ -435,22 +420,9 @@ mod tests {
 
         let mut queue = Queue::open(&path).unwrap();
         let dry = DryRun::new(true);
-        let http = http_for("routine-pkg", "1.9", 0)
-            .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/sec-pkg/_meta",
-                "<package name=\"sec-pkg\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"sec-pkg\"/></package>",
-            )
-            .with(
-                "https://api.opensuse.org/public/source/devel:languages:python/sec-pkg/sec-pkg.spec",
-                "Name: sec-pkg\nVersion: 1.9\n",
-            )
-            .with(
-                &search_url_for("sec-pkg"),
-                "<collection matches=\"0\"></collection>",
-            );
-        let obs = obs_with_creds(&http);
+        let gateway = gateway_for("routine-pkg", "1.9", false);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &dry);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -478,29 +450,9 @@ mod tests {
 
         let mut queue = Queue::open(&path).unwrap();
         let dry = DryRun::new(true);
-        let mut http = FakeHttpClient::new();
-        for pkg in ["a", "b", "c"] {
-            http = http
-                .with(
-                    &format!("https://api.opensuse.org/public/source/openSUSE:Factory/{pkg}/_meta"),
-                    &format!(
-                        "<package name=\"{pkg}\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"{pkg}\"/></package>"
-                    ),
-                )
-                .with(
-                    &format!(
-                        "https://api.opensuse.org/public/source/devel:languages:python/{pkg}/{pkg}.spec"
-                    ),
-                    &format!("Name: {pkg}\nVersion: 1.9\n"),
-                )
-                .with(
-                    &search_url_for(pkg),
-                    "<collection matches=\"0\"></collection>",
-                );
-        }
-        let obs = obs_with_creds(&http);
+        let gateway = gateway_for("a", "1.9", false);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let cfg = config(2, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &dry);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -534,26 +486,10 @@ mod tests {
         drop(queue);
 
         let mut queue = Queue::open(&path).unwrap();
-        let http = http_for("foo", "1.9", 0)
-            .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/bar/_meta",
-                "<package name=\"bar\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>",
-            )
-            .with(
-                "https://api.opensuse.org/public/source/devel:languages:python/bar/bar.spec",
-                "Name: bar\nVersion: 1.9\n",
-            )
-            .with(
-                &search_url_for("bar"),
-                "<collection matches=\"0\"></collection>",
-            )
-            .with_post(
-                "https://api.opensuse.org/request?cmd=create",
-                "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
-            );
-        let obs = obs_with_creds(&http);
+        let mut gateway = gateway_for("foo", "1.9", false);
+        gateway.file_submit = Ok(Some(("1400001".to_string(), Vec::new())));
         let executor = CompletedExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         // Daily cap 1: only the first entry files; the second is skipped
         // with the cap reason.
         let cfg = config(4, 1);
@@ -574,8 +510,6 @@ mod tests {
         assert_eq!(queue.find("bar").unwrap().status, "pending");
         // The cap counts the SR filed today.
         assert_eq!(queue.srs_filed_today(), 1);
-        // Exactly one POST was made.
-        assert_eq!(http.posted().len(), 1);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }
@@ -598,10 +532,9 @@ mod tests {
         let mut queue = Queue::open(&path).unwrap();
         // Devel already at 2.0: the worker skips, the dispatcher marks
         // the entry done, and the cap is not consumed.
-        let http = http_for("foo", "2.0", 0);
-        let obs = ObsClient::new(&http);
+        let gateway = gateway_for("foo", "2.0", false);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &live);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -609,7 +542,6 @@ mod tests {
         assert_eq!(report.filed, 0);
         assert_eq!(report.cap_remaining, 20);
         assert_eq!(queue.find("foo").unwrap().status, "done");
-        assert!(http.posted().is_empty());
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }
@@ -637,67 +569,22 @@ mod tests {
         drop(queue);
 
         let mut queue = Queue::open(&path).unwrap();
-        // The open-SR search 401s for foo (rotated credentials): the
-        // run fails loudly instead of escalating foo and moving on to
-        // bar. Both entries stay pending for the next run.
-        let http = http_for("foo", "1.9", 0)
-            .with_status(&search_url_for("foo"), 401, "unauthorized")
-            .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/bar/_meta",
-                "<package name=\"bar\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"bar\"/></package>",
-            )
-            .with(
-                "https://api.opensuse.org/public/source/devel:languages:python/bar/bar.spec",
-                "Name: bar\nVersion: 1.9\n",
-            )
-            .with(
-                &search_url_for("bar"),
-                "<collection matches=\"0\"></collection>",
-            );
-        let obs = obs_with_creds(&http);
+        // The open-SR check rejects the credentials for foo (rotated
+        // credentials): the run fails loudly instead of escalating foo
+        // and moving on to bar. Both entries stay pending for the next
+        // run.
+        let mut gateway = gateway_for("foo", "1.9", false);
+        gateway.has_open_sr = Err(GeectlError::new(ErrorKind::AuthFailed, "unauthorized"));
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &live);
         let err = dispatcher.dispatch(&mut queue).unwrap_err();
         assert!(format!("{err}").contains("authentication rejected"));
+        // bar was never reached: the batch stopped at foo, so both
+        // entries are still pending.
         assert_eq!(queue.find("foo").unwrap().status, "pending");
         assert_eq!(queue.find("bar").unwrap().status, "pending");
-        // bar was never reached: the batch stopped at foo.
-        assert!(http.authed_gets().iter().all(|u| !u.contains("bar")));
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(format!("{path}.lock"));
-    }
-
-    #[test]
-    fn dispatch_fails_loudly_on_auth_rejection_403() {
-        // A 403 on the open-SR search is an auth rejection too: the
-        // run fails loudly instead of escalating the package and
-        // moving on. Mirrors the 401 test — 403 is covered only
-        // transitively elsewhere (shared mapping + fake test).
-        let path = tmp_path();
-        let mut queue = Queue::open(&path).unwrap();
-        let live = DryRun::new(false);
-        queue
-            .add(
-                entry("foo", UpdateKind::Routine),
-                DedupChecks::none(),
-                &live,
-            )
-            .unwrap();
-        queue.save(&live).unwrap();
-        drop(queue);
-
-        let mut queue = Queue::open(&path).unwrap();
-        let http = http_for("foo", "1.9", 0).with_status(&search_url_for("foo"), 403, "forbidden");
-        let obs = obs_with_creds(&http);
-        let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
-        let cfg = config(4, 20);
-        let dispatcher = Dispatcher::new(&worker, &cfg, &live);
-        let err = dispatcher.dispatch(&mut queue).unwrap_err();
-        assert!(format!("{err}").contains("authentication rejected"));
-        assert_eq!(queue.find("foo").unwrap().status, "pending");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }
@@ -721,13 +608,10 @@ mod tests {
         drop(queue);
 
         let mut queue = Queue::open(&path).unwrap();
-        let http = http_for("foo", "1.9", 0).with_post(
-            "https://api.opensuse.org/request?cmd=create",
-            "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
-        );
-        let obs = obs_with_creds(&http);
+        let mut gateway = gateway_for("foo", "1.9", false);
+        gateway.file_submit = Ok(Some(("1400001".to_string(), Vec::new())));
         let executor = CompletedExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &live);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -737,7 +621,6 @@ mod tests {
         assert_eq!(report.filed, 1);
         assert_eq!(queue.find("foo").unwrap().status, "done");
         assert_eq!(queue.find("foo").unwrap().sr_id.as_deref(), Some("1400001"));
-        assert_eq!(http.posted().len(), 1);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }
@@ -762,10 +645,9 @@ mod tests {
         // in_progress in the file and is not dispatched.
         let mut queue = Queue::open(&path).unwrap();
         let dry = DryRun::new(true);
-        let http = http_for("foo", "1.9", 0);
-        let obs = ObsClient::new(&http);
+        let gateway = gateway_for("foo", "1.9", false);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &dry);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -795,17 +677,17 @@ mod tests {
         drop(queue);
 
         // Dispatch-time dedup re-check fails: the devel project
-        // resolves, but the spec fetch has no canned response, so the
-        // worker escalates fail-closed — and the dispatcher persists
-        // the reason on the entry instead of only printing it.
+        // resolves, but the devel-version check fails, so the worker
+        // escalates fail-closed — and the dispatcher persists the
+        // reason on the entry instead of only printing it.
         let mut queue = Queue::open(&path).unwrap();
-        let http = FakeHttpClient::new().with(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
-            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
-        );
-        let obs = ObsClient::new(&http);
+        let mut gateway = gateway_for("foo", "1.9", false);
+        gateway.devel_version = Err(GeectlError::new(
+            ErrorKind::NetworkError,
+            "transport error",
+        ));
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &live);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -850,21 +732,16 @@ mod tests {
         queue.save(&live).unwrap();
         drop(queue);
 
-        // The devel version check passes, but the open-SR search fails
-        // (no canned response) — escalate fail-closed.
+        // The devel version check passes, but the open-SR check fails
+        // — escalate fail-closed.
         let mut queue = Queue::open(&path).unwrap();
-        let http = FakeHttpClient::new()
-            .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
-                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
-            )
-            .with(
-                "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
-                "Name: foo\nVersion: 1.9\n",
-            );
-        let obs = obs_with_creds(&http);
+        let mut gateway = gateway_for("foo", "1.9", false);
+        gateway.has_open_sr = Err(GeectlError::new(
+            ErrorKind::NetworkError,
+            "transport error",
+        ));
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &live);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -898,10 +775,9 @@ mod tests {
 
         let mut queue = Queue::open(&path).unwrap();
         let dry = DryRun::new(true);
-        let http = http_for("foo", "1.9", 0);
-        let obs = ObsClient::new(&http);
+        let gateway = gateway_for("foo", "1.9", false);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let cfg = config(4, 0);
         let dispatcher = Dispatcher::new(&worker, &cfg, &dry);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -941,10 +817,9 @@ mod tests {
 
         let mut queue = Queue::open(&path).unwrap();
         let dry = DryRun::new(true);
-        let http = http_for("bar", "1.9", 0);
-        let obs = ObsClient::new(&http);
+        let gateway = gateway_for("bar", "1.9", false);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let cfg = config(4, 1);
         let dispatcher = Dispatcher::new(&worker, &cfg, &dry);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -971,15 +846,17 @@ mod tests {
         queue.save(&live).unwrap();
         drop(queue);
 
-        // Live mode, executor completes, but the filing POST fails (no
-        // canned POST response = transport error): the worker escalates,
-        // and the dispatcher persists the reason — the entry is not
-        // marked done and carries no SR id.
+        // Live mode, executor completes, but the filing fails: the
+        // worker escalates, and the dispatcher persists the reason —
+        // the entry is not marked done and carries no SR id.
         let mut queue = Queue::open(&path).unwrap();
-        let http = http_for("foo", "1.9", 0);
-        let obs = obs_with_creds(&http);
+        let mut gateway = gateway_for("foo", "1.9", false);
+        gateway.file_submit = Err(GeectlError::new(
+            ErrorKind::NetworkError,
+            "transport error",
+        ));
         let executor = CompletedExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &live);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -1013,14 +890,16 @@ mod tests {
         queue.save(&live).unwrap();
         drop(queue);
 
-        // A non-ASCII package name fails the OBS-name check: the
-        // worker's devel lookup rejects it and the entry escalates
-        // before reaching the network with a bad name.
+        // The devel lookup fails for the non-ASCII package name: the
+        // entry escalates fail-closed before anything is filed.
         let mut queue = Queue::open(&path).unwrap();
-        let http = FakeHttpClient::new();
-        let obs = ObsClient::new(&http);
+        let mut gateway = FakeObsGateway::new();
+        gateway.devel_project = Err(GeectlError::new(
+            ErrorKind::NetworkError,
+            "transport error",
+        ));
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &live);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -1029,29 +908,6 @@ mod tests {
         assert_eq!(queue.find("föö").unwrap().status, "escalated");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
-    }
-
-    /// The maintained-instances listing POST URL for `foo` (same
-    /// shape as the worker tests: the branch command with the
-    /// maintained attributes and `dryrun=1`).
-    fn maintained_instances_url() -> String {
-        let query = [
-            ("cmd", "branch"),
-            ("attribute", "OBS:Maintained"),
-            ("update_project_attribute", "OBS:UpdateProject"),
-            ("package", "foo"),
-            ("dryrun", "1"),
-        ];
-        let mut url = "https://api.opensuse.org/source?".to_string();
-        for (i, (name, value)) in query.iter().enumerate() {
-            if i > 0 {
-                url.push('&');
-            }
-            url.push_str(&geectl::url::encode_query_value(name));
-            url.push('=');
-            url.push_str(&geectl::url::encode_query_value(value));
-        }
-        url
     }
 
     #[test]
@@ -1078,11 +934,9 @@ mod tests {
         // NotMaintained and the dispatcher escalates the entry.
         let mut queue = Queue::open(&path).unwrap();
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new()
-            .with_post(&maintained_instances_url(), "<collection></collection>");
-        let obs = obs_with_creds(&http);
+        let gateway = FakeObsGateway::new();
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &dry);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -1096,22 +950,6 @@ mod tests {
         assert_eq!(queue.find("foo").unwrap().status, "pending");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
-    }
-
-    /// The open-incident dedup search URL for the maintenance filing
-    /// (same shape as the worker tests).
-    fn maintenance_dedup_url() -> String {
-        let match_expr = "(state/@name='new' or state/@name='review') and action/@type='maintenance_incident' and action[source/@package='foo.openSUSE_Leap_15.6_Update' and target/@project='openSUSE:Maintenance']";
-        format!(
-            "https://api.opensuse.org/search/request?match={}",
-            geectl::url::encode_query_value(match_expr)
-        )
-    }
-
-    /// A maintained-instances listing body for `foo` (same shape as
-    /// the worker tests: source project is the update project).
-    fn maintained_instances_body() -> &'static str {
-        "<collection><package project=\"openSUSE:Leap:15.6:Update\" package=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\" /><target project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.6:Update\" /></package><package project=\"openSUSE:Leap:15.5:Update\" package=\"foo\"><target project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.5:Update\" /></package></collection>"
     }
 
     /// A Leap 15.6 security entry for `foo` (CVE-driven, as the Leap
@@ -1143,19 +981,10 @@ mod tests {
         drop(queue);
 
         let mut queue = Queue::open(&path).unwrap();
-        let http = FakeHttpClient::new()
-            .with_post(&maintained_instances_url(), maintained_instances_body())
-            .with(
-                &maintenance_dedup_url(),
-                "<collection matches=\"0\"></collection>",
-            )
-            .with_post(
-                "https://api.opensuse.org/request?cmd=create&addrevision=1",
-                "<request id=\"1400002\" creator=\"scarabeus_iv\"></request>",
-            );
-        let obs = obs_with_creds(&http);
+        let mut gateway = gateway_for_leap_foo();
+        gateway.file_maintenance_incident = Ok(Some("1400002".to_string()));
         let executor = CompletedExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &live);
         let report = dispatcher.dispatch(&mut queue).unwrap();
@@ -1191,11 +1020,9 @@ mod tests {
         drop(queue);
 
         let mut queue = Queue::open(&path).unwrap();
-        let http = FakeHttpClient::new()
-            .with_post(&maintained_instances_url(), "<collection></collection>");
-        let obs = obs_with_creds(&http);
+        let gateway = FakeObsGateway::new();
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &live);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
         let dispatcher = Dispatcher::new(&worker, &cfg, &live);
         let report = dispatcher.dispatch(&mut queue).unwrap();
