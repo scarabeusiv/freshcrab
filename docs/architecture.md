@@ -49,8 +49,8 @@ library — freshcrab implements no forge logic of its own.
   you start its container, set its budget and data, and it processes
   things until they go quiet.
 - The planner is the entry point: one freshcrab run is one planner
-  run. Each queue runs under the planner's run; each queue keeps its
-  own state file.
+  run. Each queue runs under the planner's run; the queues share the
+  one queue store.
 
 ### Updater queue
 
@@ -59,7 +59,7 @@ library — freshcrab implements no forge logic of its own.
   devel project, bumps the version, cleans the spec, builds it in
   OBS, validates it, and files the update. Detail: the updater
   pipeline sections below.
-- State: `queue.json`, one entry per package behind (pending /
+- State: one entry per package behind in the queue store (pending /
   in_progress / done / blocked / escalated). Security-first
   ordering: CVE-driven entries before routine ones.
 - Factory is implemented. Leap and CVE validation are scaffolded
@@ -74,8 +74,8 @@ library — freshcrab implements no forge logic of its own.
   A ruleset auto-comments or rejects the clear cases,
   mid-confidence items sit in a maintained queue, and the rest go to
   a human for review or decision. Detail: `docs/review-queue.md`.
-- State: a separate state file (`review_queue.json`), one record per
-  ref, with the same shape and conventions as `queue.json`.
+- State: one record per ref in the queue store, with the same shape
+  and conventions as the updater entries.
 
 ### Submitter queue
 
@@ -83,14 +83,15 @@ library — freshcrab implements no forge logic of its own.
   and maintenance-request filing for Leap
   ([#15](https://github.com/scarabeusiv/freshcrab/issues/15),
   [#7](https://github.com/scarabeusiv/freshcrab/issues/7)).
-- Current state: filing is the worker's last step (the worker builds
-  the SR payload and files it via geectl).
-  [#15](https://github.com/scarabeusiv/freshcrab/issues/15) reworks Leap
+- Filing is the submitter queue's job: the worker builds the SR
+  payload and hands filing to the submitter queue, which works in
+  the one queue. Filing items are inserted with priority, not
+  appended at the tail: the work (branch, bump, build, validate) is
+  already done when filing is queued, so a tail-appended filing
+  would sit while the completed work waits. The exact insertion
+  position is open. See Open questions.
+- [#15](https://github.com/scarabeusiv/freshcrab/issues/15) reworks Leap
   maintenance-request filing to go through geectl only.
-- The boundary between the updater's worker and the submitter queue
-  is not drawn: whether filing moves to the submitter queue with its
-  own state, or stays the worker's last step, is open. See Open
-  questions.
 
 ### Cleanups
 
@@ -122,14 +123,22 @@ library — freshcrab implements no forge logic of its own.
   the dispatcher concurrency limit, the daily SR cap
   (`daily_sr_cap`, config), Repology pacing (1 request/second),
   the queue lock (one writer at a time). The observer's own budget
-  unit, values, and exhaustion behaviour are open. See Open
-  questions.
-- Coherent queue: one queue across forges. An item is identified by
-  its handle, not by who filed it; one record per ref
+  unit and values are open. See Open questions.
+- Exhaustion: when the token budget is out, the daemon finishes: it
+  stops processing. Whether it then exits or idles waiting for the
+  next budget period is open. See Open questions.
+- Coherent queue: one queue across forges, in one store for the whole
+  queue — not the union of the per-queue state files. An item is
+  identified by its handle, not by who filed it; one record per ref
   (`obs:<id>` / `gitea:<owner>/<repo>#<number>`); re-discovery
   updates the record in place, never duplicates it. Discovery runs
   across ALL configured instances — every OBS and every Gitea
-  instance in the config, not just the default.
+  instance in the config, not just the default. Priorities are
+  adjustable at runtime: a human can tell the daemon to prioritise
+  CVEs, or cleanups, as they see fit. The daemon runs until the token
+  budget is exhausted, so the order items are processed in — what
+  goes first within the budget — is a human decision. How a human
+  tells the daemon is open. See Open questions.
 - Forge assignment: an item executes on the forge that owns it (its
   handle's forge). Capability differences are per forge: OBS decline
   is human-only; Gitea labels are Gitea-only library operations,
@@ -147,7 +156,7 @@ library — freshcrab implements no forge logic of its own.
 |---|---|---|
 | Version watching (watcher, collectors, confirmation) | Updater | Implemented (Factory); Leap/CVE scaffolded |
 | queue.json, dispatcher, worker (branch, bump, clean, build, validate) | Updater | Implemented (Factory); live executor is the agent/CI step |
-| SR filing to devel (worker) | Submitter | Implemented; boundary with the submitter queue open |
+| SR filing to devel | Submitter | Filing moves to the submitter queue; insertion position open |
 | [#15](https://github.com/scarabeusiv/freshcrab/issues/15) Leap maintenance-request filing | Submitter | In flight, geectl-only |
 | [#21](https://github.com/scarabeusiv/freshcrab/issues/21) review queue | Reviewer | Step 1 (state file + discovery); step 2 (signal readers) in flight |
 | [#22](https://github.com/scarabeusiv/freshcrab/issues/22) hygiene sweeps | Cleanup (planner-run) | In flight, report-only |
@@ -156,9 +165,6 @@ library — freshcrab implements no forge logic of its own.
 
 ### Misfits
 
-- Submitter boundary: the worker files inline today. Whether
-  filing moves to the submitter queue with its own state, or stays
-  the worker's last step, is not drawn.
 - [#24](https://github.com/scarabeusiv/freshcrab/issues/24) crates.io
   publish is release tooling, not a queue item. It is
   not owned by any queue; whether the planner owns it is not drawn.
@@ -478,79 +484,73 @@ by the design above.
 7. Clients in scope: which clients does the observer budget — the
    forges only (OBS, Gitea, GitHub, GitLab), or also the collectors
    (Repology, Anitya, PyPI, Distrowatch)? Decision: observer scope.
-8. Exhaustion: when the budget is exhausted mid-queue — pause and
-   resume on the next run, defer the remaining items, fail the run,
-   or drop low-priority items? Does the observer pre-empt an
-   in-flight item, or only gate new ones? Decision: exhaustion
-   behaviour.
+8. Post-exhaustion state: after the daemon finishes on budget
+   exhaustion, does it exit or idle waiting for the next budget
+   period? Decision: post-exhaustion state.
 9. Observer failure: if the observer dies or cannot read budget
    state, do the queues run unbounded (fail-open) or stop
    (fail-closed)? Decision: observer failure mode.
 
 ### Coherent queue
 
-10. Store: is the coherent queue a single store, or the union of the
-    per-queue state files (`queue.json`, `review_queue.json`,
-    submitter state)? Decision: queue store shape.
+10. Reprioritisation mechanism: how does a human tell the daemon to
+    prioritise CVEs or cleanups — a command, an API, a config file?
+    Decision: reprioritisation mechanism.
 11. Cross-forge dedup: the same logical change can exist on two
     forges (an OBS SR and a Gitea PR for one change). Does
     coherence dedup them into one item? How is "same change"
     determined — same srcmd5, same branch? Decision: cross-forge
     dedup rule.
-12. Global ordering: does the coherent queue impose a cross-queue
-    order (security first across all forges), or is ordering
-    per-queue only? Decision: global ordering.
-13. Item locking: when the observer assigns an item, is it locked to
+12. Item locking: when the observer assigns an item, is it locked to
     one executor until done? What prevents two queues, or two runs,
     from acting on the same item? Decision: assignment locking.
 
 ### Forge assignment
 
-14. Assignment rule: does the observer route an item to a forge, or
+13. Assignment rule: does the observer route an item to a forge, or
     does the item's own forge (its handle) decide? Does assignment
     account for per-forge capabilities (OBS decline is human-only,
     Gitea labels are Gitea-only)? Decision: assignment rule.
-15. Forge down or unconfigured: does the item stay queued, get
+14. Forge down or unconfigured: does the item stay queued, get
     reassigned, or escalate to a human? Decision: forge-failure
     behaviour.
-16. Adding a forge mid-run: is a newly configured forge picked up on
+15. Adding a forge mid-run: is a newly configured forge picked up on
     the next run, or does the planner need a restart? Are existing
     items re-evaluated against the new forge? Decision: forge
     onboarding.
 
 ### Queue interaction
 
-17. Updater to reviewer: does an updater-filed SR enter the reviewer
+16. Updater to reviewer: does an updater-filed SR enter the reviewer
     queue by direct handoff, or only via re-discovery (sr_id
     match)? Decision: handoff mechanism.
-18. Reviewer to submitter: does a reviewer-accepted item (trivial-fix
+17. Reviewer to submitter: does a reviewer-accepted item (trivial-fix
     accept) feed the submitter queue for the follow-up, or does the
     reviewer act directly? Decision: reviewer-to-submitter handoff.
-19. Updater to submitter: does the updater hand filing to the
-    submitter queue, or keep filing inline in the worker? Decision:
-    filing ownership (the submitter boundary).
+18. Filing insertion position: filing items are inserted with
+    priority, not tail-appended — where exactly: at the head, or at
+    a high-priority position? Decision: filing insertion position.
 
 ### State, guards, config
 
-20. Submitter and planner state: does the submitter queue get its own
-    state file, and does the planner keep spawn and cleanup state?
-    Decision: state files.
-21. Kill switch scope: does the kill switch pause the planner (all
+19. Planner state: does the planner keep spawn and cleanup state?
+    Decision: planner state.
+20. Kill switch scope: does the kill switch pause the planner (all
     queues) or one queue? Decision: kill-switch scope.
-22. Dry-run scope: is dry-run global, or can one queue be live while
+21. Dry-run scope: is dry-run global, or can one queue be live while
     another is dry-run? Decision: dry-run granularity.
-23. Config placement: where do the planner schedule and the observer
+22. Config placement: where do the planner schedule and the observer
     budgets live — `config.yaml`, the ruleset, or a separate file?
     Decision: config placement.
 
 ### Cleanups
 
-24. Cleanup trigger: what triggers a cleanup — a planner schedule, a
+23. Cleanup trigger: what triggers a cleanup — a planner schedule, a
     threshold, manual? Is
     [#22](https://github.com/scarabeusiv/freshcrab/issues/22) hygiene
     invoked by the planner, or run
     manually? Decision: cleanup trigger.
-25. Cleanup safety: what guards an acting cleanup (dry-run, kill
+24. Cleanup safety: what guards an acting cleanup (dry-run, kill
     switch, human approval), and when does
     [#22](https://github.com/scarabeusiv/freshcrab/issues/22) move from
     report-only
@@ -558,19 +558,19 @@ by the design above.
 
 ### Failure modes
 
-26. Queue death: if one queue dies, does the planner restart it, mark
+25. Queue death: if one queue dies, does the planner restart it, mark
     it, or continue with the others? Does a dead queue block the
     run? Decision: queue-failure handling.
-27. Partial act: an item is half-acted (comment posted, state not
+26. Partial act: an item is half-acted (comment posted, state not
     saved) — what resumes it? Decision: partial-act recovery.
 
 ### Scope
 
-28. Planner boundary ("whatever"): is release tooling (
+27. Planner boundary ("whatever"): is release tooling (
     [#24](https://github.com/scarabeusiv/freshcrab/issues/24) crates.io
     publish) planner-owned, or outside the architecture? Decision:
     planner boundary.
-29. GitHub and GitLab (
+28. GitHub and GitLab (
     [#26](https://github.com/scarabeusiv/freshcrab/issues/26)): are
     they forges under the observer (with
     tokens and budgets), or out of scope? Decision: forge scope.

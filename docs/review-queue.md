@@ -284,12 +284,10 @@ reviewers decline.
 
 ## Queue state
 
-- Storage: a separate state file (`review_queue.json`), with the same
-  shape and conventions as `queue.json` — one record per ref, JSON,
-  statuses, `created_at` / `updated_at`, forward-compatible loading
-  (unknown fields default). A separate file, not an extension of
-  `queue.json`: review records are keyed by ref, not by package, and
-  follow a different lifecycle from update entries.
+- Storage: the one queue store — one record per ref, JSON, statuses,
+  `created_at` / `updated_at`, forward-compatible loading
+  (unknown fields default). Review records are keyed by ref, not by
+  package, and follow a different lifecycle from update entries.
 - Record: ref, status (open, triaged, actioned, escalated, terminal),
   tier, signal snapshot, ruleset version, binding (source srcmd5 at a
   pinned rev, target srcmd5, or PR head and base — see Binding),
