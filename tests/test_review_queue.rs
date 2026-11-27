@@ -105,6 +105,17 @@ impl freshcrab::review_queue::PullRequestSource for FakeSource {
             format!("fake source has no build answer for {project}/{package}"),
         ))
     }
+
+    fn maintainers(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<Vec<geectl::obs::NamedRole>, GeectlError> {
+        Err(GeectlError::new(
+            ErrorKind::NotFound,
+            format!("fake source has no maintainers answer for {project}/{package}"),
+        ))
+    }
 }
 
 fn summary(reference: PullRequestRef, target_repository: &str) -> PullRequestSummary {
