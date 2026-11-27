@@ -189,7 +189,14 @@ runs both sweeps per project and prints the report as JSON.
   the sweep loudly instead of reporting a partial list.
 - **Long-broken packages.** A package is long-broken when it fails
   in every repository that counts for it (Tumbleweed counts only for
-  packages in Factory), has no successful build in the last 90 days
+  packages in Factory — a Tumbleweed repository is one whose primary
+  build path targets the Tumbleweed family: `openSUSE:Factory`,
+  `openSUSE:Tumbleweed`, or any `openSUSE:Factory:*` subproject; the
+  check follows the first path transitively through the swept
+  project's own tree only, so a repo building against a subproject
+  repo ultimately builds against that repo's target, while a repo
+  whose first path points at a different project is a direct build
+  target), has no successful build in the last 90 days
   (via the job history on a failing architecture), and was never
   integrated (no accepted submit request from the project or a branch
   of it). A package building in any counting repository is skipped,

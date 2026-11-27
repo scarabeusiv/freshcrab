@@ -99,20 +99,20 @@ pub fn classify_repo(statuses: &[PackageBuildStatus]) -> RepoBuild {
 }
 
 /// True when `project` is a Tumbleweed-family build target: the
-/// Factory project itself, the Tumbleweed distribution project, or a
-/// Factory port (zSystems, PowerPC, ARM, RISCV). `openSUSE:Slowroll`
-/// is a distinct distribution, not a Tumbleweed build target, so it
-/// does not count here.
+/// Factory project itself, the Tumbleweed distribution project, or
+/// any Factory subproject (`openSUSE:Factory:*` — the ports
+/// zSystems, PowerPC, ARM, RISCV, LegacyX86, LegacyARM, their
+/// `:NonFree` variants, and any future port). The prefix is
+/// deliberate: an allowlist silently misses a port that appears
+/// later. `openSUSE:Factory:Live` and `openSUSE:Factory:Staging`
+/// also match, but they are not plausible build targets for a swept
+/// repo, and matching them is the fail-closed direction anyway.
+/// `openSUSE:Slowroll` is a distinct distribution, not a Tumbleweed
+/// build target, so it does not count here.
 pub fn is_tumbleweed_path_project(project: &str) -> bool {
-    matches!(
-        project,
-        "openSUSE:Factory"
-            | "openSUSE:Tumbleweed"
-            | "openSUSE:Factory:zSystems"
-            | "openSUSE:Factory:PowerPC"
-            | "openSUSE:Factory:ARM"
-            | "openSUSE:Factory:RISCV"
-    )
+    project == "openSUSE:Factory"
+        || project == "openSUSE:Tumbleweed"
+        || project.starts_with("openSUSE:Factory:")
 }
 
 /// True when the repository targets Tumbleweed: its primary build
@@ -150,6 +150,10 @@ fn repo_is_tumbleweed_resolved(
     let mut current_paths = repo.paths.clone();
     let mut visited: HashSet<(String, String)> = HashSet::new();
     loop {
+        // A repo with no paths ends the walk as non-Tumbleweed,
+        // consistent with the direct check; a pathless repo yields
+        // neutral (not failed) build results in practice, so it
+        // never contributes a failure to the sweep.
         let Some((path_project, path_repo)) = current_paths.first().cloned() else {
             return Ok(false);
         };
@@ -472,8 +476,11 @@ pub fn sweep_long_broken(
     // follows the first path transitively through the project's own
     // tree (a repo building against a subproject repo ultimately
     // builds against that repo's target), and may fetch subproject
-    // metas, cached.
+    // metas, cached. The cache is seeded with the swept project's
+    // own meta, so a repo pathing to the project itself does not
+    // re-fetch it over the API.
     let mut meta_cache: HashMap<String, Option<ProjectMeta>> = HashMap::new();
+    meta_cache.insert(project.to_string(), Some(meta.clone()));
     let mut is_tumbleweed: HashMap<String, bool> = HashMap::new();
     for repo in &meta.repositories {
         let tw = repo_is_tumbleweed_resolved(obs, project, repo, &mut meta_cache)?;
@@ -764,7 +771,9 @@ mod tests {
     #[test]
     fn tumbleweed_is_the_factory_family_on_the_first_path() {
         // The Factory project itself, the Tumbleweed distribution
-        // project, and the Factory ports all count.
+        // project, and every Factory subproject count — the ports,
+        // the Legacy ports, the NonFree tree, and any future port
+        // the prefix covers.
         for project in [
             "openSUSE:Factory",
             "openSUSE:Tumbleweed",
@@ -772,6 +781,11 @@ mod tests {
             "openSUSE:Factory:PowerPC",
             "openSUSE:Factory:ARM",
             "openSUSE:Factory:RISCV",
+            "openSUSE:Factory:LegacyX86",
+            "openSUSE:Factory:LegacyARM",
+            "openSUSE:Factory:NonFree",
+            "openSUSE:Factory:RISCV:NonFree",
+            "openSUSE:Factory:LegacyX86:NonFree",
         ] {
             assert!(
                 repo_is_tumbleweed(&repo_named(

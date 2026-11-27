@@ -182,13 +182,17 @@ fn project_meta() -> String {
 
 /// The backports subproject meta the transitive Tumbleweed check
 /// resolves through: its py315 repo paths to openSUSE:Tumbleweed,
-/// its 15.7 repo to openSUSE:Leap:15.7.
+/// its 15.7 repo to SUSE:SLE-15-SP7:Update.
 fn backports_meta() -> String {
     meta_xml(
         "devel:languages:python:backports",
         &[
             ("py315", &["x86_64"], &[("openSUSE:Tumbleweed", "standard")]),
-            ("15.7", &["x86_64"], &[("openSUSE:Leap:15.7", "standard")]),
+            (
+                "15.7",
+                &["x86_64"],
+                &[("SUSE:SLE-15-SP7:Update", "standard")],
+            ),
         ],
     )
 }
