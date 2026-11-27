@@ -83,6 +83,12 @@ library — freshcrab implements no forge logic of its own.
   self-approved is a last-instance effort — unless a human
   overrides it directly with geectl. The cooldown duration is
   open. See Open questions.
+- A hotfix queue carries concentrated nits that were quick-fixed:
+  quick commit and forward, processed and reviewed as priority. It
+  bypasses the cooldown on self-owned submissions — the priority
+  exception to the re-discovery/cooldown rule. The queue's exact
+  shape, its priority ordering, and what counts as a concentrated
+  nit are open. See Open questions.
 
 ### Submitter queue
 
@@ -535,15 +541,15 @@ by the design above.
 
 ### Queue interaction
 
-14. Reviewer to submitter: does a reviewer-accepted item (trivial-fix
-    accept) feed the submitter queue for the follow-up, or does the
-    reviewer act directly? Decision: reviewer-to-submitter handoff.
-15. Cooldown duration: how long is the cooldown on a self-owned
+14. Cooldown duration: how long is the cooldown on a self-owned
     submission before the reviewer acts on it? Decision: cooldown
     duration.
-16. Filing insertion position: filing items are inserted with
+15. Filing insertion position: filing items are inserted with
     priority, not tail-appended — where exactly: at the head, or at
     a high-priority position? Decision: filing insertion position.
+16. Hotfix queue shape: what is the hotfix queue's exact shape,
+    its priority ordering, and what counts as a concentrated nit?
+    Decision: hotfix queue shape.
 
 ### State, guards, config
 
