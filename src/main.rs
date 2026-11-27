@@ -338,9 +338,9 @@ fn main() -> ExitCode {
     let sr_ids = own_sr_ids(queue.entries());
     match discover(&config, &sr_ids, &geectl_http, &review_queue_path, &dry_run) {
         Ok(report) => {
+            let scanned = report.instances.iter().filter(|i| !i.skipped).count();
             eprintln!(
-                "review queue: {} instance arm(s) scanned, {} discovered, {} new, {} updated, {} terminal, {} unresolved",
-                report.instances.len(),
+                "review queue: {scanned} instance arm(s) scanned, {} discovered, {} new, {} updated, {} terminal, {} unresolved",
                 report.discovered,
                 report.new_records,
                 report.updated_records,
@@ -352,10 +352,17 @@ fn main() -> ExitCode {
             }
             for instance in &report.instances {
                 if let Some(error) = &instance.error {
-                    eprintln!(
-                        "review queue: {} {} search failed: {error}",
-                        instance.alias, instance.backend
-                    );
+                    if instance.skipped {
+                        eprintln!(
+                            "review queue: {} {} skipped: {error}",
+                            instance.alias, instance.backend
+                        );
+                    } else {
+                        eprintln!(
+                            "review queue: {} {} search failed: {error}",
+                            instance.alias, instance.backend
+                        );
+                    }
                 }
             }
         }

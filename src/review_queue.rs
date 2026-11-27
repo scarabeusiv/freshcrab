@@ -596,8 +596,13 @@ pub fn enumerate_instances_with(
             Ok(creds) => Some(creds),
             Err(e) => {
                 let message = e.to_string();
-                reasons.push(format!("OBS credentials unusable: {message}"));
+                // A never-forwarded refusal is expected safety
+                // behaviour, not a reason the instance is
+                // unscannable: it stays out of the reasons so the
+                // fallback "no credentials configured" message is
+                // used instead.
                 if is_credential_misconfiguration(&message) {
+                    reasons.push(format!("OBS credentials unusable: {message}"));
                     obs_error = Some(message);
                 }
                 None
@@ -609,8 +614,8 @@ pub fn enumerate_instances_with(
             Ok(creds) => Some(creds),
             Err(e) => {
                 let message = e.to_string();
-                reasons.push(format!("Gitea token unusable: {message}"));
                 if is_credential_misconfiguration(&message) {
+                    reasons.push(format!("Gitea token unusable: {message}"));
                     gitea_error = Some(message);
                 }
                 None
@@ -673,6 +678,10 @@ pub struct InstanceReport {
     pub unresolved: usize,
     /// The search itself failed: no records from this arm.
     pub error: Option<String>,
+    /// The arm was skipped before any search ran (a misconfigured
+    /// credential set): the error names the skipped arm, not a
+    /// search failure.
+    pub skipped: bool,
 }
 
 /// The outcome of a discovery run across all instances.
@@ -876,10 +885,11 @@ pub fn discover_on(
     // server (merged, declined, superseded, deleted) is marked
     // terminal from the server state, never deleted locally. A
     // failed re-check leaves the record as it is — a failed read
-    // never marks anything terminal. An out-of-scope ref that is
-    // still open is left untouched (its title and binding are not
-    // refreshed); only its terminal state is tracked.
-    let recheck: Vec<(String, String, bool)> = queue
+    // never marks anything terminal. An out-of-scope ref is only
+    // ever terminal-marked, never refreshed: its title and binding
+    // are not rewritten, whether the search returned it or omitted
+    // it.
+    let recheck: Vec<(String, String)> = queue
         .entries()
         .iter()
         .filter(|r| {
@@ -888,15 +898,9 @@ pub fn discover_on(
                 && r.status != "terminal"
                 && (!seen.contains(&r.reference) || out_of_scope_seen.contains(&r.reference))
         })
-        .map(|r| {
-            (
-                r.reference.clone(),
-                r.title.clone(),
-                out_of_scope_seen.contains(&r.reference),
-            )
-        })
+        .map(|r| (r.reference.clone(), r.title.clone()))
         .collect();
-    for (reference, _title, out_of_scope) in recheck {
+    for (reference, _title) in recheck {
         let parsed: PullRequestRef = match reference.parse() {
             Ok(parsed) => parsed,
             Err(e) => {
@@ -909,15 +913,20 @@ pub fn discover_on(
         match source.show(&parsed) {
             Ok(pr) => {
                 if pr.status == PullRequestStatus::Open {
-                    if out_of_scope {
-                        // Still open but out of scope: leave the
-                        // record untouched — only its terminal state
-                        // is tracked, never its title or binding.
+                    // Still open. Refresh it in place only when it
+                    // is in scope — an out-of-scope ref (whether
+                    // the search returned it or omitted it) is left
+                    // untouched; only its terminal state is tracked.
+                    if !in_scope(
+                        &pr.target.repository,
+                        &pr.target.branch,
+                        backend,
+                        &pr.reference,
+                        config,
+                        own_sr_ids,
+                    ) {
                         continue;
                     }
-                    // Still open but the search did not return it
-                    // (a race, or the search limit): refresh it in
-                    // place instead of marking it terminal.
                     let record = ReviewRecord::new(
                         &pr.reference.to_string(),
                         instance_alias,
@@ -935,22 +944,12 @@ pub fn discover_on(
                         report.updated_records += 1;
                     }
                 } else {
-                    let mut record = ReviewRecord::new(
-                        &pr.reference.to_string(),
-                        instance_alias,
-                        backend.as_str(),
-                        &pr.title,
-                        &pr.author,
-                        Some(ReviewBinding {
-                            source_repository: pr.source.repository.clone(),
-                            source_commit: pr.source.commit.clone(),
-                            target_repository: pr.target.repository.clone(),
-                            target_commit: pr.target.commit.clone(),
-                        }),
-                    );
-                    record.status = "terminal".to_string();
-                    queue.upsert(record);
-                    report.terminal_marked += 1;
+                    // Merged, declined, or otherwise no longer open:
+                    // mark terminal, keeping the stored title and
+                    // binding (the same as the NotFound arm below).
+                    if queue.mark_terminal(instance_alias, &reference) {
+                        report.terminal_marked += 1;
+                    }
                 }
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -1018,6 +1017,7 @@ pub fn discover(
                         url: instance.url.clone(),
                         backend: backend.as_str().to_string(),
                         error: Some(error),
+                        skipped: true,
                         ..InstanceReport::default()
                     });
                 }
@@ -1441,9 +1441,11 @@ mod tests {
     fn enumerate_defaults_only_when_no_aliases() {
         let file_config = geectl_config::Config::default();
         // The fakes model the real resolvers: credentials resolve
-        // only for their own default URL, never for the other
-        // backend's URL (the real resolvers never forward plain
-        // credentials to a non-default, non-alias URL).
+        // only for their own default URL, and the OBS resolver
+        // errors with the never-forwarded refusal on the other
+        // backend's URL when plain credentials exist (the real
+        // resolvers never forward plain credentials to a
+        // non-default, non-alias URL).
         let scan = enumerate_instances_with(
             &file_config,
             "https://api.opensuse.org",
@@ -1455,7 +1457,10 @@ mod tests {
                         password: "p".to_string(),
                     })
                 } else {
-                    Ok(Credentials::None)
+                    Err(err(
+                        ErrorKind::ConfigError,
+                        "no credentials configured for https://src.opensuse.org; the credentials configured for the default instance are never forwarded to another instance",
+                    ))
                 }
             },
             &|url| {
@@ -1464,7 +1469,10 @@ mod tests {
                         token: "t".to_string(),
                     })
                 } else {
-                    Ok(Credentials::None)
+                    Err(err(
+                        ErrorKind::ConfigError,
+                        "no credentials configured for https://api.opensuse.org; the credentials configured for the default instance are never forwarded to another instance",
+                    ))
                 }
             },
         );
@@ -1630,10 +1638,11 @@ mod tests {
     #[test]
     fn enumerate_does_not_surface_the_never_forwarded_refusal() {
         let file_config = geectl_config::Config::default();
-        // The Gitea resolver refuses the OBS default URL because
-        // the default instance's token is never forwarded there.
-        // That is expected safety behaviour, not a misconfiguration,
-        // so it carries no error on the instance.
+        // Each resolver refuses the other backend's default URL
+        // because the default instance's credentials are never
+        // forwarded there. That is expected safety behaviour, not a
+        // misconfiguration, so it carries no error on either
+        // instance — in both directions.
         let scan = enumerate_instances_with(
             &file_config,
             "https://api.opensuse.org",
@@ -1645,7 +1654,10 @@ mod tests {
                         password: "p".to_string(),
                     })
                 } else {
-                    Ok(Credentials::None)
+                    Err(err(
+                        ErrorKind::ConfigError,
+                        "no credentials configured for https://src.opensuse.org; the credentials configured for the default instance are never forwarded to another instance",
+                    ))
                 }
             },
             &|url| {
@@ -1669,6 +1681,48 @@ mod tests {
         assert!(obs.obs_credentials.is_some());
         assert!(obs.gitea_credentials.is_none());
         assert!(obs.gitea_error.is_none());
+        let gitea = scan
+            .instances
+            .iter()
+            .find(|i| i.url == "https://src.opensuse.org")
+            .unwrap();
+        assert!(gitea.gitea_credentials.is_some());
+        assert!(gitea.obs_credentials.is_none());
+        assert!(gitea.obs_error.is_none());
+    }
+
+    #[test]
+    fn enumerate_unscannable_reason_hides_the_never_forwarded_refusal() {
+        let file_config = geectl_config::Config::default();
+        // Single-backend setup: OBS credentials exist, no Gitea
+        // token at all. The Gitea default is unscannable, but its
+        // reason must not name the never-forwarded refusal — that
+        // is expected safety behaviour, not why it cannot be
+        // scanned. The fallback message names the real state.
+        let scan = enumerate_instances_with(
+            &file_config,
+            "https://api.opensuse.org",
+            "https://src.opensuse.org",
+            &|url| {
+                if url == "https://api.opensuse.org" {
+                    Ok(Credentials::Basic {
+                        username: "u".to_string(),
+                        password: "p".to_string(),
+                    })
+                } else {
+                    Err(err(
+                        ErrorKind::ConfigError,
+                        "no credentials configured for https://src.opensuse.org; the credentials configured for the default instance are never forwarded to another instance",
+                    ))
+                }
+            },
+            &|_| Ok(Credentials::None),
+        );
+        assert_eq!(scan.instances.len(), 1);
+        assert_eq!(scan.unscannable.len(), 1);
+        let (_, reason) = &scan.unscannable[0];
+        assert!(!reason.contains("never forwarded"));
+        assert!(reason.contains("no OBS credentials and no Gitea token configured"));
     }
 
     fn open_queue(path: &str) -> ReviewQueue {
@@ -2002,7 +2056,11 @@ mod tests {
             &dry(),
         );
         assert_eq!(report.terminal_marked, 1);
-        assert_eq!(queue.find("default", "obs:60").unwrap().status, "terminal");
+        let record = queue.find("default", "obs:60").unwrap();
+        assert_eq!(record.status, "terminal");
+        // Terminal-marking keeps the stored title and binding; only
+        // the status changes.
+        assert_eq!(record.title, "bump foo");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }
@@ -2049,6 +2107,49 @@ mod tests {
         assert_eq!(report.terminal_marked, 0);
         assert_eq!(report.updated_records, 0);
         let record = queue.find("default", "obs:61").unwrap();
+        assert_eq!(record.status, "open");
+        assert_eq!(record.title, "old title");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn discover_on_leaves_an_omitted_out_of_scope_ref_untouched() {
+        let path = tmp_path("recheck-omitted-out-of-scope");
+        let mut queue = open_queue(&path);
+        let config = test_config();
+        queue.upsert(ReviewRecord::new(
+            "obs:62",
+            "default",
+            "obs",
+            "old title",
+            "someone",
+            None,
+        ));
+        // The search omits the ref entirely and its show says still
+        // open but targeting an excluded package: the record is
+        // left untouched, not refreshed as if it were in scope.
+        let source = FakeSource::new(vec![]).with_show(
+            "obs:62",
+            Ok(fake_pr(
+                PullRequestRef::Obs(62),
+                PullRequestStatus::Open,
+                "devel:gcc/gcc",
+                None,
+            )),
+        );
+        let report = discover_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &config,
+            &[],
+            &mut queue,
+            &dry(),
+        );
+        assert_eq!(report.terminal_marked, 0);
+        assert_eq!(report.updated_records, 0);
+        let record = queue.find("default", "obs:62").unwrap();
         assert_eq!(record.status, "open");
         assert_eq!(record.title, "old title");
         let _ = fs::remove_file(&path);
