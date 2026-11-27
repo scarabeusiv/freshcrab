@@ -1092,10 +1092,7 @@ mod tests {
         // package; only auth rejection is run-level.
         let dry = DryRun::new(true);
         let mut gateway = gateway_for_foo("1.9", false);
-        gateway.has_open_sr = Err(GeectlError::new(
-            ErrorKind::NetworkError,
-            "transport error",
-        ));
+        gateway.has_open_sr = Err(GeectlError::new(ErrorKind::NetworkError, "transport error"));
         let executor = DryRunExecutor;
         let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
@@ -1233,10 +1230,7 @@ mod tests {
         // fail-closed instead of filing on an unchecked dedup.
         let dry = DryRun::new(true);
         let mut gateway = gateway_for_foo("1.9", false);
-        gateway.devel_version = Err(GeectlError::new(
-            ErrorKind::NetworkError,
-            "transport error",
-        ));
+        gateway.devel_version = Err(GeectlError::new(ErrorKind::NetworkError, "transport error"));
         let executor = DryRunExecutor;
         let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&entry("foo")) {
@@ -1253,10 +1247,7 @@ mod tests {
         // — escalate fail-closed.
         let dry = DryRun::new(true);
         let mut gateway = gateway_for_foo("1.9", false);
-        gateway.has_open_sr = Err(GeectlError::new(
-            ErrorKind::NetworkError,
-            "transport error",
-        ));
+        gateway.has_open_sr = Err(GeectlError::new(ErrorKind::NetworkError, "transport error"));
         let executor = DryRunExecutor;
         let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&entry("foo")) {
@@ -1639,8 +1630,7 @@ mod tests {
         // that instance branches from another maintainer's home.
         let dry = DryRun::new(true);
         let mut instance_15_6 = leap_15_6_instance();
-        instance_15_6.target_project =
-            "home:alice:branches:OBS_Maintained:foo".to_string();
+        instance_15_6.target_project = "home:alice:branches:OBS_Maintained:foo".to_string();
         let mut gateway = FakeObsGateway::new();
         gateway.maintained_instances = Ok(vec![instance_15_6, leap_15_5_instance()]);
         let executor = DryRunExecutor;
@@ -1735,10 +1725,8 @@ mod tests {
         // instead of filing without a branch project.
         let dry = DryRun::new(true);
         let mut gateway = FakeObsGateway::new();
-        gateway.maintained_instances = Err(GeectlError::new(
-            ErrorKind::NetworkError,
-            "transport error",
-        ));
+        gateway.maintained_instances =
+            Err(GeectlError::new(ErrorKind::NetworkError, "transport error"));
         let executor = DryRunExecutor;
         let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&leap_entry("foo")) {
