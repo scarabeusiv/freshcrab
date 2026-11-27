@@ -350,7 +350,7 @@ impl<'a> Worker<'a> {
             return self.run_maintenance(entry);
         }
         // 1. Resolve the devel project (public API read) against
-        // Factory, the target the one-argument lookup reads.
+        // Factory, the target the lookup reads.
         let devel_project = match self
             .obs
             .devel_project(geectl::obs::FACTORY_PROJECT, &entry.package)
@@ -583,7 +583,7 @@ impl<'a> Worker<'a> {
             },
             Execution::Completed => {
                 // A payload failure escalates before execution in
-                // live mode (see step 3), so this is unreachable
+                // live mode (see step 4), so this is unreachable
                 // there; fail closed rather than filing nothing.
                 let Some(payload) = payload else {
                     return WorkerOutcome::Escalated {

@@ -111,7 +111,7 @@ change, not in the gates:
   goes to the Leap maintenance process (maintenance incident /
   update project for that release), not to the devel project.
 - **Branch via `maintenance_branch`.** The branch step for a Leap
-  plan uses `ObsClient::maintenance_branch` into the branch project
+  plan must use `ObsClient::maintenance_branch` into the branch project
   the maintained-instances listing reports — never a plain branch,
   and never from a devel project, which a Leap plan does not have
   (see `UpdateExecutor`).
