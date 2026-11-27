@@ -23,7 +23,7 @@ use freshcrab::dry_run::resolve as resolve_dry_run;
 use freshcrab::factory::FactoryClient;
 use freshcrab::http::{map_obs_credentials_error, UreqClient};
 use freshcrab::queue::{DedupChecks, Queue, QueueEntry};
-use freshcrab::review_queue::{discover, own_sr_ids, refresh_signals};
+use freshcrab::review_queue::{classify_records, discover, own_sr_ids, refresh_signals};
 use freshcrab::watcher::Watcher;
 use freshcrab::worker::{DryRunExecutor, Worker};
 use geectl::auth::Credentials;
@@ -31,12 +31,15 @@ use geectl::error::{ErrorKind, GeectlError};
 use std::process::ExitCode;
 
 fn print_usage() {
-    eprintln!("Usage: freshcrab [--config <path>] [--packages <pkg>...] [--queue <path>] [--review-queue <path>] [--dry-run | --live]");
+    eprintln!("Usage: freshcrab [--config <path>] [--packages <pkg>...] [--queue <path>] [--review-queue <path>] [--review-ruleset <path>] [--dry-run | --live]");
     eprintln!("  --config <path>     path to config.yaml (default: config.yaml)");
     eprintln!("  --packages <pkg>... check only these packages (overrides the config list)");
     eprintln!("  --queue <path>      path to the queue state file (default: queue.json)");
     eprintln!(
         "  --review-queue <path> path to the review queue state file (default: review_queue.json)"
+    );
+    eprintln!(
+        "  --review-ruleset <path> path to the review ruleset file (default: review_ruleset.json)"
     );
     eprintln!("  --dry-run           force dry-run mode (default)");
     eprintln!("  --live              force live mode (writes the queue; overrides config and env)");
@@ -56,6 +59,7 @@ fn main() -> ExitCode {
     let mut packages: Option<Vec<String>> = None;
     let mut queue_path = "queue.json".to_string();
     let mut review_queue_path = "review_queue.json".to_string();
+    let mut review_ruleset_path = "review_ruleset.json".to_string();
     let mut cli_dry_run: Option<bool> = None;
 
     let mut args = std::env::args().skip(1);
@@ -81,6 +85,14 @@ fn main() -> ExitCode {
                 Some(path) => review_queue_path = path,
                 None => {
                     eprintln!("--review-queue needs a path");
+                    print_usage();
+                    return ExitCode::from(2);
+                }
+            },
+            "--review-ruleset" => match args.next() {
+                Some(path) => review_ruleset_path = path,
+                None => {
+                    eprintln!("--review-ruleset needs a path");
                     print_usage();
                     return ExitCode::from(2);
                 }
@@ -402,6 +414,38 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("review queue signal refresh failed: {e}");
+        }
+    }
+
+    // The review queue classifies every snapshot against the
+    // ruleset (step 3, report-only: it records the tier and the
+    // decided action; it posts nothing). It runs after the signal
+    // refresh, so the snapshots it classifies are current. A
+    // ruleset that fails to load refuses the run: the failure is
+    // logged loudly and the run classifies nothing (the
+    // classification is skipped, not defaulted). Like discovery
+    // and refresh, a classification failure is sidecar state and
+    // must not break the update pipeline or its stdout JSON.
+    match classify_records(&review_ruleset_path, &review_queue_path, &dry_run) {
+        Ok(report) => {
+            eprintln!(
+                "review queue: classified {} records ({} auto, {} mid, {} human; {} skipped: {} terminal, {} escalated, {} without snapshot, {} no longer open)",
+                report.classified,
+                report.auto,
+                report.mid,
+                report.human,
+                report.skipped_terminal
+                    + report.skipped_escalated
+                    + report.skipped_no_snapshot
+                    + report.skipped_not_open,
+                report.skipped_terminal,
+                report.skipped_escalated,
+                report.skipped_no_snapshot,
+                report.skipped_not_open
+            );
+        }
+        Err(e) => {
+            eprintln!("review queue classification failed: {e}");
         }
     }
 

@@ -1,0 +1,261 @@
+{
+  "version": "1",
+  "rules": [
+    {
+      "name": "failed-read",
+      "when": [
+        {
+          "op": "is_non_empty",
+          "path": "read_errors"
+        }
+      ],
+      "action": "escalate-human",
+      "message": "A signal read failed, so the item cannot be judged green.",
+      "question": "Which signal read failed, and what does the server actually say for this submission?"
+    },
+    {
+      "name": "draft",
+      "when": [
+        {
+          "op": "eq",
+          "path": "server.draft",
+          "value": true
+        }
+      ],
+      "action": "hold",
+      "message": "Still a draft; parked until it leaves draft state."
+    },
+    {
+      "name": "changes-requested",
+      "when": [
+        {
+          "op": "eq",
+          "path": "review.state",
+          "value": "changes_requested"
+        }
+      ],
+      "action": "escalate-human",
+      "message": "A reviewer already requested changes.",
+      "question": "A reviewer already requested changes — does the current state resolve them, or does the request need a human decision?"
+    },
+    {
+      "name": "unmergeable",
+      "when": [
+        {
+          "op": "eq",
+          "path": "server.mergeable",
+          "value": false
+        }
+      ],
+      "action": "escalate-human",
+      "message": "The pull request conflicts with its base.",
+      "question": "The pull request conflicts with its base — can the author rebase it, or does it need a human?"
+    },
+    {
+      "name": "excluded-package",
+      "when": [
+        {
+          "op": "eq",
+          "path": "package.is_excluded",
+          "value": true
+        }
+      ],
+      "action": "escalate-human",
+      "message": "The target package is excluded (hand-maintained).",
+      "question": "The target package is excluded as hand-maintained — does a human need to take this one?"
+    },
+    {
+      "name": "security-unclear-scope",
+      "when": [
+        {
+          "op": "eq",
+          "path": "package.is_security",
+          "value": true
+        },
+        {
+          "op": "eq",
+          "path": "diff.version_bump_only",
+          "value": false
+        }
+      ],
+      "action": "escalate-human",
+      "message": "A security update that changes more than the version.",
+      "question": "This security update changes more than the version — is the scope what the CVE fix needs?"
+    },
+    {
+      "name": "risk-flag-service-files",
+      "when": [
+        {
+          "op": "any_basename_in",
+          "path": "diff.files",
+          "value": [
+            "_service",
+            "_link",
+            "_aggregate",
+            ".gitmodules"
+          ]
+        }
+      ],
+      "action": "escalate-human",
+      "message": "The submission changes a service, link, aggregate, or submodule definition.",
+      "question": "The submission changes a service, link, aggregate, or submodule definition — is the new source layout intended?"
+    },
+    {
+      "name": "risk-flag-macros",
+      "when": [
+        {
+          "op": "any_ends_with",
+          "path": "diff.files",
+          "value": [
+            ".macros"
+          ]
+        }
+      ],
+      "action": "escalate-human",
+      "message": "The submission changes a macros file.",
+      "question": "The submission changes a macros file — is the new macro set intended?"
+    },
+    {
+      "name": "pre-release-version",
+      "when": [
+        {
+          "op": "contains_any",
+          "path": "diff.new_version",
+          "value": [
+            "~rc",
+            "~beta",
+            "~alpha",
+            "~pre"
+          ]
+        }
+      ],
+      "action": "escalate-human",
+      "message": "The new version is a pre-release.",
+      "question": "The new version is a pre-release — is a pre-release acceptable for Factory here?"
+    },
+    {
+      "name": "leading-v-version",
+      "when": [
+        {
+          "op": "starts_with",
+          "path": "diff.new_version",
+          "value": "v"
+        }
+      ],
+      "action": "escalate-human",
+      "message": "The new version carries a leading v.",
+      "question": "The new version carries a leading v — is that the upstream versioning, or a packaging slip?"
+    },
+    {
+      "name": "review-asked-pending",
+      "when": [
+        {
+          "op": "eq",
+          "path": "review.state",
+          "value": "asked_pending"
+        }
+      ],
+      "action": "hold",
+      "message": "A review was asked and is still pending; parked until it lands."
+    },
+    {
+      "name": "failed-build-submit",
+      "when": [
+        {
+          "op": "eq",
+          "path": "build.status",
+          "value": "any_failed"
+        },
+        {
+          "op": "ne",
+          "path": "build.target_status",
+          "value": "any_failed"
+        }
+      ],
+      "action": "escalate-human",
+      "message": "The submission's build fails while the target project does not fail the same way.",
+      "question": "The submission's build fails while the target project builds — is the failure the submitter's to fix?"
+    },
+    {
+      "name": "failed-build-target",
+      "when": [
+        {
+          "op": "eq",
+          "path": "build.status",
+          "value": "any_failed"
+        },
+        {
+          "op": "eq",
+          "path": "build.target_status",
+          "value": "any_failed"
+        }
+      ],
+      "action": "hold",
+      "message": "The submission's build fails, but the target project fails the same way; parked until the target builds again."
+    },
+    {
+      "name": "build-building",
+      "when": [
+        {
+          "op": "eq",
+          "path": "build.status",
+          "value": "building"
+        }
+      ],
+      "action": "hold",
+      "message": "The build is still running; parked until it finishes."
+    },
+    {
+      "name": "build-unknown",
+      "when": [
+        {
+          "op": "eq",
+          "path": "build.status",
+          "value": "unknown"
+        }
+      ],
+      "action": "hold",
+      "message": "No build evidence (a Gitea pull request, or no signal repository); parked until build evidence appears."
+    },
+    {
+      "name": "clean-bump",
+      "when": [
+        {
+          "op": "eq",
+          "path": "build.status",
+          "value": "all_green"
+        },
+        {
+          "op": "in",
+          "path": "review.state",
+          "value": [
+            "none",
+            "approved"
+          ]
+        },
+        {
+          "op": "eq",
+          "path": "server.status",
+          "value": "open"
+        },
+        {
+          "op": "eq",
+          "path": "server.draft",
+          "value": false
+        },
+        {
+          "op": "eq",
+          "path": "diff.version_bump_only",
+          "value": true
+        },
+        {
+          "op": "eq",
+          "path": "diff.changelog_changed",
+          "value": true
+        }
+      ],
+      "action": "comment",
+      "message": "Version bump only, changelog updated, build green on Tumbleweed and Leap 16, no review outstanding."
+    }
+  ]
+}

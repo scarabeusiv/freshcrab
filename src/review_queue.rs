@@ -18,6 +18,38 @@
 //! review state, file nothing, and merge nothing. The tier stays
 //! empty until the ruleset (step 3) classifies the snapshot.
 //!
+//! Step 3 (this module): the ruleset file (`review_ruleset.json`,
+//! a separate declarative file in the repo, versioned with the
+//! code — not a section of `config.yaml`) and the evaluator.
+//! A rule names its signal pattern (`when`: conditions over the
+//! step-2 signal snapshot) and its action (`comment`,
+//! `request-changes`, `decline`, `escalate-human`, `hold`,
+//! `accept-trivial`). Rules are evaluated in file order; the first
+//! matching rule wins; no rule matching means the human tier.
+//! The tier and the decided action are recorded on the record
+//! together with the ruleset version that produced them; a comment
+//! body never carries the version. Fail-closed: anything the
+//! ruleset does not cover goes to the human tier, and a ruleset
+//! that fails to load refuses the run (classify returns the error;
+//! the run classifies nothing). `decline` is normalized to
+//! `comment` at evaluation: OBS decline is human-only, so the
+//! queue comments in the ruleset cases instead of declining.
+//! Report-only, like steps 1-2: classification records the
+//! tier and action; it posts nothing. The human handoff (step 4)
+//! and the actions (steps 5-7) are not built here.
+//!
+//! The initial rule set encodes only the clear cases the step-2
+//! snapshot supports: signal statuses (build, review, server),
+//! file names from the diff (risk-flag files), and the bumped
+//! version string (pre-release markers). The rest of #21's
+//! ruleset signals needs diff text the snapshot does not carry
+//! (changelog wording and format, `%check` changes, spec findings,
+//! patch-to-changelog naming, tarball equality, `setBadness`);
+//! those cases match no rule and fall through to the human tier
+//! until diff-text signals land. No rule in the initial set yields
+//! `request-changes` or `accept-trivial`: both need a diff-text
+//! finding, so steps 6-7 stay live-inert until then.
+//!
 //! Discovery runs across ALL configured instances: every OBS
 //! instance and every Gitea instance in the geectl config, not just
 //! the default. Instances come from geectl's config file
@@ -159,6 +191,18 @@ pub struct ReviewRecord {
     /// until a ruleset exists.
     #[serde(default)]
     pub ruleset_version: Option<String>,
+    /// The rule that classified this record (step 3). None until
+    /// a rule matches; a record that matched no rule (human tier
+    /// by fail-closed default) carries None.
+    #[serde(default)]
+    pub matched_rule: Option<String>,
+    /// The action the ruleset decided for this record (step 3):
+    /// `comment` | `request-changes` | `escalate-human` | `hold` |
+    /// `accept-trivial`. None until classified. This is the decided
+    /// next action, not a posted one — posted actions live in
+    /// `action_history` (steps 5-7).
+    #[serde(default)]
+    pub action: Option<String>,
     #[serde(default)]
     pub binding: Option<ReviewBinding>,
     /// The grace periods for the trivial-fix tiers (decided
@@ -195,6 +239,8 @@ impl ReviewRecord {
             tier: String::new(),
             signal_snapshot: None,
             ruleset_version: None,
+            matched_rule: None,
+            action: None,
             binding,
             grace_periods: GracePeriods::default(),
             last_checked: now.clone(),
@@ -755,6 +801,43 @@ impl ReviewQueue {
         {
             Some(existing) => {
                 existing.signal_snapshot = Some(snapshot);
+                existing.last_checked = now.clone();
+                existing.updated_at = now;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record a classification on the record for (`instance`,
+    /// `reference`): the tier, the decided action, the matching
+    /// rule, and the ruleset version that produced them. An `open`
+    /// record becomes `triaged`; any other status is kept (an
+    /// escalated record is never classified — step 4 owns it).
+    /// Returns false when no such record exists.
+    pub fn set_classification(
+        &mut self,
+        instance: &str,
+        reference: &str,
+        tier: &str,
+        action: &str,
+        rule: Option<&str>,
+        ruleset_version: &str,
+    ) -> bool {
+        let now = now_iso();
+        match self
+            .records
+            .iter_mut()
+            .find(|r| r.instance == instance && r.reference == reference)
+        {
+            Some(existing) => {
+                existing.tier = tier.to_string();
+                existing.action = Some(action.to_string());
+                existing.matched_rule = rule.map(str::to_string);
+                existing.ruleset_version = Some(ruleset_version.to_string());
+                if existing.status == "open" {
+                    existing.status = "triaged".to_string();
+                }
                 existing.last_checked = now.clone();
                 existing.updated_at = now;
                 true
@@ -2399,6 +2482,537 @@ fn refresh_on(
         }
     }
     report
+}
+
+/// The actions a ruleset rule can decide. `decline` is normalized
+/// to `comment` by the evaluator: OBS decline is human-only, so
+/// the queue comments in the ruleset cases instead of declining.
+pub const RULESET_ACTIONS: &[&str] = &[
+    "comment",
+    "request-changes",
+    "decline",
+    "escalate-human",
+    "hold",
+    "accept-trivial",
+];
+
+/// The signal-snapshot paths a rule condition may name. A path
+/// outside this set is a load error, never a silent never-match:
+/// a typo'd path must refuse the run, not misclassify every item.
+const RULESET_PATHS: &[&str] = &[
+    "read_errors",
+    "build.status",
+    "build.target_status",
+    "review.state",
+    "diff.files",
+    "diff.spec_changed",
+    "diff.version_bump_only",
+    "diff.patches_changed",
+    "diff.new_files",
+    "diff.changelog_changed",
+    "diff.new_version",
+    "diff.cve_ids",
+    "author.is_own_filing",
+    "author.is_package_maintainer",
+    "author.first_time_submitter",
+    "package.package",
+    "package.is_excluded",
+    "package.is_core",
+    "package.is_security",
+    "package.cve_ids",
+    "server.status",
+    "server.draft",
+    "server.mergeable",
+];
+
+/// The condition operators. `eq` / `ne` compare a scalar;
+/// `in` tests membership in an array of scalars; `contains`
+/// is a string substring (or an array element, exact);
+/// `contains_any` is a string substring against any of an array
+/// of strings; `starts_with` is a string prefix;
+/// `any_basename_in` matches when any file in an array has a
+/// basename in the array of names; `any_ends_with` matches when
+/// any string in an array ends with any of an array of suffixes;
+/// `is_empty` / `is_non_empty` match an absent, null, empty
+/// string, or empty array (and its negation).
+const RULESET_OPS: &[&str] = &[
+    "eq",
+    "ne",
+    "in",
+    "contains",
+    "contains_any",
+    "starts_with",
+    "any_basename_in",
+    "any_ends_with",
+    "is_empty",
+    "is_non_empty",
+];
+
+/// One condition in a ruleset rule's signal pattern: all of a
+/// rule's conditions must match for the rule to match.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleCondition {
+    pub path: String,
+    pub op: String,
+    /// The compared value. Absent for `is_empty` /
+    /// `is_non_empty`; anything else is a load error.
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+}
+
+/// One rule in the ruleset file: its signal pattern, its action,
+/// the finding text, and — for human-tier rules — the exact
+/// question for the human (step 4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RulesetRule {
+    pub name: String,
+    #[serde(default)]
+    pub when: Vec<RuleCondition>,
+    pub action: String,
+    pub message: String,
+    #[serde(default)]
+    pub question: Option<String>,
+}
+
+/// The ruleset file shape (`review_ruleset.json`): a version
+/// plus the rules in evaluation order. Unknown fields are
+/// rejected, like the config file's unknown keys: a typo'd field
+/// must refuse the run, not be silently ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RulesetFile {
+    pub version: String,
+    pub rules: Vec<RulesetRule>,
+}
+
+/// A loaded, validated ruleset.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ruleset {
+    pub version: String,
+    pub rules: Vec<RulesetRule>,
+}
+
+impl Ruleset {
+    /// Load and validate the ruleset file at `path`. Any failure
+    /// (missing file, invalid JSON, unknown field, unknown action,
+    /// unknown path or operator, bad condition value) refuses the
+    /// run: the caller gets the error and classifies nothing,
+    /// never a default-allow fallback.
+    pub fn load(path: &str) -> Result<Self, ReviewQueueError> {
+        let text = fs::read_to_string(path)
+            .map_err(|e| ReviewQueueError(format!("cannot read ruleset file {path}: {e}")))?;
+        Self::load_text(&text)
+    }
+
+    /// Load and validate a ruleset from its JSON text (used by the
+    /// tests; `load` is the file entry point).
+    pub fn load_text(text: &str) -> Result<Self, ReviewQueueError> {
+        let file: RulesetFile = serde_json::from_str(text)
+            .map_err(|e| ReviewQueueError(format!("invalid ruleset file: {e}")))?;
+        Self::validate(file)
+    }
+
+    /// Validate a parsed ruleset file: a non-empty version, unique
+    /// non-empty rule names, non-empty messages, known actions,
+    /// and well-formed conditions (known path and operator, a
+    /// value of the shape the operator needs).
+    fn validate(file: RulesetFile) -> Result<Self, ReviewQueueError> {
+        if file.version.trim().is_empty() {
+            return Err(ReviewQueueError(
+                "invalid ruleset file: version must be a non-empty string".to_string(),
+            ));
+        }
+        let mut names: HashSet<&str> = HashSet::new();
+        for rule in &file.rules {
+            if rule.name.trim().is_empty() {
+                return Err(ReviewQueueError(
+                    "invalid ruleset file: every rule needs a non-empty name".to_string(),
+                ));
+            }
+            if !names.insert(rule.name.as_str()) {
+                return Err(ReviewQueueError(format!(
+                    "invalid ruleset file: duplicate rule name {:?}",
+                    rule.name
+                )));
+            }
+            if !RULESET_ACTIONS.contains(&rule.action.as_str()) {
+                return Err(ReviewQueueError(format!(
+                    "invalid ruleset file: rule {:?} has unknown action {:?} (expected one of {})",
+                    rule.name,
+                    rule.action,
+                    RULESET_ACTIONS.join(", ")
+                )));
+            }
+            if rule.message.trim().is_empty() {
+                return Err(ReviewQueueError(format!(
+                    "invalid ruleset file: rule {:?} needs a non-empty message",
+                    rule.name
+                )));
+            }
+            for condition in &rule.when {
+                Self::validate_condition(&rule.name, condition)?;
+            }
+        }
+        Ok(Ruleset {
+            version: file.version,
+            rules: file.rules,
+        })
+    }
+
+    /// Validate one condition: a known path, a known operator,
+    /// and a value of the shape the operator needs (absent for
+    /// `is_empty` / `is_non_empty`, a scalar for `eq` / `ne`, a
+    /// non-empty string for `contains` / `starts_with`, a
+    /// non-empty array of strings for the rest).
+    fn validate_condition(rule: &str, condition: &RuleCondition) -> Result<(), ReviewQueueError> {
+        let invalid = |what: &str| {
+            ReviewQueueError(format!(
+                "invalid ruleset file: rule {rule:?} condition {:?} {}: {what}",
+                condition.path, condition.op
+            ))
+        };
+        if !RULESET_PATHS.contains(&condition.path.as_str()) {
+            return Err(invalid(&format!(
+                "unknown signal path (expected one of {})",
+                RULESET_PATHS.join(", ")
+            )));
+        }
+        if !RULESET_OPS.contains(&condition.op.as_str()) {
+            return Err(invalid(&format!(
+                "unknown operator (expected one of {})",
+                RULESET_OPS.join(", ")
+            )));
+        }
+        match condition.op.as_str() {
+            "is_empty" | "is_non_empty" => {
+                if condition.value.is_some() {
+                    return Err(invalid("takes no value"));
+                }
+            }
+            "eq" | "ne" => match &condition.value {
+                Some(value) if value.is_string() || value.is_boolean() || value.is_number() => {}
+                _ => return Err(invalid("needs a string, boolean, or number value")),
+            },
+            "contains" | "starts_with" => match &condition.value {
+                Some(serde_json::Value::String(s)) if !s.is_empty() => {}
+                _ => return Err(invalid("needs a non-empty string value")),
+            },
+            "in" => match &condition.value {
+                Some(serde_json::Value::Array(items))
+                    if !items.is_empty()
+                        && items.iter().all(|item| {
+                            item.is_boolean()
+                                || item.is_number()
+                                || item.as_str().is_some_and(|s| !s.is_empty())
+                        }) => {}
+                _ => {
+                    return Err(invalid(
+                        "needs a non-empty array of scalars (strings must be non-empty)",
+                    ));
+                }
+            },
+            "contains_any" | "any_basename_in" | "any_ends_with" => match &condition.value {
+                Some(serde_json::Value::Array(items))
+                    if !items.is_empty()
+                        && items
+                            .iter()
+                            .all(|item| item.as_str().is_some_and(|s| !s.is_empty())) => {}
+                _ => {
+                    return Err(invalid("needs a non-empty array of non-empty strings"));
+                }
+            },
+            _ => unreachable!("operator validated above"),
+        }
+        Ok(())
+    }
+}
+
+/// The evaluator's verdict for one record: the tier, the decided
+/// action, the matching rule (None when no rule matched), the
+/// finding text, and — for human-tier verdicts — the exact
+/// question for the human (step 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Classification {
+    pub tier: String,
+    pub action: String,
+    pub rule: Option<String>,
+    pub reason: String,
+    pub question: Option<String>,
+}
+
+/// Classify one signal snapshot against the ruleset, in file
+/// order: the first matching rule wins. No rule matching means
+/// the human tier (fail-closed). A `decline` rule is normalized
+/// to `comment`: OBS decline is human-only, so the queue comments
+/// in the ruleset cases instead of declining.
+pub fn classify(ruleset: &Ruleset, snapshot: &SignalSnapshot) -> Classification {
+    let json = match serde_json::to_value(snapshot) {
+        Ok(json) => json,
+        Err(_) => {
+            // The snapshot is freshcrab's own serialization, so
+            // this is unreachable in practice; fail closed to the
+            // human tier rather than guessing a verdict.
+            return Classification {
+                tier: "human".to_string(),
+                action: "escalate-human".to_string(),
+                rule: None,
+                reason: "The signal snapshot cannot be read; fail-closed to the human tier."
+                    .to_string(),
+                question: Some(
+                    "The signal snapshot cannot be read — what does the server actually say for this submission?"
+                        .to_string(),
+                ),
+            };
+        }
+    };
+    for rule in &ruleset.rules {
+        if rule
+            .when
+            .iter()
+            .all(|condition| condition_matches(condition, &json))
+        {
+            return classification_for(rule);
+        }
+    }
+    Classification {
+        tier: "human".to_string(),
+        action: "escalate-human".to_string(),
+        rule: None,
+        reason: "No ruleset rule covers this item; fail-closed to the human tier.".to_string(),
+        question: Some("No ruleset rule covers this item — what should happen to it?".to_string()),
+    }
+}
+
+/// The verdict for one matching rule: the tier follows the
+/// action (`comment` / `request-changes` / `accept-trivial` are
+/// auto; `hold` is mid; `escalate-human` is human).
+fn classification_for(rule: &RulesetRule) -> Classification {
+    match rule.action.as_str() {
+        "comment" | "request-changes" | "accept-trivial" => Classification {
+            tier: "auto".to_string(),
+            action: rule.action.clone(),
+            rule: Some(rule.name.clone()),
+            reason: rule.message.clone(),
+            question: rule.question.clone(),
+        },
+        "hold" => Classification {
+            tier: "mid".to_string(),
+            action: "hold".to_string(),
+            rule: Some(rule.name.clone()),
+            reason: rule.message.clone(),
+            question: rule.question.clone(),
+        },
+        "decline" => Classification {
+            tier: "auto".to_string(),
+            action: "comment".to_string(),
+            rule: Some(rule.name.clone()),
+            reason: format!(
+                "{} (Rule {:?} says decline; OBS decline is human-only, so the queue comments instead.)",
+                rule.message, rule.name
+            ),
+            question: rule.question.clone(),
+        },
+        "escalate-human" => Classification {
+            tier: "human".to_string(),
+            action: "escalate-human".to_string(),
+            rule: Some(rule.name.clone()),
+            reason: rule.message.clone(),
+            question: rule.question.clone(),
+        },
+        _ => unreachable!("rule actions are validated at load"),
+    }
+}
+
+/// True when one condition matches the snapshot (as JSON): the
+/// condition's path resolves into the snapshot, and the operator
+/// holds. A null or missing value matches only `is_empty`
+/// (absence is empty); every other operator needs a real value.
+fn condition_matches(condition: &RuleCondition, snapshot: &serde_json::Value) -> bool {
+    let resolved = snapshot_value(snapshot, &condition.path);
+    match condition.op.as_str() {
+        "is_empty" => is_empty_value(resolved),
+        "is_non_empty" => !is_empty_value(resolved),
+        "eq" => {
+            matches!(resolved, Some(value) if !value.is_null() && Some(value) == condition.value.as_ref())
+        }
+        "ne" => {
+            matches!(resolved, Some(value) if !value.is_null() && Some(value) != condition.value.as_ref())
+        }
+        "in" => match (resolved, &condition.value) {
+            (Some(value), Some(serde_json::Value::Array(items)))
+                if !value.is_null() && !value.is_array() && !value.is_object() =>
+            {
+                items.iter().any(|item| item == value)
+            }
+            _ => false,
+        },
+        "contains" => match (resolved, &condition.value) {
+            (
+                Some(serde_json::Value::String(haystack)),
+                Some(serde_json::Value::String(needle)),
+            ) => haystack.contains(needle.as_str()),
+            (Some(serde_json::Value::Array(items)), Some(needle)) => {
+                items.iter().any(|item| item == needle)
+            }
+            _ => false,
+        },
+        "contains_any" => match (resolved, &condition.value) {
+            (
+                Some(serde_json::Value::String(haystack)),
+                Some(serde_json::Value::Array(needles)),
+            ) => needles.iter().any(|needle| {
+                needle
+                    .as_str()
+                    .is_some_and(|needle| haystack.contains(needle))
+            }),
+            _ => false,
+        },
+        "starts_with" => match (resolved, &condition.value) {
+            (
+                Some(serde_json::Value::String(haystack)),
+                Some(serde_json::Value::String(prefix)),
+            ) => haystack.starts_with(prefix.as_str()),
+            _ => false,
+        },
+        "any_basename_in" => match (resolved, &condition.value) {
+            (Some(serde_json::Value::Array(files)), Some(serde_json::Value::Array(names))) => {
+                files.iter().any(|file| {
+                    file.as_str().is_some_and(|file| {
+                        let basename = file.rsplit('/').next().unwrap_or(file);
+                        names
+                            .iter()
+                            .any(|name| name.as_str().is_some_and(|name| name == basename))
+                    })
+                })
+            }
+            _ => false,
+        },
+        "any_ends_with" => match (resolved, &condition.value) {
+            (Some(serde_json::Value::Array(items)), Some(serde_json::Value::Array(suffixes))) => {
+                items.iter().any(|item| {
+                    item.as_str().is_some_and(|item| {
+                        suffixes.iter().any(|suffix| {
+                            suffix.as_str().is_some_and(|suffix| item.ends_with(suffix))
+                        })
+                    })
+                })
+            }
+            _ => false,
+        },
+        _ => unreachable!("operators are validated at load"),
+    }
+}
+
+/// True for an absent, null, empty-string, or empty-array value.
+fn is_empty_value(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None => true,
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => s.is_empty(),
+        Some(serde_json::Value::Array(items)) => items.is_empty(),
+        Some(_) => false,
+    }
+}
+
+/// Resolve a dotted path (`build.status`, `read_errors`) into the
+/// snapshot JSON. None when any step is missing.
+fn snapshot_value<'a>(
+    snapshot: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut current = snapshot;
+    for part in path.split('.') {
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+
+/// The outcome of a classification run over the queue file.
+#[derive(Debug, Default)]
+pub struct ClassifyReport {
+    pub classified: usize,
+    pub auto: usize,
+    pub mid: usize,
+    pub human: usize,
+    /// Terminal records: classified never; the ref left the server.
+    pub skipped_terminal: usize,
+    /// Escalated records: step 4 owns them; classification leaves
+    /// them parked.
+    pub skipped_escalated: usize,
+    /// Records with no signal snapshot yet (an unscannable
+    /// instance, or a record discovery just wrote): nothing to
+    /// classify.
+    pub skipped_no_snapshot: usize,
+    /// Records whose snapshot says the ref is no longer open
+    /// (merged, declined): discovery marks them terminal on its
+    /// next pass; classification leaves them alone.
+    pub skipped_not_open: usize,
+}
+
+/// Classify every classifiable record in the queue file against
+/// the ruleset at `ruleset_path`, record the tier, the decided
+/// action, the matching rule, and the ruleset version, and save
+/// the queue (DryRun-guarded). Report-only: it records the
+/// verdict; it posts nothing. A ruleset that fails to load
+/// refuses the run: the error is returned and nothing is
+/// classified. Terminal and escalated records are skipped, as
+/// are records with no snapshot yet and records whose snapshot
+/// says the ref is no longer open. A snapshot that cannot be
+/// parsed is classified from an unknown snapshot, so the
+/// `failed-read` rule escalates it instead of dropping it.
+pub fn classify_records(
+    ruleset_path: &str,
+    queue_path: &str,
+    dry_run: &DryRun,
+) -> Result<ClassifyReport, ReviewQueueError> {
+    let ruleset = Ruleset::load(ruleset_path)?;
+    let mut queue = ReviewQueue::open(queue_path)?;
+    let mut report = ClassifyReport::default();
+    let targets: Vec<ReviewRecord> = queue.entries().to_vec();
+    for record in &targets {
+        if record.status == "terminal" {
+            report.skipped_terminal += 1;
+            continue;
+        }
+        if record.status == "escalated" {
+            report.skipped_escalated += 1;
+            continue;
+        }
+        let Some(stored) = &record.signal_snapshot else {
+            report.skipped_no_snapshot += 1;
+            continue;
+        };
+        let snapshot: SignalSnapshot = match serde_json::from_value(stored.clone()) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                SignalSnapshot::unknown(vec![format!("cannot parse stored signal snapshot: {e}")])
+            }
+        };
+        if snapshot.server.status != "open" && snapshot.server.status != "unknown" {
+            report.skipped_not_open += 1;
+            continue;
+        }
+        let verdict = classify(&ruleset, &snapshot);
+        match verdict.tier.as_str() {
+            "auto" => report.auto += 1,
+            "mid" => report.mid += 1,
+            _ => report.human += 1,
+        }
+        if queue.set_classification(
+            &record.instance,
+            &record.reference,
+            &verdict.tier,
+            &verdict.action,
+            verdict.rule.as_deref(),
+            &ruleset.version,
+        ) {
+            report.classified += 1;
+        }
+    }
+    queue.save(dry_run)?;
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -4537,5 +5151,366 @@ mod tests {
         assert!(snapshot.diff.version_bump_only);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    // Step 3: ruleset and evaluator.
+
+    /// A clean all-green version-bump snapshot: the baseline every
+    /// classify test mutates.
+    fn base_snapshot() -> SignalSnapshot {
+        SignalSnapshot {
+            read_at: "0".to_string(),
+            build: BuildSignal {
+                status: "all_green".to_string(),
+                cells: Vec::new(),
+                target_status: "all_green".to_string(),
+                target_reason: None,
+                reason: None,
+            },
+            review: ReviewSignal {
+                state: "none".to_string(),
+                reviews: Vec::new(),
+                reason: None,
+            },
+            diff: DiffSignal {
+                files: vec!["foo.spec".to_string(), "foo.changes".to_string()],
+                spec_changed: true,
+                version_bump_only: true,
+                patches_changed: false,
+                new_files: Vec::new(),
+                changelog_changed: true,
+                new_version: Some("2.0".to_string()),
+                cve_ids: Vec::new(),
+                reason: None,
+            },
+            author: AuthorSignal {
+                author: "someone".to_string(),
+                is_own_filing: Some(false),
+                is_package_maintainer: Some(true),
+                first_time_submitter: None,
+            },
+            package: PackageSignal {
+                package: "foo".to_string(),
+                is_excluded: Some(false),
+                is_core: None,
+                is_security: Some(false),
+                cve_ids: Vec::new(),
+            },
+            server: ServerSignal {
+                status: "open".to_string(),
+                draft: false,
+                mergeable: None,
+            },
+            read_errors: Vec::new(),
+        }
+    }
+
+    fn shipped_ruleset() -> Ruleset {
+        // The test runs with the crate root as the working
+        // directory, like `repo_config_loads`.
+        Ruleset::load("review_ruleset.json").unwrap()
+    }
+
+    #[test]
+    fn ruleset_load_rejects_bad_files() {
+        // No version.
+        assert!(Ruleset::load_text(r#"{"rules": []}"#).is_err());
+        // Empty version.
+        assert!(Ruleset::load_text(r#"{"version": "", "rules": []}"#).is_err());
+        // Unknown top-level key.
+        assert!(Ruleset::load_text(r#"{"version": "1", "rules": [], "extra": 1}"#).is_err());
+        // Unknown action.
+        assert!(Ruleset::load_text(
+            r#"{"version": "1", "rules": [{"name": "x", "when": [], "action": "merge", "message": "m"}]}"#
+        )
+        .is_err());
+        // Unknown signal path.
+        assert!(Ruleset::load_text(
+            r#"{"version": "1", "rules": [{"name": "x", "when": [{"path": "build.colour", "op": "eq", "value": "green"}], "action": "hold", "message": "m"}]}"#
+        )
+        .is_err());
+        // Unknown operator.
+        assert!(Ruleset::load_text(
+            r#"{"version": "1", "rules": [{"name": "x", "when": [{"path": "build.status", "op": "matches", "value": "green"}], "action": "hold", "message": "m"}]}"#
+        )
+        .is_err());
+        // Duplicate rule name.
+        assert!(Ruleset::load_text(
+            r#"{"version": "1", "rules": [
+                {"name": "x", "when": [], "action": "hold", "message": "m"},
+                {"name": "x", "when": [], "action": "hold", "message": "m"}]}"#
+        )
+        .is_err());
+        // `eq` with an array value.
+        assert!(Ruleset::load_text(
+            r#"{"version": "1", "rules": [{"name": "x", "when": [{"path": "build.status", "op": "eq", "value": ["green"]}], "action": "hold", "message": "m"}]}"#
+        )
+        .is_err());
+        // `is_empty` with a value.
+        assert!(Ruleset::load_text(
+            r#"{"version": "1", "rules": [{"name": "x", "when": [{"path": "read_errors", "op": "is_empty", "value": true}], "action": "hold", "message": "m"}]}"#
+        )
+        .is_err());
+        // Empty message.
+        assert!(Ruleset::load_text(
+            r#"{"version": "1", "rules": [{"name": "x", "when": [], "action": "hold", "message": "  "}]}"#
+        )
+        .is_err());
+        // Not JSON at all.
+        assert!(Ruleset::load_text("not json").is_err());
+        // An empty rule list is a valid fail-closed ruleset:
+        // everything falls through to the human tier.
+        assert!(Ruleset::load_text(r#"{"version": "1", "rules": []}"#).is_ok());
+        // `in` accepts booleans as well as strings.
+        assert!(Ruleset::load_text(
+            r#"{"version": "1", "rules": [{"name": "x", "when": [{"path": "package.is_excluded", "op": "in", "value": [true]}], "action": "hold", "message": "m"}]}"#
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn ruleset_shipped_file_loads() {
+        let ruleset = shipped_ruleset();
+        assert_eq!(ruleset.version, "1");
+        assert!(
+            ruleset.rules.iter().any(|r| r.name == "clean-bump"),
+            "shipped ruleset carries the clean-bump rule"
+        );
+        assert!(
+            ruleset.rules.iter().any(|r| r.name == "failed-read"),
+            "shipped ruleset carries the failed-read rule"
+        );
+    }
+
+    #[test]
+    fn classify_clean_bump_is_auto_comment() {
+        let ruleset = shipped_ruleset();
+        let verdict = classify(&ruleset, &base_snapshot());
+        assert_eq!(verdict.tier, "auto");
+        assert_eq!(verdict.action, "comment");
+        assert_eq!(verdict.rule.as_deref(), Some("clean-bump"));
+        // An approved review is green too.
+        let mut approved = base_snapshot();
+        approved.review.state = "approved".to_string();
+        let verdict = classify(&ruleset, &approved);
+        assert_eq!(verdict.tier, "auto");
+        assert_eq!(verdict.rule.as_deref(), Some("clean-bump"));
+    }
+
+    #[test]
+    fn classify_failed_read_is_human_and_wins_over_draft() {
+        let ruleset = shipped_ruleset();
+        let mut snapshot = base_snapshot();
+        snapshot.read_errors = vec!["build: connection refused".to_string()];
+        snapshot.server.draft = true;
+        let verdict = classify(&ruleset, &snapshot);
+        assert_eq!(verdict.tier, "human");
+        assert_eq!(verdict.action, "escalate-human");
+        assert_eq!(verdict.rule.as_deref(), Some("failed-read"));
+        assert!(verdict.question.is_some());
+    }
+
+    #[test]
+    fn classify_draft_is_mid_hold() {
+        let ruleset = shipped_ruleset();
+        let mut snapshot = base_snapshot();
+        snapshot.server.draft = true;
+        let verdict = classify(&ruleset, &snapshot);
+        assert_eq!(verdict.tier, "mid");
+        assert_eq!(verdict.action, "hold");
+        assert_eq!(verdict.rule.as_deref(), Some("draft"));
+    }
+
+    #[test]
+    fn classify_risk_flag_files_and_versions_are_human() {
+        let ruleset = shipped_ruleset();
+        // A changed _service, by basename, wherever it sits.
+        let mut snapshot = base_snapshot();
+        snapshot.diff.files = vec!["foo/_service".to_string()];
+        snapshot.diff.version_bump_only = false;
+        let verdict = classify(&ruleset, &snapshot);
+        assert_eq!(verdict.rule.as_deref(), Some("risk-flag-service-files"));
+        assert_eq!(verdict.tier, "human");
+        // A pre-release version.
+        let mut snapshot = base_snapshot();
+        snapshot.diff.new_version = Some("1.0~rc1".to_string());
+        let verdict = classify(&ruleset, &snapshot);
+        assert_eq!(verdict.rule.as_deref(), Some("pre-release-version"));
+        // A leading v.
+        let mut snapshot = base_snapshot();
+        snapshot.diff.new_version = Some("v2.0".to_string());
+        let verdict = classify(&ruleset, &snapshot);
+        assert_eq!(verdict.rule.as_deref(), Some("leading-v-version"));
+        // No version at all: the version rules need a value, so
+        // they do not match on null.
+        let mut snapshot = base_snapshot();
+        snapshot.diff.new_version = None;
+        let verdict = classify(&ruleset, &snapshot);
+        assert_eq!(verdict.rule.as_deref(), Some("clean-bump"));
+    }
+
+    #[test]
+    fn classify_failed_build_depends_on_the_target() {
+        let ruleset = shipped_ruleset();
+        // The submitter's failure (the target builds): human.
+        let mut snapshot = base_snapshot();
+        snapshot.build.status = "any_failed".to_string();
+        snapshot.build.target_status = "all_green".to_string();
+        let verdict = classify(&ruleset, &snapshot);
+        assert_eq!(verdict.rule.as_deref(), Some("failed-build-submit"));
+        assert_eq!(verdict.tier, "human");
+        // The target fails the same way: parked, not the
+        // submitter's.
+        let mut snapshot = base_snapshot();
+        snapshot.build.status = "any_failed".to_string();
+        snapshot.build.target_status = "any_failed".to_string();
+        let verdict = classify(&ruleset, &snapshot);
+        assert_eq!(verdict.rule.as_deref(), Some("failed-build-target"));
+        assert_eq!(verdict.tier, "mid");
+        assert_eq!(verdict.action, "hold");
+    }
+
+    #[test]
+    fn classify_no_rule_match_is_human() {
+        let ruleset = shipped_ruleset();
+        // Green build and no outstanding review, but the diff is
+        // more than a bump (a patch changed): no rule covers it.
+        let mut snapshot = base_snapshot();
+        snapshot.diff.version_bump_only = false;
+        snapshot.diff.patches_changed = true;
+        snapshot.diff.files.push("fix.patch".to_string());
+        snapshot.diff.new_version = None;
+        let verdict = classify(&ruleset, &snapshot);
+        assert_eq!(verdict.tier, "human");
+        assert_eq!(verdict.action, "escalate-human");
+        assert_eq!(verdict.rule, None);
+    }
+
+    #[test]
+    fn classify_decline_normalizes_to_comment() {
+        let ruleset = Ruleset::load_text(
+            r#"{"version": "1", "rules": [
+                {"name": "would-decline", "when": [{"path": "build.status", "op": "eq", "value": "all_green"}], "action": "decline", "message": "Would decline this."}]}"#,
+        )
+        .unwrap();
+        let verdict = classify(&ruleset, &base_snapshot());
+        assert_eq!(verdict.tier, "auto");
+        assert_eq!(verdict.action, "comment");
+        assert_eq!(verdict.rule.as_deref(), Some("would-decline"));
+        assert!(verdict.reason.contains("OBS decline is human-only"));
+    }
+
+    #[test]
+    fn classify_first_match_wins() {
+        let ruleset = Ruleset::load_text(
+            r#"{"version": "1", "rules": [
+                {"name": "first", "when": [{"path": "build.status", "op": "eq", "value": "all_green"}], "action": "escalate-human", "message": "First."},
+                {"name": "second", "when": [{"path": "build.status", "op": "eq", "value": "all_green"}], "action": "comment", "message": "Second."}]}"#,
+        )
+        .unwrap();
+        let verdict = classify(&ruleset, &base_snapshot());
+        assert_eq!(verdict.rule.as_deref(), Some("first"));
+        assert_eq!(verdict.tier, "human");
+    }
+
+    #[test]
+    fn set_classification_opens_to_triaged() {
+        let path = tmp_path("classify-set");
+        let live_run = live();
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        queue.upsert(ReviewRecord::new(
+            "obs:123", "default", "obs", "bump foo", "someone", None,
+        ));
+        assert!(queue.set_classification(
+            "default",
+            "obs:123",
+            "auto",
+            "comment",
+            Some("clean-bump"),
+            "1"
+        ));
+        let record = queue.find("default", "obs:123").unwrap();
+        assert_eq!(record.status, "triaged");
+        assert_eq!(record.tier, "auto");
+        assert_eq!(record.action.as_deref(), Some("comment"));
+        assert_eq!(record.matched_rule.as_deref(), Some("clean-bump"));
+        assert_eq!(record.ruleset_version.as_deref(), Some("1"));
+        assert!(!queue.set_classification("default", "obs:999", "auto", "comment", None, "1"));
+        queue.save(&live_run).unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn classify_records_persists_verdicts() {
+        let path = tmp_path("classify-run");
+        let live_run = live();
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        queue.upsert(ReviewRecord::new(
+            "obs:123", "default", "obs", "bump foo", "someone", None,
+        ));
+        let clean = serde_json::to_value(base_snapshot()).unwrap();
+        queue.set_signal_snapshot("default", "obs:123", clean);
+        queue.upsert(ReviewRecord::new(
+            "obs:124", "default", "obs", "bump bar", "someone", None,
+        ));
+        let mut failed = base_snapshot();
+        failed.read_errors = vec!["build: connection refused".to_string()];
+        queue.set_signal_snapshot("default", "obs:124", serde_json::to_value(failed).unwrap());
+        // No snapshot: skipped.
+        queue.upsert(ReviewRecord::new(
+            "obs:125", "default", "obs", "bump baz", "someone", None,
+        ));
+        // Terminal: skipped.
+        queue.upsert(ReviewRecord::new(
+            "obs:126", "default", "obs", "bump qux", "someone", None,
+        ));
+        queue.mark_terminal("default", "obs:126");
+        queue.save(&live_run).unwrap();
+        drop(queue);
+
+        let report = classify_records("review_ruleset.json", &path, &live_run).unwrap();
+        assert_eq!(report.classified, 2);
+        assert_eq!(report.auto, 1);
+        assert_eq!(report.human, 1);
+        assert_eq!(report.skipped_no_snapshot, 1);
+        assert_eq!(report.skipped_terminal, 1);
+
+        let queue = ReviewQueue::open(&path).unwrap();
+        let clean_record = queue.find("default", "obs:123").unwrap();
+        assert_eq!(clean_record.tier, "auto");
+        assert_eq!(clean_record.action.as_deref(), Some("comment"));
+        assert_eq!(clean_record.matched_rule.as_deref(), Some("clean-bump"));
+        assert_eq!(clean_record.ruleset_version.as_deref(), Some("1"));
+        assert_eq!(clean_record.status, "triaged");
+        let failed_record = queue.find("default", "obs:124").unwrap();
+        assert_eq!(failed_record.tier, "human");
+        assert_eq!(failed_record.matched_rule.as_deref(), Some("failed-read"));
+        let skipped = queue.find("default", "obs:125").unwrap();
+        assert_eq!(skipped.tier, "");
+        assert_eq!(skipped.ruleset_version, None);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn classify_records_refuses_a_bad_ruleset() {
+        let ruleset_path = tmp_path("bad-ruleset");
+        fs::write(&ruleset_path, "not json").unwrap();
+        let queue_path = tmp_path("classify-refused");
+        let live_run = live();
+        {
+            let mut queue = ReviewQueue::open(&queue_path).unwrap();
+            queue.upsert(ReviewRecord::new(
+                "obs:123", "default", "obs", "bump foo", "someone", None,
+            ));
+            queue.save(&live_run).unwrap();
+        }
+        assert!(classify_records(&ruleset_path, &queue_path, &live_run).is_err());
+        let queue = ReviewQueue::open(&queue_path).unwrap();
+        assert_eq!(queue.find("default", "obs:123").unwrap().tier, "");
+        let _ = fs::remove_file(&ruleset_path);
+        let _ = fs::remove_file(&queue_path);
+        let _ = fs::remove_file(format!("{queue_path}.lock"));
     }
 }
