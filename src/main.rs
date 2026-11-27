@@ -23,6 +23,7 @@ use freshcrab::dry_run::resolve as resolve_dry_run;
 use freshcrab::factory::FactoryClient;
 use freshcrab::http::{map_obs_credentials_error, UreqClient};
 use freshcrab::queue::{DedupChecks, Queue, QueueEntry};
+use freshcrab::review_queue::{discover, own_sr_ids};
 use freshcrab::watcher::Watcher;
 use freshcrab::worker::{DryRunExecutor, Worker};
 use geectl::auth::Credentials;
@@ -30,10 +31,13 @@ use geectl::error::{ErrorKind, GeectlError};
 use std::process::ExitCode;
 
 fn print_usage() {
-    eprintln!("Usage: freshcrab [--config <path>] [--packages <pkg>...] [--queue <path>] [--dry-run | --live]");
+    eprintln!("Usage: freshcrab [--config <path>] [--packages <pkg>...] [--queue <path>] [--review-queue <path>] [--dry-run | --live]");
     eprintln!("  --config <path>     path to config.yaml (default: config.yaml)");
     eprintln!("  --packages <pkg>... check only these packages (overrides the config list)");
     eprintln!("  --queue <path>      path to the queue state file (default: queue.json)");
+    eprintln!(
+        "  --review-queue <path> path to the review queue state file (default: review_queue.json)"
+    );
     eprintln!("  --dry-run           force dry-run mode (default)");
     eprintln!("  --live              force live mode (writes the queue; overrides config and env)");
     eprintln!(
@@ -51,6 +55,7 @@ fn main() -> ExitCode {
     let mut config_path = "config.yaml".to_string();
     let mut packages: Option<Vec<String>> = None;
     let mut queue_path = "queue.json".to_string();
+    let mut review_queue_path = "review_queue.json".to_string();
     let mut cli_dry_run: Option<bool> = None;
 
     let mut args = std::env::args().skip(1);
@@ -68,6 +73,14 @@ fn main() -> ExitCode {
                 Some(path) => queue_path = path,
                 None => {
                     eprintln!("--queue needs a path");
+                    print_usage();
+                    return ExitCode::from(2);
+                }
+            },
+            "--review-queue" => match args.next() {
+                Some(path) => review_queue_path = path,
+                None => {
+                    eprintln!("--review-queue needs a path");
                     print_usage();
                     return ExitCode::from(2);
                 }
@@ -310,6 +323,43 @@ fn main() -> ExitCode {
     if let Err(e) = queue.save(&dry_run) {
         eprintln!("{e}");
         return ExitCode::from(1);
+    }
+
+    // The review queue discovers submissions across all configured
+    // instances on every run (report-only: it reads and records,
+    // posts nothing). It runs after the update queue is saved, so
+    // the sr_ids it matches freshcrab's own filings against are
+    // current. The review queue reads through geectl's pull-request
+    // surface with geectl's own credentials (GEECTL_*), not the
+    // update pipeline's OSC_* pair.
+    let sr_ids = own_sr_ids(queue.entries());
+    match discover(&config, &sr_ids, &geectl_http, &review_queue_path, &dry_run) {
+        Ok(report) => {
+            eprintln!(
+                "review queue: {} instance arm(s) scanned, {} discovered, {} new, {} updated, {} terminal, {} unresolved",
+                report.instances.len(),
+                report.discovered,
+                report.new_records,
+                report.updated_records,
+                report.terminal_marked,
+                report.unresolved
+            );
+            for (alias, reason) in &report.unscannable {
+                eprintln!("review queue: instance {alias} unscannable: {reason}");
+            }
+            for instance in &report.instances {
+                if let Some(error) = &instance.error {
+                    eprintln!(
+                        "review queue: {} {} search failed: {error}",
+                        instance.alias, instance.backend
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
     }
 
     // Report-only gates the dispatcher only: the watcher above has
