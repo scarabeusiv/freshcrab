@@ -259,6 +259,12 @@ Any new forge need goes to geectl first and freshcrab picks it up from a
 geectl release; local implementation stays out. Reviewers enforce
 this: a freshcrab PR adding forge logic is refused.
 
+## Pluggability
+
+Forges and queues are pluggable: a new forge arrives via geectl, and
+a new queue is added, without changing the planner or the observer.
+A lab plugs in its own forges and queues.
+
 ## Updater queue
 
 ### Components
