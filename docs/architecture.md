@@ -110,9 +110,16 @@ library — freshcrab implements no forge logic of its own.
 
 ### Central observer
 
-- Controls token budget and cost for the clients that matter, and
-  runs the coherent queue. As more forges are added, it assigns the
-  items to execute.
+- Controls the token budget and runs the coherent queue. As more
+  forges are added, it assigns the items to execute.
+- Token budget: LLM/agent token spend — real money. A lab has a token
+  budget for the month; the observer paces spending so the month's
+  budget lasts the month. The daemon must not spend it in a day or a
+  week. The daemon is built for labs that pay per token, so pacing is
+  a first-class concern. Cost is token spend, not API call count or
+  wall time. The budget unit is token cost (money), scoped per lab,
+  per month, with day/week pacing. The budget values are per-lab
+  config; the pacing mechanism is open. See Open questions.
 - Clients that exist: the forge clients — OBS, Gitea, and later
   GitHub and GitLab — all reached through geectl's library; and the
   collectors (Repology, Anitya, PyPI, Distrowatch) that the updater
@@ -122,8 +129,8 @@ library — freshcrab implements no forge logic of its own.
 - Budgets already enforced, per component (not observer-enforced):
   the dispatcher concurrency limit, the daily SR cap
   (`daily_sr_cap`, config), Repology pacing (1 request/second),
-  the queue lock (one writer at a time). The observer's own budget
-  unit and values are open. See Open questions.
+  the queue lock (one writer at a time). The observer's budget
+  values are per-lab config and open. See Open questions.
 - Exhaustion: when the token budget is out, the daemon finishes: it
   stops processing. Whether it then exits or idles waiting for the
   next budget period is open. See Open questions.
@@ -471,86 +478,81 @@ by the design above.
 
 ### Observer — token budget and cost
 
-4. Budget unit and scope: what is "token budget" measured in — API
-   calls, wall time, requests per minute — and per what: per forge,
-   per instance, per client, per day? Decision: budget unit and
-   scope.
-5. Budget values: what are the numbers per client and forge?
-   Repology pacing (1 request/second) is known; OBS, Gitea, and
-   GitHub limits are not set. Decision: budget values.
-6. Cost: what is "cost" — API call count, wall time, or something
-   else? Is there a per-action cost model (a search costs X, a
-   comment costs Y)? Decision: cost definition.
-7. Clients in scope: which clients does the observer budget — the
+4. Budget values: what are the numbers per client and forge? The
+   values are per-lab config. Decision: budget values.
+5. Clients in scope: which clients does the observer budget — the
    forges only (OBS, Gitea, GitHub, GitLab), or also the collectors
    (Repology, Anitya, PyPI, Distrowatch)? Decision: observer scope.
-8. Post-exhaustion state: after the daemon finishes on budget
+6. Pacing mechanism: how does the observer pace spending so the
+   month's budget lasts the month — what does it throttle, and on
+   what schedule? Decision: pacing mechanism.
+7. Post-exhaustion state: after the daemon finishes on budget
    exhaustion, does it exit or idle waiting for the next budget
    period? Decision: post-exhaustion state.
-9. Observer failure: if the observer dies or cannot read budget
+8. Observer failure: if the observer dies or cannot read budget
    state, do the queues run unbounded (fail-open) or stop
    (fail-closed)? Decision: observer failure mode.
 
 ### Coherent queue
 
-10. Reprioritisation mechanism: how does a human tell the daemon to
+9. Reprioritisation mechanism: how does a human tell the daemon to
     prioritise CVEs or cleanups — a command, an API, a config file?
     Decision: reprioritisation mechanism.
-11. Cross-forge dedup: the same logical change can exist on two
+10. Cross-forge dedup: the same logical change can exist on two
     forges (an OBS SR and a Gitea PR for one change). Does
     coherence dedup them into one item? How is "same change"
     determined — same srcmd5, same branch? Decision: cross-forge
     dedup rule.
-12. Item locking: when the observer assigns an item, is it locked to
+11. Item locking: when the observer assigns an item, is it locked to
     one executor until done? What prevents two queues, or two runs,
     from acting on the same item? Decision: assignment locking.
 
 ### Forge assignment
 
-13. Assignment rule: does the observer route an item to a forge, or
+12. Assignment rule: does the observer route an item to a forge, or
     does the item's own forge (its handle) decide? Does assignment
     account for per-forge capabilities (OBS decline is human-only,
     Gitea labels are Gitea-only)? Decision: assignment rule.
-14. Forge down or unconfigured: does the item stay queued, get
+13. Forge down or unconfigured: does the item stay queued, get
     reassigned, or escalate to a human? Decision: forge-failure
     behaviour.
-15. Adding a forge mid-run: is a newly configured forge picked up on
+14. Adding a forge mid-run: is a newly configured forge picked up on
     the next run, or does the planner need a restart? Are existing
     items re-evaluated against the new forge? Decision: forge
     onboarding.
 
 ### Queue interaction
 
-16. Updater to reviewer: does an updater-filed SR enter the reviewer
+15. Updater to reviewer: does an updater-filed SR enter the reviewer
     queue by direct handoff, or only via re-discovery (sr_id
     match)? Decision: handoff mechanism.
-17. Reviewer to submitter: does a reviewer-accepted item (trivial-fix
+16. Reviewer to submitter: does a reviewer-accepted item (trivial-fix
     accept) feed the submitter queue for the follow-up, or does the
     reviewer act directly? Decision: reviewer-to-submitter handoff.
-18. Filing insertion position: filing items are inserted with
+17. Filing insertion position: filing items are inserted with
     priority, not tail-appended — where exactly: at the head, or at
     a high-priority position? Decision: filing insertion position.
 
 ### State, guards, config
 
-19. Planner state: does the planner keep spawn and cleanup state?
+18. Planner state: does the planner keep spawn and cleanup state?
     Decision: planner state.
-20. Kill switch scope: does the kill switch pause the planner (all
+19. Kill switch scope: does the kill switch pause the planner (all
     queues) or one queue? Decision: kill-switch scope.
-21. Dry-run scope: is dry-run global, or can one queue be live while
+20. Dry-run scope: is dry-run global, or can one queue be live while
     another is dry-run? Decision: dry-run granularity.
-22. Config placement: where do the planner schedule and the observer
+21. Config placement: where do the planner schedule and the observer
     budgets live — `config.yaml`, the ruleset, or a separate file?
     Decision: config placement.
 
 ### Cleanups
 
-23. Cleanup trigger: what triggers a cleanup — a planner schedule, a
+22. Cleanup trigger: what triggers a cleanup — a planner schedule, a
     threshold, manual? Is
     [#22](https://github.com/scarabeusiv/freshcrab/issues/22) hygiene
     invoked by the planner, or run
     manually? Decision: cleanup trigger.
-24. Cleanup safety: what guards an acting cleanup (dry-run, kill
+23. Cleanup safety: what guards an acting cleanup (dry-run, kill
     switch, human approval), and when does
     [#22](https://github.com/scarabeusiv/freshcrab/issues/22) move from
     report-only
@@ -558,19 +560,19 @@ by the design above.
 
 ### Failure modes
 
-25. Queue death: if one queue dies, does the planner restart it, mark
+24. Queue death: if one queue dies, does the planner restart it, mark
     it, or continue with the others? Does a dead queue block the
     run? Decision: queue-failure handling.
-26. Partial act: an item is half-acted (comment posted, state not
+25. Partial act: an item is half-acted (comment posted, state not
     saved) — what resumes it? Decision: partial-act recovery.
 
 ### Scope
 
-27. Planner boundary ("whatever"): is release tooling (
+26. Planner boundary ("whatever"): is release tooling (
     [#24](https://github.com/scarabeusiv/freshcrab/issues/24) crates.io
     publish) planner-owned, or outside the architecture? Decision:
     planner boundary.
-28. GitHub and GitLab (
+27. GitHub and GitLab (
     [#26](https://github.com/scarabeusiv/freshcrab/issues/26)): are
     they forges under the observer (with
     tokens and budgets), or out of scope? Decision: forge scope.
