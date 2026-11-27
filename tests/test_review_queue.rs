@@ -5,13 +5,14 @@ use freshcrab::config::Config;
 use freshcrab::dry_run::DryRun;
 use freshcrab::queue::{QueueEntry, UpdateKind};
 use freshcrab::review_queue::{
-    classify_records, comment_on, discover_on, own_sr_ids, ReviewQueue, ReviewRecord, Ruleset,
+    classify_records, comment_on, discover_on, own_sr_ids, request_changes_on, ReviewBinding,
+    ReviewQueue, ReviewRecord, Ruleset,
 };
 use freshcrab::target::Target;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::pull_request::{
     PullRequest, PullRequestBackend, PullRequestEndpoint, PullRequestRef, PullRequestSearch,
-    PullRequestStatus, PullRequestSummary, ReviewComment,
+    PullRequestStatus, PullRequestSummary, ReviewComment, ReviewOpinion,
 };
 use std::cell::{Cell, RefCell};
 use std::env;
@@ -51,11 +52,15 @@ fn test_config() -> Config {
     }
 }
 
+/// A recorded request-changes call: ref, message, commit pin.
+type RequestedChange = (String, Option<String>, Option<String>);
+
 struct FakeSource {
     search_results: Vec<PullRequestSummary>,
     show_answers: Vec<(String, Result<PullRequest, GeectlError>)>,
     posted_comments: RefCell<Vec<(String, ReviewComment)>>,
     next_comment_id: Cell<u64>,
+    requested_changes: RefCell<Vec<RequestedChange>>,
 }
 
 impl FakeSource {
@@ -65,6 +70,7 @@ impl FakeSource {
             show_answers: Vec::new(),
             posted_comments: RefCell::new(Vec::new()),
             next_comment_id: Cell::new(0),
+            requested_changes: RefCell::new(Vec::new()),
         }
     }
 
@@ -77,6 +83,12 @@ impl FakeSource {
     /// in posting order.
     fn posted(&self) -> Vec<(String, ReviewComment)> {
         self.posted_comments.borrow().clone()
+    }
+
+    /// The request-changes calls this fake served, as (ref,
+    /// message, commit) in call order.
+    fn requested(&self) -> Vec<RequestedChange> {
+        self.requested_changes.borrow().clone()
     }
 }
 
@@ -166,6 +178,29 @@ impl freshcrab::review_queue::PullRequestSource for FakeSource {
             .filter(|(stored, _)| *stored == key)
             .map(|(_, comment)| comment.clone())
             .collect())
+    }
+
+    fn request_changes(
+        &self,
+        reference: &PullRequestRef,
+        message: Option<&str>,
+        commit: Option<&str>,
+        dry_run: &geectl::obs::DryRun,
+    ) -> Result<Option<ReviewOpinion>, GeectlError> {
+        if dry_run.enabled() {
+            return Ok(None);
+        }
+        self.requested_changes.borrow_mut().push((
+            reference.to_string(),
+            message.map(str::to_string),
+            commit.map(str::to_string),
+        ));
+        Ok(Some(ReviewOpinion {
+            reviewer: "freshcrab".to_string(),
+            state: geectl::pull_request::OpinionState::ChangesRequested,
+            comment: message.unwrap_or_default().to_string(),
+            when: None,
+        }))
     }
 }
 
@@ -418,4 +453,128 @@ fn comment_stage_posts_once_across_runs() {
     }
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(format!("{path}.lock"));
+}
+
+#[test]
+fn request_changes_stage_posts_once_across_runs() {
+    let path = tmp_path("request");
+    let ruleset_path = tmp_path("reject-ruleset");
+    let live_run = live();
+    // A ruleset whose one rule matches the clean bump snapshot
+    // and yields `request-changes`: the driver acts on the
+    // decided action, and the rule exists only so the test can
+    // drive it — no shipped rule yields `request-changes` yet.
+    fs::write(
+        &ruleset_path,
+        r#"{"version": "9", "rules": [{"name": "test-reject", "when": [{"path": "diff.files", "op": "contains", "value": "foo.spec"}], "action": "request-changes", "message": "The test rule matches.", "question": "Why does the test rule match?"}]}"#,
+    )
+    .unwrap();
+    {
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        queue.upsert(ReviewRecord::new(
+            "obs:42",
+            "default",
+            "obs",
+            "bump foo",
+            "someone",
+            Some(ReviewBinding {
+                source_repository: "home:alice/foo".to_string(),
+                source_commit: Some("srcmd5".to_string()),
+                target_repository: "devel:foo/foo".to_string(),
+                target_commit: Some("targetmd5".to_string()),
+            }),
+        ));
+        // A clean all-green bump snapshot, as JSON (the same
+        // shape as the comment-stage test).
+        let snapshot = serde_json::json!({
+            "read_at": "0",
+            "build": {"status": "all_green", "cells": [], "target_status": "all_green"},
+            "review": {"state": "none", "reviews": []},
+            "diff": {
+                "files": ["foo.spec", "foo.changes"],
+                "spec_changed": true,
+                "version_bump_only": true,
+                "patches_changed": false,
+                "new_files": [],
+                "changelog_changed": true,
+                "new_version": "2.0",
+                "cve_ids": []
+            },
+            "author": {"author": "someone", "is_own_filing": false, "is_package_maintainer": true},
+            "package": {"package": "foo", "is_excluded": false, "is_security": false, "cve_ids": []},
+            "server": {"status": "open", "draft": false, "mergeable": null},
+            "read_errors": []
+        });
+        queue.set_signal_snapshot("default", "obs:42", snapshot);
+        queue.save(&live_run).unwrap();
+    }
+    classify_records(&ruleset_path, &path, &live_run).unwrap();
+    let ruleset = Ruleset::load(&ruleset_path).unwrap();
+    let show = PullRequest {
+        reference: PullRequestRef::Obs(42),
+        title: "bump foo".to_string(),
+        description: String::new(),
+        author: "someone".to_string(),
+        status: PullRequestStatus::Open,
+        draft: false,
+        merged: false,
+        mergeable: None,
+        merge_base: None,
+        source: PullRequestEndpoint {
+            repository: "home:alice/foo".to_string(),
+            branch: None,
+            commit: Some("srcmd5".to_string()),
+        },
+        target: PullRequestEndpoint {
+            repository: "devel:foo/foo".to_string(),
+            branch: None,
+            commit: Some("targetmd5".to_string()),
+        },
+        reviews: Vec::new(),
+        reviews_error: None,
+        labels: Vec::new(),
+    };
+    let source = FakeSource::new(vec![]).with_show("obs:42", show);
+    {
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        assert_eq!(
+            queue.find("default", "obs:42").unwrap().action.as_deref(),
+            Some("request-changes")
+        );
+        let report = request_changes_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.requested, 1);
+        assert_eq!(source.requested().len(), 1);
+        assert_eq!(source.requested()[0].0, "obs:42");
+        // OBS takes no commit pin.
+        assert_eq!(source.requested()[0].2, None);
+        assert_eq!(queue.find("default", "obs:42").unwrap().status, "actioned");
+        queue.save(&live_run).unwrap();
+    }
+    {
+        // A second run over the unchanged snapshot requests
+        // nothing.
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = request_changes_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.requested, 0);
+        assert_eq!(report.skipped_unchanged, 1);
+        assert_eq!(source.requested().len(), 1);
+        queue.save(&live_run).unwrap();
+    }
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+    let _ = fs::remove_file(&ruleset_path);
 }

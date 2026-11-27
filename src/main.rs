@@ -25,7 +25,7 @@ use freshcrab::http::{map_obs_credentials_error, UreqClient};
 use freshcrab::queue::{DedupChecks, Queue, QueueEntry};
 use freshcrab::review_queue::{
     classify_records, discover, human_handoff_report, own_sr_ids, post_comments, refresh_signals,
-    ReviewQueue,
+    request_changes, ReviewQueue,
 };
 use freshcrab::watcher::Watcher;
 use freshcrab::worker::{DryRunExecutor, Worker};
@@ -584,6 +584,55 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("review queue comment stage failed: {e}");
+        }
+    }
+
+    // The review queue requests changes (step 6, reject stage):
+    // records whose decided action is `request-changes`, through
+    // geectl's pull-request request-changes call. The stage is off
+    // by default and runs only on its explicit go-ahead
+    // (`review_request_changes_stage`, which needs the comment
+    // stage on); the driver refuses a misordered stage. Like the
+    // comment stage, this runs before the `report_only` return
+    // below: the stage flags gate the queue's actions, while
+    // `report_only` gates filing (the queue files nothing). A
+    // failure is logged loudly and the run continues.
+    match request_changes(
+        &config,
+        &sr_ids,
+        &geectl_http,
+        &review_queue_path,
+        &review_ruleset_path,
+        &dry_run,
+    ) {
+        Ok(report) => {
+            eprintln!(
+                "review queue: changes requested for {} records, {} already requested, {} already changes-requested on the server, {} planned (dry-run), {} skipped, {} failed",
+                report.requested,
+                report.skipped_unchanged,
+                report.skipped_already_requested,
+                report.planned,
+                report.skipped,
+                report.failed
+            );
+            for instance in &report.instances {
+                if let Some(error) = &instance.error {
+                    if instance.skipped {
+                        eprintln!(
+                            "review queue: {} {} skipped: {error}",
+                            instance.alias, instance.backend
+                        );
+                    } else {
+                        eprintln!(
+                            "review queue: {} {} request-changes failed: {error}",
+                            instance.alias, instance.backend
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("review queue request-changes stage failed: {e}");
         }
     }
 

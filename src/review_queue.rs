@@ -88,6 +88,34 @@
 //! quotes text must indent the quote so no quoted line starts
 //! with a trigger).
 //!
+//! Step 6 (this module): the request-changes action (reject
+//! stage). Changes are requested on records whose decided action
+//! is `request-changes`, via geectl's
+//! `PullRequestClient::request_changes` library call — a
+//! review-level act, never the PR-level decline (declining the
+//! request itself stays human-only, and a ruleset `decline`
+//! normalizes to a comment). The binding is re-checked right
+//! before acting: the pull request is re-read and its fresh
+//! binding compared with the recorded one; a mismatch, a missing
+//! binding, a failed re-read, or a no-longer-open request fails
+//! closed and the item is skipped. The review state is re-read
+//! too: changes already requested (by anyone) mean the item is
+//! skipped, never re-requested. Idempotency is the fingerprint
+//! plus the recorded action, like the comment stage. On a Gitea
+//! ref the review is pinned to the fresh head commit (geectl
+//! re-checks the head itself); on OBS no pin is passed (geectl
+//! refuses one). Stage-gated like step 5: off by default, and
+//! the reject stage needs the comment stage on. No shipped
+//! ruleset rule yields `request-changes` yet — the spec's case
+//! (a `%check` change without a reason in a spec comment and a
+//! changelog line) needs diff-text signals the step-2 snapshot
+//! does not capture — so the stage is live-inert until such a
+//! rule exists; the driver is complete and tested, waiting on
+//! the rule. (An OBS source with no pinned rev carries no
+//! revision in the binding, so the re-check compares
+//! repositories only there; the snapshot fingerprint is the
+//! remaining guard.)
+//!
 //! Discovery runs across ALL configured instances: every OBS
 //! instance and every Gitea instance in the geectl config, not just
 //! the default. Instances come from geectl's config file
@@ -127,7 +155,7 @@ use geectl::gitea::GiteaClient;
 use geectl::obs::{BuildResults, CveId, NamedRole, ObsClient, ResultsQuery, OBS_API_BASE};
 use geectl::pull_request::{
     OpinionState, PullRequest, PullRequestBackend, PullRequestClient, PullRequestRef,
-    PullRequestSearch, PullRequestStatus, PullRequestSummary, ReviewComment,
+    PullRequestSearch, PullRequestStatus, PullRequestSummary, ReviewComment, ReviewOpinion,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -1299,6 +1327,22 @@ pub trait PullRequestSource {
     /// List the comments on the pull request, oldest first (step
     /// 5), through geectl's `PullRequestClient::comments`.
     fn comments(&self, reference: &PullRequestRef) -> Result<Vec<ReviewComment>, GeectlError>;
+    /// Request changes on the pull request (step 6), through
+    /// geectl's `PullRequestClient::request_changes`. This is a
+    /// review-level act: on OBS it declines the review asked of
+    /// the acting user, never the request itself — declining the
+    /// request is the PR-level act and stays human-only. `message`
+    /// is the review text; `commit` pins the review to that head
+    /// on a Gitea ref (refused on OBS) and is re-checked against
+    /// the live head inside geectl. Returns the recorded review
+    /// opinion, or `None` in dry-run.
+    fn request_changes(
+        &self,
+        reference: &PullRequestRef,
+        message: Option<&str>,
+        commit: Option<&str>,
+        dry_run: &geectl::obs::DryRun,
+    ) -> Result<Option<ReviewOpinion>, GeectlError>;
 }
 
 impl<'a> PullRequestSource for PullRequestClient<'a> {
@@ -1351,6 +1395,16 @@ impl<'a> PullRequestSource for PullRequestClient<'a> {
 
     fn comments(&self, reference: &PullRequestRef) -> Result<Vec<ReviewComment>, GeectlError> {
         PullRequestClient::comments(self, reference)
+    }
+
+    fn request_changes(
+        &self,
+        reference: &PullRequestRef,
+        message: Option<&str>,
+        commit: Option<&str>,
+        dry_run: &geectl::obs::DryRun,
+    ) -> Result<Option<ReviewOpinion>, GeectlError> {
+        PullRequestClient::request_changes(self, reference, None, message, commit, dry_run)
     }
 }
 
@@ -3816,6 +3870,359 @@ pub fn comment_on(
     report
 }
 
+/// The binding of a freshly read pull request (step 6): the
+/// source and target repositories and their commits — the OBS
+/// source revision when the action pins one, the PR head and
+/// base on Gitea. Compared with the record's stored binding
+/// right before acting.
+fn binding_of(pr: &PullRequest) -> ReviewBinding {
+    ReviewBinding {
+        source_repository: pr.source.repository.clone(),
+        source_commit: pr.source.commit.clone(),
+        target_repository: pr.target.repository.clone(),
+        target_commit: pr.target.commit.clone(),
+    }
+}
+
+/// The outcome of a request-changes run across all instances.
+#[derive(Debug, Default)]
+pub struct RequestChangesReport {
+    pub instances: Vec<RequestChangesInstanceReport>,
+    pub unscannable: Vec<(String, String)>,
+    /// Changes requested.
+    pub requested: usize,
+    /// Items whose request-changes was already recorded for the
+    /// current fingerprint: skipped, never re-requested.
+    pub skipped_unchanged: usize,
+    /// Items whose review state is already changes-requested on
+    /// the server: skipped, never re-requested.
+    pub skipped_already_requested: usize,
+    /// Items that would request changes in dry-run: planned,
+    /// nothing written.
+    pub planned: usize,
+    /// Items skipped for another reason (not actionable, a stale
+    /// verdict, a body the guard refused, a binding mismatch, a
+    /// failed server read): counted, never acted on.
+    pub skipped: usize,
+    /// Items whose request failed.
+    pub failed: usize,
+}
+
+/// The outcome of requesting changes on one instance on one
+/// backend.
+#[derive(Debug, Default)]
+pub struct RequestChangesInstanceReport {
+    pub alias: String,
+    pub url: String,
+    pub backend: String,
+    pub requested: usize,
+    pub skipped_unchanged: usize,
+    pub skipped_already_requested: usize,
+    pub planned: usize,
+    /// Items skipped for another reason (not actionable, a stale
+    /// verdict, a body the guard refused, a binding mismatch, a
+    /// failed server read): counted, never acted on.
+    pub skipped_other: usize,
+    pub failed: usize,
+    /// The request-changes run itself failed (no records acted
+    /// on this arm).
+    pub error: Option<String>,
+    /// The arm was skipped before any request ran (a
+    /// misconfigured credential set).
+    pub skipped: bool,
+}
+
+impl ArmReport for RequestChangesInstanceReport {
+    fn failed(alias: String, url: String, backend: String, error: String, skipped: bool) -> Self {
+        RequestChangesInstanceReport {
+            alias,
+            url,
+            backend,
+            error: Some(error),
+            skipped,
+            ..RequestChangesInstanceReport::default()
+        }
+    }
+
+    fn set_url(&mut self, url: String) {
+        self.url = url;
+    }
+}
+
+impl ArmSummary<RequestChangesInstanceReport> for RequestChangesReport {
+    fn set_unscannable(&mut self, unscannable: Vec<(String, String)>) {
+        self.unscannable = unscannable;
+    }
+
+    fn push_instance(&mut self, report: RequestChangesInstanceReport) {
+        self.instances.push(report);
+    }
+
+    fn accumulate(&mut self, report: &RequestChangesInstanceReport) {
+        self.requested += report.requested;
+        self.skipped_unchanged += report.skipped_unchanged;
+        self.skipped_already_requested += report.skipped_already_requested;
+        self.planned += report.planned;
+        self.skipped += report.skipped_other;
+        self.failed += report.failed;
+    }
+}
+
+/// Request changes (step 6, reject stage): records whose decided
+/// action is `request-changes`, on every scannable instance arm,
+/// through geectl's `PullRequestClient::request_changes`. A
+/// review-level act only: it never declines the request itself.
+/// The stage must be ready (`review_stage_ready`): off runs
+/// nothing, a misordered stage refuses the run. A ruleset that
+/// fails to load refuses the run. In dry-run the run prints what
+/// it would do and writes nothing (no requests, no state file).
+/// A failure on one arm is recorded on that arm and the run
+/// continues with the rest; a failure to enumerate instances or
+/// to open/save the queue is returned to the caller.
+pub fn request_changes(
+    config: &Config,
+    own_sr_ids: &[u64],
+    http: &dyn geectl::http::HttpClient,
+    path: &str,
+    ruleset_path: &str,
+    dry_run: &DryRun,
+) -> Result<RequestChangesReport, ReviewQueueError> {
+    if !review_stage_ready(config, ReviewStage::RequestChanges)? {
+        return Ok(RequestChangesReport::default());
+    }
+    let ruleset = Ruleset::load(ruleset_path)?;
+    let mut queue = ReviewQueue::open(path)?;
+    let scan = enumerate_instances()
+        .map_err(|e| ReviewQueueError(format!("cannot enumerate geectl instances: {e}")))?;
+    request_changes_with_scan(
+        config, own_sr_ids, http, &mut queue, dry_run, scan, &ruleset,
+    )
+}
+
+/// Run the request-changes stage over an already-enumerated
+/// scan, so tests drive the per-arm report construction without
+/// touching the real geectl config or environment.
+fn request_changes_with_scan(
+    config: &Config,
+    own_sr_ids: &[u64],
+    http: &dyn geectl::http::HttpClient,
+    queue: &mut ReviewQueue,
+    dry_run: &DryRun,
+    scan: InstanceScan,
+    ruleset: &Ruleset,
+) -> Result<RequestChangesReport, ReviewQueueError> {
+    run_arms(
+        http,
+        scan,
+        config,
+        own_sr_ids,
+        queue,
+        dry_run,
+        |source, backend, alias, _config, _own_sr_ids, queue, dry_run| {
+            request_changes_on(source, backend, alias, queue, dry_run, ruleset)
+        },
+    )
+}
+
+/// Request changes on the records on one instance arm whose
+/// decided action is `request-changes`. Each record's verdict is
+/// re-derived from its snapshot and the ruleset: a record whose
+/// stored verdict no longer matches the re-derived one is stale
+/// (the ruleset changed since classification) and is skipped,
+/// never acted on. The binding is re-checked right before acting:
+/// the pull request is re-read and its fresh binding compared
+/// with the recorded one — a mismatch, a missing binding, a
+/// failed re-read, or a no-longer-open request fails closed and
+/// the item is skipped. The review state is re-read too: changes
+/// already requested (by anyone) mean the item is skipped, never
+/// re-requested. A re-run acts only on change: a request already
+/// recorded for the current fingerprint is skipped. On a Gitea
+/// ref the review is pinned to the fresh head commit; on OBS no
+/// pin is passed. The review text is the triage comment body,
+/// checked by the same guard as a posted comment.
+pub fn request_changes_on(
+    source: &dyn PullRequestSource,
+    backend: PullRequestBackend,
+    instance_alias: &str,
+    queue: &mut ReviewQueue,
+    dry_run: &DryRun,
+    ruleset: &Ruleset,
+) -> RequestChangesInstanceReport {
+    let mut report = RequestChangesInstanceReport {
+        alias: instance_alias.to_string(),
+        backend: backend.as_str().to_string(),
+        ..RequestChangesInstanceReport::default()
+    };
+    let geectl_dry = geectl::obs::DryRun::new(dry_run.enabled());
+    let targets: Vec<ReviewRecord> = queue
+        .entries()
+        .iter()
+        .filter(|r| {
+            r.instance == instance_alias
+                && r.backend == backend.as_str()
+                && r.status != "terminal"
+                && r.status != "escalated"
+                && r.action.as_deref() == Some("request-changes")
+        })
+        .cloned()
+        .collect();
+    for record in &targets {
+        let Some(stored) = &record.signal_snapshot else {
+            report.skipped_other += 1;
+            continue;
+        };
+        let snapshot: SignalSnapshot = match serde_json::from_value(stored.clone()) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot parse stored signal snapshot for {} on {instance_alias}: {e}; skipping",
+                    record.reference
+                );
+                report.skipped_other += 1;
+                continue;
+            }
+        };
+        let reference: PullRequestRef = match record.reference.parse() {
+            Ok(reference) => reference,
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot parse stored review ref {:?} on {instance_alias}: {e}; skipping",
+                    record.reference
+                );
+                report.skipped_other += 1;
+                continue;
+            }
+        };
+        // Re-derive the verdict: the stored one may be stale.
+        let verdict = classify(ruleset, &snapshot);
+        if verdict.action != "request-changes"
+            || verdict.tier != record.tier
+            || verdict.rule.as_deref() != record.matched_rule.as_deref()
+        {
+            eprintln!(
+                "warning: stored verdict for {} on {instance_alias} no longer matches the ruleset; skipping",
+                record.reference
+            );
+            report.skipped_other += 1;
+            continue;
+        }
+        let body = triage_comment_body(&snapshot, &verdict);
+        if let Err(e) = check_comment_body(&body) {
+            eprintln!(
+                "warning: refusing to request changes on {} on {instance_alias}: {e}",
+                record.reference
+            );
+            report.skipped_other += 1;
+            continue;
+        }
+        let fingerprint = classification_fingerprint(&ruleset.version, &snapshot, &record.binding);
+        if queue.action_recorded(
+            instance_alias,
+            &record.reference,
+            "request-changes",
+            &fingerprint,
+        ) {
+            report.skipped_unchanged += 1;
+            continue;
+        }
+        // No binding recorded: nothing to re-check against —
+        // fail closed, never act unpinned.
+        let Some(stored_binding) = &record.binding else {
+            eprintln!(
+                "warning: no binding recorded for {} on {instance_alias}; skipping (cannot re-check before acting)",
+                record.reference
+            );
+            report.skipped_other += 1;
+            continue;
+        };
+        // Binding re-check, right before acting: re-read the
+        // pull request and compare its fresh binding with the
+        // recorded one.
+        let fresh = match source.show(&reference) {
+            Ok(pr) => pr,
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot re-read {} on {instance_alias}: {e}; skipping (never act unverified)",
+                    record.reference
+                );
+                report.skipped_other += 1;
+                continue;
+            }
+        };
+        if fresh.status != PullRequestStatus::Open {
+            eprintln!(
+                "warning: {} on {instance_alias} is no longer open ({}); skipping",
+                record.reference,
+                fresh.status.as_str()
+            );
+            report.skipped_other += 1;
+            continue;
+        }
+        if binding_of(&fresh) != *stored_binding {
+            eprintln!(
+                "warning: binding for {} on {instance_alias} changed since classification; skipping",
+                record.reference
+            );
+            report.skipped_other += 1;
+            continue;
+        }
+        let fresh_review = review_state(&fresh);
+        if fresh_review.state == "changes_requested" {
+            report.skipped_already_requested += 1;
+            continue;
+        }
+        if fresh_review.state == "unknown" {
+            eprintln!(
+                "warning: cannot read the review state of {} on {instance_alias}; skipping (never act unverified)",
+                record.reference
+            );
+            report.skipped_other += 1;
+            continue;
+        }
+        if !dry_run.allow(&format!(
+            "request changes on {} on {instance_alias}",
+            record.reference
+        )) {
+            report.planned += 1;
+            continue;
+        }
+        // On Gitea the review is pinned to the fresh head commit
+        // (geectl re-checks the head itself); on OBS no pin is
+        // passed — geectl refuses one.
+        let commit = match backend {
+            PullRequestBackend::Obs => None,
+            PullRequestBackend::Gitea => fresh.source.commit.as_deref(),
+        };
+        match source.request_changes(&reference, Some(&body), commit, &geectl_dry) {
+            Ok(Some(opinion)) => {
+                queue.record_action(
+                    instance_alias,
+                    &record.reference,
+                    "request-changes",
+                    &opinion.reviewer,
+                    &fingerprint,
+                );
+                report.requested += 1;
+            }
+            Ok(None) => {
+                eprintln!(
+                    "warning: request changes on {} on {instance_alias} returned no review in live mode; skipping",
+                    record.reference
+                );
+                report.failed += 1;
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot request changes on {} on {instance_alias}: {e}",
+                    record.reference
+                );
+                report.failed += 1;
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3918,6 +4325,11 @@ mod tests {
     /// posted comments land in `posted_comments` with fresh ids,
     /// and `comments_answers` seeds the server-side comments a
     /// `comments` read returns.
+    ///
+    /// A recorded request-changes call (step 6): ref, message,
+    /// commit pin.
+    type RequestedChange = (String, Option<String>, Option<String>);
+
     struct FakeSource {
         search_results: Vec<PullRequestSummary>,
         search_error: Option<GeectlError>,
@@ -3928,6 +4340,9 @@ mod tests {
         comments_answers: Vec<(String, Vec<ReviewComment>)>,
         posted_comments: std::cell::RefCell<Vec<(String, ReviewComment)>>,
         next_comment_id: std::cell::Cell<u64>,
+        /// Request-changes calls, as (ref, message, commit) in
+        /// call order (step 6).
+        requested_changes: std::cell::RefCell<Vec<RequestedChange>>,
     }
 
     impl FakeSource {
@@ -3942,6 +4357,7 @@ mod tests {
                 comments_answers: Vec::new(),
                 posted_comments: std::cell::RefCell::new(Vec::new()),
                 next_comment_id: std::cell::Cell::new(0),
+                requested_changes: std::cell::RefCell::new(Vec::new()),
             }
         }
 
@@ -3987,6 +4403,12 @@ mod tests {
         /// in posting order.
         fn posted(&self) -> Vec<(String, ReviewComment)> {
             self.posted_comments.borrow().clone()
+        }
+
+        /// The request-changes calls this fake served, as (ref,
+        /// message, commit) in call order.
+        fn requested(&self) -> Vec<RequestedChange> {
+            self.requested_changes.borrow().clone()
         }
     }
 
@@ -4108,6 +4530,29 @@ mod tests {
                     .map(|(_, comment)| comment.clone()),
             );
             Ok(comments)
+        }
+
+        fn request_changes(
+            &self,
+            reference: &PullRequestRef,
+            message: Option<&str>,
+            commit: Option<&str>,
+            dry_run: &geectl::obs::DryRun,
+        ) -> Result<Option<ReviewOpinion>, GeectlError> {
+            if dry_run.enabled() {
+                return Ok(None);
+            }
+            self.requested_changes.borrow_mut().push((
+                reference.to_string(),
+                message.map(str::to_string),
+                commit.map(str::to_string),
+            ));
+            Ok(Some(ReviewOpinion {
+                reviewer: "freshcrab".to_string(),
+                state: OpinionState::ChangesRequested,
+                comment: message.unwrap_or_default().to_string(),
+                when: None,
+            }))
         }
     }
 
@@ -6895,6 +7340,361 @@ mod tests {
         assert_eq!(source.posted().len(), 2);
         let record = queue.find("default", "obs:123").unwrap();
         assert_eq!(record.action_history.len(), 2);
+        queue.save(&live_run).unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    // Step 6: request-changes action.
+
+    /// A ruleset whose one rule matches the clean bump snapshot
+    /// and yields `request-changes`: the driver acts on the
+    /// decided action, and the rule exists only so the tests can
+    /// drive it — no shipped rule yields `request-changes` yet.
+    fn test_reject_ruleset() -> Ruleset {
+        Ruleset::load_text(
+            r#"{"version": "9", "rules": [{"name": "test-reject", "when": [{"path": "diff.files", "op": "contains", "value": "foo.spec"}], "action": "request-changes", "message": "The test rule matches.", "question": "Why does the test rule match?"}]}"#,
+        )
+        .unwrap()
+    }
+
+    /// The binding `fake_pr` serves: source home:alice/foo at
+    /// srcmd5, target devel:foo/foo at targetmd5.
+    fn fake_pr_binding() -> ReviewBinding {
+        ReviewBinding {
+            source_repository: "home:alice/foo".to_string(),
+            source_commit: Some("srcmd5".to_string()),
+            target_repository: "devel:foo/foo".to_string(),
+            target_commit: Some("targetmd5".to_string()),
+        }
+    }
+
+    /// A queue file with one record (obs:123) carrying the
+    /// binding `fake_pr` serves, the clean snapshot, and a
+    /// `request-changes` verdict from the test ruleset.
+    fn request_queue(path: &str) {
+        let live_run = live();
+        {
+            let mut queue = ReviewQueue::open(path).unwrap();
+            queue.upsert(ReviewRecord::new(
+                "obs:123",
+                "default",
+                "obs",
+                "bump foo",
+                "someone",
+                Some(fake_pr_binding()),
+            ));
+            queue.set_signal_snapshot(
+                "default",
+                "obs:123",
+                serde_json::to_value(base_snapshot()).unwrap(),
+            );
+            assert!(queue.set_classification(
+                "default",
+                "obs:123",
+                "auto",
+                "request-changes",
+                Some("test-reject"),
+                "9"
+            ));
+            queue.save(&live_run).unwrap();
+        }
+    }
+
+    #[test]
+    fn request_changes_on_posts_once_then_skips() {
+        let path = tmp_path("request-once");
+        let live_run = live();
+        request_queue(&path);
+        let ruleset = test_reject_ruleset();
+        let source = FakeSource::new(vec![]).with_show("obs:123", Ok(obs_pr_with_reviews(vec![])));
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = request_changes_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.requested, 1);
+        let snapshot = base_snapshot();
+        let body = triage_comment_body(&snapshot, &classify(&ruleset, &snapshot));
+        assert_eq!(
+            source.requested(),
+            vec![("obs:123".to_string(), Some(body), None)]
+        );
+        let record = queue.find("default", "obs:123").unwrap();
+        assert_eq!(record.status, "actioned");
+        assert_eq!(record.action_history.len(), 1);
+        assert_eq!(record.action_history[0].action, "request-changes");
+        assert_eq!(record.action_history[0].id, "freshcrab");
+        // A re-run over the unchanged snapshot requests nothing.
+        let report = request_changes_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.requested, 0);
+        assert_eq!(report.skipped_unchanged, 1);
+        assert_eq!(source.requested().len(), 1);
+        queue.save(&live_run).unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn request_changes_on_skips_on_binding_mismatch() {
+        let path = tmp_path("request-binding");
+        let live_run = live();
+        request_queue(&path);
+        let ruleset = test_reject_ruleset();
+        let mut changed = obs_pr_with_reviews(vec![]);
+        changed.source.commit = Some("other-rev".to_string());
+        let source = FakeSource::new(vec![]).with_show("obs:123", Ok(changed));
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = request_changes_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.requested, 0);
+        assert_eq!(report.skipped_other, 1);
+        assert!(source.requested().is_empty());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn request_changes_on_skips_when_already_requested() {
+        let path = tmp_path("request-already");
+        let live_run = live();
+        request_queue(&path);
+        let ruleset = test_reject_ruleset();
+        let pr = obs_pr_with_reviews(vec![review_opinion(
+            "alice",
+            OpinionState::ChangesRequested,
+        )]);
+        let source = FakeSource::new(vec![]).with_show("obs:123", Ok(pr));
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = request_changes_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.requested, 0);
+        assert_eq!(report.skipped_already_requested, 1);
+        assert!(source.requested().is_empty());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn request_changes_on_skips_without_binding() {
+        let path = tmp_path("request-nobinding");
+        let live_run = live();
+        // A record with no binding recorded: the re-check has
+        // nothing to compare against, so the run fails closed
+        // without even reading the server.
+        comment_queue(&path);
+        {
+            let mut queue = ReviewQueue::open(&path).unwrap();
+            assert!(queue.set_classification(
+                "default",
+                "obs:123",
+                "auto",
+                "request-changes",
+                Some("test-reject"),
+                "9"
+            ));
+            queue.save(&live_run).unwrap();
+        }
+        let ruleset = test_reject_ruleset();
+        let source = FakeSource::new(vec![]);
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = request_changes_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.requested, 0);
+        assert_eq!(report.skipped_other, 1);
+        assert!(source.requested().is_empty());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn request_changes_on_skips_when_show_fails() {
+        let path = tmp_path("request-showfail");
+        let live_run = live();
+        request_queue(&path);
+        let ruleset = test_reject_ruleset();
+        let source =
+            FakeSource::new(vec![]).with_show("obs:123", Err(err(ErrorKind::NotFound, "gone")));
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = request_changes_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.requested, 0);
+        assert_eq!(report.skipped_other, 1);
+        assert!(source.requested().is_empty());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn request_changes_on_skips_when_review_state_unknown() {
+        let path = tmp_path("request-unknown-review");
+        let live_run = live();
+        request_queue(&path);
+        let ruleset = test_reject_ruleset();
+        // The re-read succeeds but its reviews sub-read failed,
+        // so the review state is unknown: fail closed instead of
+        // acting without knowing whether changes were already
+        // requested.
+        let mut pr = obs_pr_with_reviews(vec![]);
+        pr.reviews_error = Some("reviews unavailable".to_string());
+        let source = FakeSource::new(vec![]).with_show("obs:123", Ok(pr));
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = request_changes_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.requested, 0);
+        assert_eq!(report.skipped_other, 1);
+        assert!(source.requested().is_empty());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn request_changes_on_dry_run_plans_only() {
+        let path = tmp_path("request-dry");
+        request_queue(&path);
+        let ruleset = test_reject_ruleset();
+        let source = FakeSource::new(vec![]).with_show("obs:123", Ok(obs_pr_with_reviews(vec![])));
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = request_changes_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &dry(),
+            &ruleset,
+        );
+        assert_eq!(report.requested, 0);
+        assert_eq!(report.planned, 1);
+        assert!(source.requested().is_empty());
+        let record = queue.find("default", "obs:123").unwrap();
+        assert!(record.action_history.is_empty());
+        assert_eq!(record.status, "triaged");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn request_changes_on_skips_stale_verdict() {
+        let path = tmp_path("request-stale");
+        let live_run = live();
+        request_queue(&path);
+        // The shipped ruleset re-derives a `comment` verdict for
+        // the clean bump, so the stored `request-changes` verdict
+        // is stale and skipped.
+        let ruleset = shipped_ruleset();
+        let source = FakeSource::new(vec![]).with_show("obs:123", Ok(obs_pr_with_reviews(vec![])));
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = request_changes_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.requested, 0);
+        assert_eq!(report.skipped_other, 1);
+        assert!(source.requested().is_empty());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn request_changes_on_pins_gitea_head() {
+        let path = tmp_path("request-gitea");
+        let live_run = live();
+        let reference = PullRequestRef::Gitea {
+            owner: "someone".to_string(),
+            repo: "foo".to_string(),
+            number: 7,
+        };
+        {
+            let mut queue = ReviewQueue::open(&path).unwrap();
+            queue.upsert(ReviewRecord::new(
+                &reference.to_string(),
+                "default",
+                "gitea",
+                "bump foo",
+                "someone",
+                Some(fake_pr_binding()),
+            ));
+            queue.set_signal_snapshot(
+                "default",
+                &reference.to_string(),
+                serde_json::to_value(base_snapshot()).unwrap(),
+            );
+            assert!(queue.set_classification(
+                "default",
+                &reference.to_string(),
+                "auto",
+                "request-changes",
+                Some("test-reject"),
+                "9"
+            ));
+            queue.save(&live_run).unwrap();
+        }
+        let ruleset = test_reject_ruleset();
+        let pr = fake_pr(
+            reference.clone(),
+            PullRequestStatus::Open,
+            "devel:foo/foo",
+            None,
+        );
+        let source = FakeSource::new(vec![]).with_show(&reference.to_string(), Ok(pr));
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = request_changes_on(
+            &source,
+            PullRequestBackend::Gitea,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.requested, 1);
+        // The review is pinned to the fresh head commit.
+        assert_eq!(source.requested().len(), 1);
+        assert_eq!(source.requested()[0].2, Some("srcmd5".to_string()));
         queue.save(&live_run).unwrap();
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
