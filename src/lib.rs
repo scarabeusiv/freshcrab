@@ -22,6 +22,7 @@ pub mod factory;
 pub mod http;
 pub mod obs_gateway;
 pub mod queue;
+pub mod scope;
 pub mod target;
 pub mod version;
 pub mod watcher;
