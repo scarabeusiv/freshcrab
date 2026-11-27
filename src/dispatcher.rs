@@ -88,7 +88,7 @@ pub struct DispatchReport {
     pub outcomes: Vec<DispatchEntryOutcome>,
 }
 
-/// The dispatcher. Holds the worker (which carries the OBS client),
+/// The dispatcher. Holds the worker (which drives OBS through the gateway),
 /// the config (concurrency, daily SR cap), and the dry-run mode.
 pub struct Dispatcher<'a> {
     worker: &'a Worker<'a>,
@@ -581,8 +581,10 @@ mod tests {
         let dispatcher = Dispatcher::new(&worker, &cfg, &live);
         let err = dispatcher.dispatch(&mut queue).unwrap_err();
         assert!(format!("{err}").contains("authentication rejected"));
-        // bar was never reached: the batch stopped at foo, so both
+        // bar was never reached: the batch stopped at foo — the
+        // open-SR check ran only for foo, never for bar — so both
         // entries are still pending.
+        assert_eq!(gateway.has_open_sr_calls(), vec!["foo".to_string()]);
         assert_eq!(queue.find("foo").unwrap().status, "pending");
         assert_eq!(queue.find("bar").unwrap().status, "pending");
         let _ = fs::remove_file(&path);

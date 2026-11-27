@@ -188,7 +188,7 @@ Leap entries is implemented (`Worker::run_maintenance`); what is
 still missing is the Leap watcher that produces Leap entries, so
 `leap-*` targets remain refused at startup (`main.rs`).
 
- - **Targets** (`src/target.rs`): a `Target` is `Factory` or
+- **Targets** (`src/target.rs`): a `Target` is `Factory` or
   `Leap { version }`, with the OBS project, the update project
   (`15.6` → `openSUSE:Leap:15.6:Update`; 16.0/16.1 have no `:Update`
   project — Leap 16.x is Git-tracked, see `docs/leap-and-cve.md`),
