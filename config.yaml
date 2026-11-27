@@ -54,3 +54,12 @@ dry_run: true
 # report_only: false.
 home_project: ""
 
+# The review-queue stages (steps 5-7 of issue #21). Each stage is
+# off by default and starts only on an explicit go-ahead, in order:
+# comment-only first, then request-changes, then trivial-fix
+# accept. A later stage refuses to run while an earlier one is
+# off. The kill switch pauses every stage.
+review_comment_stage: false
+review_request_changes_stage: false
+review_accept_stage: false
+

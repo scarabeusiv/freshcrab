@@ -24,7 +24,8 @@ use freshcrab::factory::FactoryClient;
 use freshcrab::http::{map_obs_credentials_error, UreqClient};
 use freshcrab::queue::{DedupChecks, Queue, QueueEntry};
 use freshcrab::review_queue::{
-    classify_records, discover, human_handoff_report, own_sr_ids, refresh_signals, ReviewQueue,
+    classify_records, discover, human_handoff_report, own_sr_ids, post_comments, refresh_signals,
+    ReviewQueue,
 };
 use freshcrab::watcher::Watcher;
 use freshcrab::worker::{DryRunExecutor, Worker};
@@ -534,6 +535,55 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("review queue handoff report failed: {e}");
+        }
+    }
+
+    // The review queue posts triage comments (step 5,
+    // comment-only stage): records whose decided action is
+    // `comment`, through geectl's pull-request comment call. The
+    // stage is off by default and runs only on its explicit
+    // go-ahead (`review_comment_stage`); the driver refuses a
+    // misordered stage. Like discovery, refresh, and classify,
+    // this runs before the `report_only` return below: the stage
+    // flags gate the queue's actions, while `report_only` gates
+    // filing (the queue files nothing). A failure is logged
+    // loudly and the run continues.
+    match post_comments(
+        &config,
+        &sr_ids,
+        &geectl_http,
+        &review_queue_path,
+        &review_ruleset_path,
+        &dry_run,
+    ) {
+        Ok(report) => {
+            eprintln!(
+                "review queue: comments posted for {} records, {} already posted, {} adopted from the server, {} planned (dry-run), {} skipped, {} failed",
+                report.posted,
+                report.skipped_unchanged,
+                report.skipped_adopted,
+                report.planned,
+                report.skipped,
+                report.failed
+            );
+            for instance in &report.instances {
+                if let Some(error) = &instance.error {
+                    if instance.skipped {
+                        eprintln!(
+                            "review queue: {} {} skipped: {error}",
+                            instance.alias, instance.backend
+                        );
+                    } else {
+                        eprintln!(
+                            "review queue: {} {} comment failed: {error}",
+                            instance.alias, instance.backend
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("review queue comment stage failed: {e}");
         }
     }
 

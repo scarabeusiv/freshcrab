@@ -67,6 +67,27 @@
 //! question for the human; the human acts through the geectl
 //! `pull-request` CLI or the web UI.
 //!
+//! Step 5 (this module): the comment action (comment-only stage).
+//! Triage comments post on auto-actionable and mid-confidence
+//! items (records whose decided action is `comment`), via
+//! geectl's `PullRequestClient::comment` library call; no
+//! review-state changes. Idempotency: each posted comment is
+//! recorded with the server-side comment id and the fingerprint
+//! of the snapshot it was raised on; a re-run acts only on
+//! change, never double-posts, and adopts a comment already on
+//! the server instead of posting it again. Stage-gated: the
+//! comment-only stage is off by default and starts only on an
+//! explicit go-ahead (`review_comment_stage` in the config); the
+//! kill switch pauses every stage; dry-run prints what it would
+//! do and writes nothing; `report_only` gates filing (the queue
+//! files nothing). A comment body never carries the ruleset
+//! version, and never carries a line starting with `merge ok` or
+//! `@group : approve` (checked before posting, including any
+//! quoted submission text — the body quotes no submission text,
+//! so the check covers the composed lines; a future step that
+//! quotes text must indent the quote so no quoted line starts
+//! with a trigger).
+//!
 //! Discovery runs across ALL configured instances: every OBS
 //! instance and every Gitea instance in the geectl config, not just
 //! the default. Instances come from geectl's config file
@@ -106,7 +127,7 @@ use geectl::gitea::GiteaClient;
 use geectl::obs::{BuildResults, CveId, NamedRole, ObsClient, ResultsQuery, OBS_API_BASE};
 use geectl::pull_request::{
     OpinionState, PullRequest, PullRequestBackend, PullRequestClient, PullRequestRef,
-    PullRequestSearch, PullRequestStatus, PullRequestSummary,
+    PullRequestSearch, PullRequestStatus, PullRequestSummary, ReviewComment,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -172,6 +193,12 @@ pub struct ReviewAction {
     pub id: String,
     /// When the action was recorded (epoch seconds, like `updated_at`).
     pub at: String,
+    /// The fingerprint of the snapshot (and ruleset version) the
+    /// action was raised on (step 5): a re-run posts again only
+    /// when the fingerprint changed. Empty for actions recorded
+    /// before fingerprints existed.
+    #[serde(default)]
+    pub fingerprint: String,
 }
 
 /// The review-record statuses (see the design's Queue state).
@@ -1005,6 +1032,61 @@ impl ReviewQueue {
         }
     }
 
+    /// Record a posted action on the record for (`instance`,
+    /// `reference`) (step 5): the action name (`comment`,
+    /// `request-changes`), the server-side id it produced, and
+    /// the fingerprint of the snapshot it was raised on. The
+    /// record becomes `actioned`. Returns false when no such
+    /// record exists.
+    pub fn record_action(
+        &mut self,
+        instance: &str,
+        reference: &str,
+        action: &str,
+        id: &str,
+        fingerprint: &str,
+    ) -> bool {
+        let now = now_iso();
+        match self
+            .records
+            .iter_mut()
+            .find(|r| r.instance == instance && r.reference == reference)
+        {
+            Some(existing) => {
+                existing.action_history.push(ReviewAction {
+                    action: action.to_string(),
+                    id: id.to_string(),
+                    at: now.clone(),
+                    fingerprint: fingerprint.to_string(),
+                });
+                existing.status = "actioned".to_string();
+                existing.last_checked = now.clone();
+                existing.updated_at = now;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// True when the record for (`instance`, `reference`) already
+    /// carries an action named `action` raised on `fingerprint`
+    /// (step 5): a re-run skips it instead of acting again.
+    /// False when no such record exists.
+    pub fn action_recorded(
+        &self,
+        instance: &str,
+        reference: &str,
+        action: &str,
+        fingerprint: &str,
+    ) -> bool {
+        self.find(instance, reference).is_some_and(|record| {
+            record
+                .action_history
+                .iter()
+                .any(|a| a.action == action && a.fingerprint == fingerprint)
+        })
+    }
+
     /// The records, in file order.
     pub fn entries(&self) -> &[ReviewRecord] {
         &self.records
@@ -1205,6 +1287,18 @@ pub trait PullRequestSource {
     /// The maintainers of `package` in `project`, as `(name, role)`
     /// pairs (persons and groups flattened).
     fn maintainers(&self, project: &str, package: &str) -> Result<Vec<NamedRole>, GeectlError>;
+    /// Post a comment on the pull request (step 5), through
+    /// geectl's `PullRequestClient::comment`. Returns the created
+    /// comment, or `None` in dry-run.
+    fn comment(
+        &self,
+        reference: &PullRequestRef,
+        body: &str,
+        dry_run: &geectl::obs::DryRun,
+    ) -> Result<Option<ReviewComment>, GeectlError>;
+    /// List the comments on the pull request, oldest first (step
+    /// 5), through geectl's `PullRequestClient::comments`.
+    fn comments(&self, reference: &PullRequestRef) -> Result<Vec<ReviewComment>, GeectlError>;
 }
 
 impl<'a> PullRequestSource for PullRequestClient<'a> {
@@ -1244,6 +1338,19 @@ impl<'a> PullRequestSource for PullRequestClient<'a> {
             )
         })?;
         obs.maintainers(project, package)
+    }
+
+    fn comment(
+        &self,
+        reference: &PullRequestRef,
+        body: &str,
+        dry_run: &geectl::obs::DryRun,
+    ) -> Result<Option<ReviewComment>, GeectlError> {
+        PullRequestClient::comment(self, reference, body, None, dry_run)
+    }
+
+    fn comments(&self, reference: &PullRequestRef) -> Result<Vec<ReviewComment>, GeectlError> {
+        PullRequestClient::comments(self, reference)
     }
 }
 
@@ -3284,6 +3391,431 @@ pub fn human_handoff_report(queue_path: &str) -> Result<Vec<HumanHandoffItem>, R
         .collect())
 }
 
+/// A review-queue action stage (steps 5-7): comment-only, then
+/// request-changes, then trivial-fix accept. Each stage starts
+/// only on an explicit go-ahead, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewStage {
+    Comment,
+    RequestChanges,
+    Accept,
+}
+
+impl ReviewStage {
+    /// The stage's name, as the config key spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ReviewStage::Comment => "comment",
+            ReviewStage::RequestChanges => "request-changes",
+            ReviewStage::Accept => "accept",
+        }
+    }
+}
+
+/// True when a review stage is ready to run: its config flag is
+/// on, and the stage before it is on too (stages start in order:
+/// comment, then request-changes, then accept). Off is the
+/// normal state, not an error: it returns `Ok(false)` and the
+/// caller runs nothing. A later stage on while an earlier one is
+/// off is a misconfiguration: it refuses the run with an error.
+/// The kill switch is the caller's gate (main returns before the
+/// stages); the stage flags are the per-stage go-ahead.
+pub fn review_stage_ready(config: &Config, stage: ReviewStage) -> Result<bool, ReviewQueueError> {
+    let (on, earlier_on, earlier) = match stage {
+        ReviewStage::Comment => (config.review_comment_stage, true, ""),
+        ReviewStage::RequestChanges => (
+            config.review_request_changes_stage,
+            config.review_comment_stage,
+            "comment",
+        ),
+        ReviewStage::Accept => (
+            config.review_accept_stage,
+            config.review_request_changes_stage,
+            "request-changes",
+        ),
+    };
+    if !on {
+        return Ok(false);
+    }
+    if !earlier_on {
+        return Err(ReviewQueueError(format!(
+            "review {} stage is on but the {earlier} stage is off: stages start in order (comment, then request-changes, then accept); switch the {earlier} stage on first",
+            stage.name()
+        )));
+    }
+    Ok(true)
+}
+
+/// The triage comment body for one snapshot (step 5): the tier,
+/// the matching rule, the finding, and one line per signal. The
+/// body never carries the ruleset version, and it quotes no
+/// submission text — the signals are summarized, never pasted —
+/// so no quoted line can start with an approval trigger;
+/// `check_comment_body` still verifies the composed lines before
+/// posting.
+pub fn triage_comment_body(snapshot: &SignalSnapshot, verdict: &Classification) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!(
+        "freshcrab triage: {} — {}: {}",
+        verdict.tier,
+        verdict.rule.as_deref().unwrap_or("unclassified"),
+        verdict.reason
+    ));
+    lines.push(format!(
+        "build: {} (target: {})",
+        snapshot.build.status, snapshot.build.target_status
+    ));
+    lines.push(format!("review: {}", snapshot.review.state));
+    let diff = if snapshot.diff.version_bump_only {
+        "version bump only".to_string()
+    } else if snapshot.diff.spec_changed {
+        format!("spec changed, {} file(s)", snapshot.diff.files.len())
+    } else {
+        format!("{} file(s)", snapshot.diff.files.len())
+    };
+    let changelog = if snapshot.diff.changelog_changed {
+        ", changelog updated"
+    } else {
+        ""
+    };
+    let version = snapshot
+        .diff
+        .new_version
+        .as_deref()
+        .map_or_else(String::new, |v| format!(", version {v}"));
+    lines.push(format!("diff: {diff}{changelog}{version}"));
+    let author = match (
+        snapshot.author.is_own_filing,
+        snapshot.author.is_package_maintainer,
+    ) {
+        (Some(true), _) => format!("{} (freshcrab's own filing)", snapshot.author.author),
+        (_, Some(true)) => format!("{} (package maintainer)", snapshot.author.author),
+        _ => snapshot.author.author.clone(),
+    };
+    lines.push(format!("author: {author}"));
+    let package = if snapshot.package.is_security == Some(true) {
+        format!("{} (security update)", snapshot.package.package)
+    } else if snapshot.package.is_excluded == Some(true) {
+        format!("{} (excluded)", snapshot.package.package)
+    } else {
+        snapshot.package.package.clone()
+    };
+    lines.push(format!("package: {package}"));
+    let server = if snapshot.server.draft {
+        "draft".to_string()
+    } else {
+        snapshot.server.status.clone()
+    };
+    lines.push(format!("server: {server}"));
+    lines.join("\n")
+}
+
+/// Refuse a comment body carrying a line that would read as an
+/// approval on the server: a line starting with `merge ok` or
+/// `@group : approve` (case-insensitive, after leading
+/// whitespace — the server may trim the line before matching).
+/// The check runs before posting, on the composed body.
+pub fn check_comment_body(body: &str) -> Result<(), ReviewQueueError> {
+    for line in body.lines() {
+        let trimmed = line.trim_start().to_lowercase();
+        if trimmed.starts_with("merge ok") || trimmed.starts_with("@group : approve") {
+            return Err(ReviewQueueError(format!(
+                "refusing to post a comment carrying a line starting with {line:?}: it would read as an approval"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The outcome of a comment run across all instances.
+#[derive(Debug, Default)]
+pub struct CommentReport {
+    pub instances: Vec<CommentInstanceReport>,
+    pub unscannable: Vec<(String, String)>,
+    /// Comments posted.
+    pub posted: usize,
+    /// Items whose comment was already recorded for the current
+    /// fingerprint: skipped, never double-posted.
+    pub skipped_unchanged: usize,
+    /// Items whose comment was already on the server: adopted
+    /// into the action history, not posted again.
+    pub skipped_adopted: usize,
+    /// Items that would post in dry-run: planned, nothing written.
+    pub planned: usize,
+    /// Items skipped for another reason (not actionable, a stale
+    /// verdict, a body the guard refused, a failed server read):
+    /// counted, never posted.
+    pub skipped: usize,
+    /// Items whose post failed.
+    pub failed: usize,
+}
+
+/// The outcome of commenting on one instance on one backend.
+#[derive(Debug, Default)]
+pub struct CommentInstanceReport {
+    pub alias: String,
+    pub url: String,
+    pub backend: String,
+    pub posted: usize,
+    pub skipped_unchanged: usize,
+    pub skipped_adopted: usize,
+    pub planned: usize,
+    /// Items skipped for another reason (not actionable, a stale
+    /// verdict, a body the guard refused, a failed server read):
+    /// counted, never posted.
+    pub skipped_other: usize,
+    pub failed: usize,
+    /// The comment run itself failed (no records commented on
+    /// this arm).
+    pub error: Option<String>,
+    /// The arm was skipped before any comment ran (a misconfigured
+    /// credential set).
+    pub skipped: bool,
+}
+
+impl ArmReport for CommentInstanceReport {
+    fn failed(alias: String, url: String, backend: String, error: String, skipped: bool) -> Self {
+        CommentInstanceReport {
+            alias,
+            url,
+            backend,
+            error: Some(error),
+            skipped,
+            ..CommentInstanceReport::default()
+        }
+    }
+
+    fn set_url(&mut self, url: String) {
+        self.url = url;
+    }
+}
+
+impl ArmSummary<CommentInstanceReport> for CommentReport {
+    fn set_unscannable(&mut self, unscannable: Vec<(String, String)>) {
+        self.unscannable = unscannable;
+    }
+
+    fn push_instance(&mut self, report: CommentInstanceReport) {
+        self.instances.push(report);
+    }
+
+    fn accumulate(&mut self, report: &CommentInstanceReport) {
+        self.posted += report.posted;
+        self.skipped_unchanged += report.skipped_unchanged;
+        self.skipped_adopted += report.skipped_adopted;
+        self.planned += report.planned;
+        self.skipped += report.skipped_other;
+        self.failed += report.failed;
+    }
+}
+
+/// Post triage comments (step 5, comment-only stage): records
+/// whose decided action is `comment`, on every scannable
+/// instance arm, through geectl's `PullRequestClient::comment`.
+/// No review-state changes. The stage must be ready
+/// (`review_stage_ready`): off runs nothing, a misordered stage
+/// refuses the run. A ruleset that fails to load refuses the run.
+/// In dry-run the run prints what it would do and writes nothing
+/// (no posts, no state file). A failure on one arm is recorded on
+/// that arm and the run continues with the rest; a failure to
+/// enumerate instances or to open/save the queue is returned to
+/// the caller.
+pub fn post_comments(
+    config: &Config,
+    own_sr_ids: &[u64],
+    http: &dyn geectl::http::HttpClient,
+    path: &str,
+    ruleset_path: &str,
+    dry_run: &DryRun,
+) -> Result<CommentReport, ReviewQueueError> {
+    if !review_stage_ready(config, ReviewStage::Comment)? {
+        return Ok(CommentReport::default());
+    }
+    let ruleset = Ruleset::load(ruleset_path)?;
+    let mut queue = ReviewQueue::open(path)?;
+    let scan = enumerate_instances()
+        .map_err(|e| ReviewQueueError(format!("cannot enumerate geectl instances: {e}")))?;
+    post_comments_with_scan(
+        config, own_sr_ids, http, &mut queue, dry_run, scan, &ruleset,
+    )
+}
+
+/// Run the comment stage over an already-enumerated scan, so
+/// tests drive the per-arm report construction without touching
+/// the real geectl config or environment.
+fn post_comments_with_scan(
+    config: &Config,
+    own_sr_ids: &[u64],
+    http: &dyn geectl::http::HttpClient,
+    queue: &mut ReviewQueue,
+    dry_run: &DryRun,
+    scan: InstanceScan,
+    ruleset: &Ruleset,
+) -> Result<CommentReport, ReviewQueueError> {
+    run_arms(
+        http,
+        scan,
+        config,
+        own_sr_ids,
+        queue,
+        dry_run,
+        |source, backend, alias, _config, _own_sr_ids, queue, dry_run| {
+            comment_on(source, backend, alias, queue, dry_run, ruleset)
+        },
+    )
+}
+
+/// Post triage comments for the records on one instance arm whose
+/// decided action is `comment`. Each record's verdict is
+/// re-derived from its snapshot and the ruleset: a record whose
+/// stored verdict no longer matches the re-derived one is stale
+/// (the ruleset changed since classification) and is skipped,
+/// never acted on. A re-run acts only on change: a comment
+/// already recorded for the current fingerprint is skipped, and
+/// a comment already on the server is adopted into the action
+/// history instead of posted again. A failed server read fails
+/// closed: the item is skipped, never posted blind.
+pub fn comment_on(
+    source: &dyn PullRequestSource,
+    backend: PullRequestBackend,
+    instance_alias: &str,
+    queue: &mut ReviewQueue,
+    dry_run: &DryRun,
+    ruleset: &Ruleset,
+) -> CommentInstanceReport {
+    let mut report = CommentInstanceReport {
+        alias: instance_alias.to_string(),
+        backend: backend.as_str().to_string(),
+        ..CommentInstanceReport::default()
+    };
+    let geectl_dry = geectl::obs::DryRun::new(dry_run.enabled());
+    let targets: Vec<ReviewRecord> = queue
+        .entries()
+        .iter()
+        .filter(|r| {
+            r.instance == instance_alias
+                && r.backend == backend.as_str()
+                && r.status != "terminal"
+                && r.status != "escalated"
+                && r.action.as_deref() == Some("comment")
+        })
+        .cloned()
+        .collect();
+    for record in &targets {
+        let Some(stored) = &record.signal_snapshot else {
+            report.skipped_other += 1;
+            continue;
+        };
+        let snapshot: SignalSnapshot = match serde_json::from_value(stored.clone()) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot parse stored signal snapshot for {} on {instance_alias}: {e}; skipping",
+                    record.reference
+                );
+                report.skipped_other += 1;
+                continue;
+            }
+        };
+        let reference: PullRequestRef = match record.reference.parse() {
+            Ok(reference) => reference,
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot parse stored review ref {:?} on {instance_alias}: {e}; skipping",
+                    record.reference
+                );
+                report.skipped_other += 1;
+                continue;
+            }
+        };
+        // Re-derive the verdict: the stored one may be stale.
+        let verdict = classify(ruleset, &snapshot);
+        if verdict.action != "comment"
+            || verdict.tier != record.tier
+            || verdict.rule.as_deref() != record.matched_rule.as_deref()
+        {
+            eprintln!(
+                "warning: stored verdict for {} on {instance_alias} no longer matches the ruleset; skipping",
+                record.reference
+            );
+            report.skipped_other += 1;
+            continue;
+        }
+        let body = triage_comment_body(&snapshot, &verdict);
+        if let Err(e) = check_comment_body(&body) {
+            eprintln!(
+                "warning: refusing to comment on {} on {instance_alias}: {e}",
+                record.reference
+            );
+            report.skipped_other += 1;
+            continue;
+        }
+        let fingerprint = classification_fingerprint(&ruleset.version, &snapshot, &record.binding);
+        if queue.action_recorded(instance_alias, &record.reference, "comment", &fingerprint) {
+            report.skipped_unchanged += 1;
+            continue;
+        }
+        let server_comments = match source.comments(&reference) {
+            Ok(comments) => comments,
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot list comments on {} on {instance_alias}: {e}; skipping (never post blind)",
+                    record.reference
+                );
+                report.skipped_other += 1;
+                continue;
+            }
+        };
+        if let Some(existing) = server_comments.iter().find(|c| c.body == body) {
+            // Already on the server: adopt it into the action
+            // history with its server-side id, never post again.
+            queue.record_action(
+                instance_alias,
+                &record.reference,
+                "comment",
+                &existing.id.to_string(),
+                &fingerprint,
+            );
+            report.skipped_adopted += 1;
+            continue;
+        }
+        if !dry_run.allow(&format!(
+            "comment on {} on {instance_alias}",
+            record.reference
+        )) {
+            report.planned += 1;
+            continue;
+        }
+        match source.comment(&reference, &body, &geectl_dry) {
+            Ok(Some(comment)) => {
+                queue.record_action(
+                    instance_alias,
+                    &record.reference,
+                    "comment",
+                    &comment.id.to_string(),
+                    &fingerprint,
+                );
+                report.posted += 1;
+            }
+            Ok(None) => {
+                eprintln!(
+                    "warning: comment on {} on {instance_alias} returned no comment in live mode; skipping",
+                    record.reference
+                );
+                report.failed += 1;
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot comment on {} on {instance_alias}: {e}",
+                    record.reference
+                );
+                report.failed += 1;
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3381,7 +3913,11 @@ mod tests {
 
     /// A fake pull-request source: canned search results and canned
     /// show, diff, build, and maintainer answers (an error is canned
-    /// by listing the ref in the matching answers with its kind).
+    /// by listing the ref in the matching answers with its kind),
+    /// plus a recording comment store for the act methods (step 5):
+    /// posted comments land in `posted_comments` with fresh ids,
+    /// and `comments_answers` seeds the server-side comments a
+    /// `comments` read returns.
     struct FakeSource {
         search_results: Vec<PullRequestSummary>,
         search_error: Option<GeectlError>,
@@ -3389,6 +3925,9 @@ mod tests {
         diff_answers: Vec<(String, Result<String, GeectlError>)>,
         build_answers: Vec<(String, Result<BuildResults, GeectlError>)>,
         maintainers_answers: Vec<(String, Result<Vec<NamedRole>, GeectlError>)>,
+        comments_answers: Vec<(String, Vec<ReviewComment>)>,
+        posted_comments: std::cell::RefCell<Vec<(String, ReviewComment)>>,
+        next_comment_id: std::cell::Cell<u64>,
     }
 
     impl FakeSource {
@@ -3400,6 +3939,9 @@ mod tests {
                 diff_answers: Vec::new(),
                 build_answers: Vec::new(),
                 maintainers_answers: Vec::new(),
+                comments_answers: Vec::new(),
+                posted_comments: std::cell::RefCell::new(Vec::new()),
+                next_comment_id: std::cell::Cell::new(0),
             }
         }
 
@@ -3433,6 +3975,18 @@ mod tests {
             self.maintainers_answers
                 .push((format!("{project}/{package}"), answer));
             self
+        }
+
+        fn with_comments(mut self, reference: &str, comments: Vec<ReviewComment>) -> Self {
+            self.comments_answers
+                .push((reference.to_string(), comments));
+            self
+        }
+
+        /// The comments this fake posted, as (ref, comment) pairs,
+        /// in posting order.
+        fn posted(&self) -> Vec<(String, ReviewComment)> {
+            self.posted_comments.borrow().clone()
         }
     }
 
@@ -3509,6 +4063,51 @@ mod tests {
                 ErrorKind::NotFound,
                 format!("fake source has no maintainers answer for {key}"),
             ))
+        }
+
+        fn comment(
+            &self,
+            reference: &PullRequestRef,
+            body: &str,
+            dry_run: &geectl::obs::DryRun,
+        ) -> Result<Option<ReviewComment>, GeectlError> {
+            if dry_run.enabled() {
+                return Ok(None);
+            }
+            let id = self.next_comment_id.get() + 1;
+            self.next_comment_id.set(id);
+            let comment = ReviewComment {
+                id,
+                author: "freshcrab".to_string(),
+                created: "0".to_string(),
+                body: body.to_string(),
+                parent_id: None,
+                diff_target: None,
+                diff_file: None,
+                diff_line: None,
+            };
+            self.posted_comments
+                .borrow_mut()
+                .push((reference.to_string(), comment.clone()));
+            Ok(Some(comment))
+        }
+
+        fn comments(&self, reference: &PullRequestRef) -> Result<Vec<ReviewComment>, GeectlError> {
+            let key = reference.to_string();
+            let mut comments: Vec<ReviewComment> = self
+                .comments_answers
+                .iter()
+                .find(|(stored, _)| *stored == key)
+                .map(|(_, comments)| comments.clone())
+                .unwrap_or_default();
+            comments.extend(
+                self.posted_comments
+                    .borrow()
+                    .iter()
+                    .filter(|(stored, _)| *stored == key)
+                    .map(|(_, comment)| comment.clone()),
+            );
+            Ok(comments)
         }
     }
 
@@ -6025,6 +6624,278 @@ mod tests {
         // The clean record still classifies; the decided one stays
         // terminal and is never re-escalated.
         assert_eq!(report.classified, 1);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    // Step 5: comment action.
+
+    #[test]
+    fn review_stage_ready_off_on_misordered() {
+        let mut config = Config::default();
+        assert!(!review_stage_ready(&config, ReviewStage::Comment).unwrap());
+        config.review_comment_stage = true;
+        assert!(review_stage_ready(&config, ReviewStage::Comment).unwrap());
+        assert!(!review_stage_ready(&config, ReviewStage::RequestChanges).unwrap());
+        config.review_request_changes_stage = true;
+        assert!(review_stage_ready(&config, ReviewStage::RequestChanges).unwrap());
+        // Accept on while request-changes is off: refused.
+        config.review_request_changes_stage = false;
+        config.review_accept_stage = true;
+        assert!(review_stage_ready(&config, ReviewStage::Accept).is_err());
+        // Request-changes on while comment is off: refused the
+        // other way (a later stage needs the earlier one on).
+        config.review_request_changes_stage = true;
+        config.review_comment_stage = false;
+        assert!(review_stage_ready(&config, ReviewStage::RequestChanges).is_err());
+    }
+
+    #[test]
+    fn triage_comment_body_has_no_ruleset_version() {
+        let ruleset = shipped_ruleset();
+        let snapshot = base_snapshot();
+        let verdict = classify(&ruleset, &snapshot);
+        let body = triage_comment_body(&snapshot, &verdict);
+        assert!(body.contains("freshcrab triage: auto — clean-bump"));
+        assert!(body.contains("Version bump only"));
+        assert!(body.contains("build: all_green"));
+        assert!(body.contains("review: none"));
+        assert!(body.contains("diff: version bump only, changelog updated, version 2.0"));
+        assert!(body.contains("author: someone (package maintainer)"));
+        assert!(body.contains("package: foo"));
+        assert!(body.contains("server: open"));
+        assert!(!body.contains("ruleset"));
+        assert!(check_comment_body(&body).is_ok());
+    }
+
+    #[test]
+    fn check_comment_body_refuses_approval_lines() {
+        assert!(check_comment_body("freshcrab triage: auto\nbuild: all_green").is_ok());
+        // Only a line START carries the trigger: mid-line is fine.
+        assert!(check_comment_body("the note says merge ok mid-line").is_ok());
+        assert!(check_comment_body("merge ok, ship it").is_err());
+        assert!(check_comment_body("  merge ok, ship it").is_err());
+        assert!(check_comment_body("Merge OK, ship it").is_err());
+        assert!(check_comment_body("@group : approve").is_err());
+        assert!(check_comment_body("  @group : approve this").is_err());
+        assert!(check_comment_body("first line\n@group : approve").is_err());
+    }
+
+    #[test]
+    fn record_action_marks_actioned() {
+        let path = tmp_path("record-action");
+        let live_run = live();
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        queue.upsert(ReviewRecord::new(
+            "obs:123", "default", "obs", "bump foo", "someone", None,
+        ));
+        assert!(queue.record_action("default", "obs:123", "comment", "7", "fp1"));
+        let record = queue.find("default", "obs:123").unwrap();
+        assert_eq!(record.status, "actioned");
+        assert_eq!(record.action_history.len(), 1);
+        assert_eq!(record.action_history[0].action, "comment");
+        assert_eq!(record.action_history[0].id, "7");
+        assert_eq!(record.action_history[0].fingerprint, "fp1");
+        assert!(queue.action_recorded("default", "obs:123", "comment", "fp1"));
+        assert!(!queue.action_recorded("default", "obs:123", "comment", "fp2"));
+        assert!(!queue.action_recorded("default", "obs:123", "request-changes", "fp1"));
+        assert!(!queue.record_action("default", "obs:999", "comment", "7", "fp1"));
+        assert!(!queue.action_recorded("default", "obs:999", "comment", "fp1"));
+        queue.save(&live_run).unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    /// A queue file with one clean record (obs:123), snapshot
+    /// recorded and classified, for the step-5 comment tests.
+    fn comment_queue(path: &str) {
+        let live_run = live();
+        {
+            let mut queue = ReviewQueue::open(path).unwrap();
+            queue.upsert(ReviewRecord::new(
+                "obs:123", "default", "obs", "bump foo", "someone", None,
+            ));
+            queue.set_signal_snapshot(
+                "default",
+                "obs:123",
+                serde_json::to_value(base_snapshot()).unwrap(),
+            );
+            queue.save(&live_run).unwrap();
+        }
+        classify_records("review_ruleset.json", path, &live_run).unwrap();
+    }
+
+    #[test]
+    fn comment_on_posts_once_then_skips() {
+        let path = tmp_path("comment-once");
+        let live_run = live();
+        comment_queue(&path);
+        let ruleset = shipped_ruleset();
+        let source = FakeSource::new(vec![]);
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = comment_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.posted, 1);
+        assert_eq!(source.posted().len(), 1);
+        let record = queue.find("default", "obs:123").unwrap();
+        assert_eq!(record.status, "actioned");
+        assert_eq!(record.action_history.len(), 1);
+        assert_eq!(record.action_history[0].action, "comment");
+        assert_eq!(record.action_history[0].id, "1");
+        // A re-run over the unchanged snapshot posts nothing.
+        let report = comment_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.posted, 0);
+        assert_eq!(report.skipped_unchanged, 1);
+        assert_eq!(source.posted().len(), 1);
+        queue.save(&live_run).unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn comment_on_adopts_server_comment() {
+        let path = tmp_path("comment-adopt");
+        let live_run = live();
+        comment_queue(&path);
+        let ruleset = shipped_ruleset();
+        let snapshot = base_snapshot();
+        let verdict = classify(&ruleset, &snapshot);
+        let body = triage_comment_body(&snapshot, &verdict);
+        let server_comment = ReviewComment {
+            id: 99,
+            author: "freshcrab".to_string(),
+            created: "0".to_string(),
+            body,
+            parent_id: None,
+            diff_target: None,
+            diff_file: None,
+            diff_line: None,
+        };
+        let source = FakeSource::new(vec![]).with_comments("obs:123", vec![server_comment]);
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = comment_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.posted, 0);
+        assert_eq!(report.skipped_adopted, 1);
+        assert!(source.posted().is_empty());
+        let record = queue.find("default", "obs:123").unwrap();
+        assert_eq!(record.action_history.len(), 1);
+        assert_eq!(record.action_history[0].id, "99");
+        queue.save(&live_run).unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn comment_on_dry_run_plans_only() {
+        let path = tmp_path("comment-dry");
+        comment_queue(&path);
+        let ruleset = shipped_ruleset();
+        let source = FakeSource::new(vec![]);
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = comment_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &dry(),
+            &ruleset,
+        );
+        assert_eq!(report.posted, 0);
+        assert_eq!(report.planned, 1);
+        assert!(source.posted().is_empty());
+        let record = queue.find("default", "obs:123").unwrap();
+        assert!(record.action_history.is_empty());
+        assert_eq!(record.status, "triaged");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn comment_on_skips_stale_verdict() {
+        let path = tmp_path("comment-stale");
+        let live_run = live();
+        comment_queue(&path);
+        // A different ruleset re-derives a different verdict (an
+        // empty ruleset: everything falls through to human), so
+        // the stored `comment` verdict is stale and skipped.
+        let ruleset = Ruleset::load_text(r#"{"version": "2", "rules": []}"#).unwrap();
+        let source = FakeSource::new(vec![]);
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = comment_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.posted, 0);
+        assert_eq!(report.skipped_other, 1);
+        assert!(source.posted().is_empty());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn comment_on_reposts_on_change() {
+        let path = tmp_path("comment-change");
+        let live_run = live();
+        comment_queue(&path);
+        let ruleset = shipped_ruleset();
+        let source = FakeSource::new(vec![]);
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = comment_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.posted, 1);
+        // The review lands (approved): the verdict is still a
+        // clean bump, but the snapshot — and the comment body —
+        // changed, so the run posts again.
+        let mut approved = base_snapshot();
+        approved.review.state = "approved".to_string();
+        queue.set_signal_snapshot(
+            "default",
+            "obs:123",
+            serde_json::to_value(approved).unwrap(),
+        );
+        let report = comment_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.posted, 1);
+        assert_eq!(source.posted().len(), 2);
+        let record = queue.find("default", "obs:123").unwrap();
+        assert_eq!(record.action_history.len(), 2);
+        queue.save(&live_run).unwrap();
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }

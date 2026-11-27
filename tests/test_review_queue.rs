@@ -4,13 +4,16 @@
 use freshcrab::config::Config;
 use freshcrab::dry_run::DryRun;
 use freshcrab::queue::{QueueEntry, UpdateKind};
-use freshcrab::review_queue::{discover_on, own_sr_ids, ReviewQueue, ReviewRecord};
+use freshcrab::review_queue::{
+    classify_records, comment_on, discover_on, own_sr_ids, ReviewQueue, ReviewRecord, Ruleset,
+};
 use freshcrab::target::Target;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::pull_request::{
     PullRequest, PullRequestBackend, PullRequestEndpoint, PullRequestRef, PullRequestSearch,
-    PullRequestStatus, PullRequestSummary,
+    PullRequestStatus, PullRequestSummary, ReviewComment,
 };
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -51,6 +54,8 @@ fn test_config() -> Config {
 struct FakeSource {
     search_results: Vec<PullRequestSummary>,
     show_answers: Vec<(String, Result<PullRequest, GeectlError>)>,
+    posted_comments: RefCell<Vec<(String, ReviewComment)>>,
+    next_comment_id: Cell<u64>,
 }
 
 impl FakeSource {
@@ -58,12 +63,20 @@ impl FakeSource {
         FakeSource {
             search_results,
             show_answers: Vec::new(),
+            posted_comments: RefCell::new(Vec::new()),
+            next_comment_id: Cell::new(0),
         }
     }
 
     fn with_show(mut self, reference: &str, answer: PullRequest) -> Self {
         self.show_answers.push((reference.to_string(), Ok(answer)));
         self
+    }
+
+    /// The comments this fake posted, as (ref, comment) pairs,
+    /// in posting order.
+    fn posted(&self) -> Vec<(String, ReviewComment)> {
+        self.posted_comments.borrow().clone()
     }
 }
 
@@ -115,6 +128,44 @@ impl freshcrab::review_queue::PullRequestSource for FakeSource {
             ErrorKind::NotFound,
             format!("fake source has no maintainers answer for {project}/{package}"),
         ))
+    }
+
+    fn comment(
+        &self,
+        reference: &PullRequestRef,
+        body: &str,
+        dry_run: &geectl::obs::DryRun,
+    ) -> Result<Option<ReviewComment>, GeectlError> {
+        if dry_run.enabled() {
+            return Ok(None);
+        }
+        let id = self.next_comment_id.get() + 1;
+        self.next_comment_id.set(id);
+        let comment = ReviewComment {
+            id,
+            author: "freshcrab".to_string(),
+            created: "0".to_string(),
+            body: body.to_string(),
+            parent_id: None,
+            diff_target: None,
+            diff_file: None,
+            diff_line: None,
+        };
+        self.posted_comments
+            .borrow_mut()
+            .push((reference.to_string(), comment.clone()));
+        Ok(Some(comment))
+    }
+
+    fn comments(&self, reference: &PullRequestRef) -> Result<Vec<ReviewComment>, GeectlError> {
+        let key = reference.to_string();
+        Ok(self
+            .posted_comments
+            .borrow()
+            .iter()
+            .filter(|(stored, _)| *stored == key)
+            .map(|(_, comment)| comment.clone())
+            .collect())
     }
 }
 
@@ -293,6 +344,78 @@ fn records_from_two_instances_do_not_collide() {
         "obs:1", "staging", "obs", "one", "a", None
     )));
     assert_eq!(queue.entries().len(), 2);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}.lock"));
+}
+
+#[test]
+fn comment_stage_posts_once_across_runs() {
+    let path = tmp_path("comment");
+    let live_run = live();
+    {
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        queue.upsert(ReviewRecord::new(
+            "obs:42", "default", "obs", "bump foo", "someone", None,
+        ));
+        // A clean all-green bump snapshot, as JSON: the readers
+        // are covered by the unit tests; this test drives the
+        // classify-then-comment path end to end.
+        let snapshot = serde_json::json!({
+            "read_at": "0",
+            "build": {"status": "all_green", "cells": [], "target_status": "all_green"},
+            "review": {"state": "none", "reviews": []},
+            "diff": {
+                "files": ["foo.spec", "foo.changes"],
+                "spec_changed": true,
+                "version_bump_only": true,
+                "patches_changed": false,
+                "new_files": [],
+                "changelog_changed": true,
+                "new_version": "2.0",
+                "cve_ids": []
+            },
+            "author": {"author": "someone", "is_own_filing": false, "is_package_maintainer": true},
+            "package": {"package": "foo", "is_excluded": false, "is_security": false, "cve_ids": []},
+            "server": {"status": "open", "draft": false, "mergeable": null},
+            "read_errors": []
+        });
+        queue.set_signal_snapshot("default", "obs:42", snapshot);
+        queue.save(&live_run).unwrap();
+    }
+    classify_records("review_ruleset.json", &path, &live_run).unwrap();
+    let ruleset = Ruleset::load("review_ruleset.json").unwrap();
+    let source = FakeSource::new(vec![]);
+    {
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = comment_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.posted, 1);
+        assert_eq!(source.posted().len(), 1);
+        assert_eq!(queue.find("default", "obs:42").unwrap().status, "actioned");
+        queue.save(&live_run).unwrap();
+    }
+    {
+        // A second run over the unchanged snapshot posts nothing.
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        let report = comment_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &mut queue,
+            &live_run,
+            &ruleset,
+        );
+        assert_eq!(report.posted, 0);
+        assert_eq!(report.skipped_unchanged, 1);
+        assert_eq!(source.posted().len(), 1);
+        queue.save(&live_run).unwrap();
+    }
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(format!("{path}.lock"));
 }
