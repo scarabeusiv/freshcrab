@@ -136,6 +136,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         [arg] if arg.starts_with('-') => Err(format!(
             "unexpected argument '{arg}'; expected at most one output directory"
         )),
+        [arg] if arg.is_empty() => Err("output directory must not be empty".to_string()),
         [arg] => Ok(Args::Run(PathBuf::from(arg))),
         _ => Err("expected at most one argument: the output directory".to_string()),
     }
@@ -240,6 +241,12 @@ mod tests {
         assert!(parse_args(&["--nope".to_string()]).is_err());
         let err = parse_args(&["out".to_string(), "extra".to_string()]).unwrap_err();
         assert!(err.contains("at most one"));
+    }
+
+    #[test]
+    fn parse_args_rejects_empty_output_directory() {
+        let err = parse_args(&["".to_string()]).unwrap_err();
+        assert!(err.contains("must not be empty"));
     }
 
     #[test]

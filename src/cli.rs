@@ -19,15 +19,16 @@ use clap::{CommandFactory, Parser};
         and prints the decision for each candidate, and the dispatcher logs the would-do \
         plan and the exact SR payload and files nothing. All plan output goes to stderr, \
         so stdout stays machine-readable JSON. Report-only mode gates \
-        only the dispatcher: the watcher still enqueues, and in live \
-        mode the queue state file is still written."
+        only the dispatcher: the watcher still runs and produces its \
+        entries; in live mode it enqueues and the queue state file is \
+        still written."
 )]
 pub struct Cli {
     /// path to config.yaml
     #[arg(long, value_name = "path", default_value = "config.yaml")]
     pub config: String,
 
-    /// check only these packages (overrides the config list)
+    /// check only these packages (overrides the config list). Repeated use accumulates.
     #[arg(long, value_name = "pkg", num_args = 1..)]
     pub packages: Option<Vec<String>>,
 
@@ -136,6 +137,12 @@ mod tests {
     fn repeated_dry_run_idempotent() {
         let cli = Cli::try_parse_from(["freshcrab", "--dry-run", "--dry-run"]).unwrap();
         assert!(cli.dry_run);
+    }
+
+    #[test]
+    fn repeated_live_idempotent() {
+        let cli = Cli::try_parse_from(["freshcrab", "--live", "--live"]).unwrap();
+        assert!(cli.live);
     }
 
     #[test]

@@ -16,7 +16,7 @@ _freshcrab() {
     local context curcontext="$curcontext" state line
     _arguments "${_arguments_options[@]}" : \
 '--config=[path to config.yaml]:path:_default' \
-'*--packages=[check only these packages (overrides the config list)]:pkg:_default' \
+'*--packages=[check only these packages (overrides the config list). Repeated use accumulates]:pkg:_default' \
 '--queue=[path to the queue state file]:path:_default' \
 '(--live)--dry-run[force dry-run mode (default)]' \
 '(--dry-run)--live[force live mode (writes the queue; overrides config and env)]' \
