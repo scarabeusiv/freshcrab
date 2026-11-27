@@ -49,10 +49,10 @@ pub const BROKEN_DURATION_SECS: u64 = BROKEN_DURATION_DAYS * 24 * 60 * 60;
 
 /// How many job-history entries to read per repository when dating
 /// the last success. The entries are the newest ones, returned
-/// oldest-first; the sustained check is order-independent (max last
-/// success, min oldest entry), so the order does not matter. A window
-/// that reaches back past the threshold with no success proves no
-/// success in the threshold.
+/// newest-first; the sustained check reads the first success as the
+/// last success and the last dated entry as the oldest. A window that
+/// reaches back past the threshold with no success proves no success
+/// in the threshold.
 const JOB_HISTORY_LIMIT: u32 = 200;
 
 /// A build code that means the package failed to build.
@@ -223,31 +223,36 @@ pub fn request_integrated_package(req: &Request, project: &str, package: &str) -
 /// True when the job history proves no success in the threshold
 /// before `now_unix`: the last success (when there is one) predates
 /// the threshold, or the window reaches back past the threshold with
-/// no success at all. An empty history, a success with no usable
-/// time, or a window that does not reach back past the threshold
-/// proves nothing: false (fail-closed). The boundary is exclusive: a
-/// success exactly at the 90-day cutoff counts as in the threshold
-/// (not sustained).
+/// no success at all. An empty history, the newest success with no
+/// usable time, or a window that does not reach back past the
+/// threshold proves nothing: false (fail-closed). The boundary is
+/// exclusive: a success exactly at the 90-day cutoff counts as in
+/// the threshold (not sustained).
 pub fn sustained_broken(entries: &[JobHistoryEntry], now_unix: u64) -> bool {
     let cutoff = now_unix.saturating_sub(BROKEN_DURATION_SECS);
-    let mut last_success: Option<u64> = None;
-    for entry in entries.iter().filter(|e| is_success_code(&e.code)) {
-        let Some(t) = entry.endtime.or(entry.starttime).or(entry.readytime) else {
-            // A success with no usable time cannot be dated: the
-            // duration is unproven.
-            return false;
-        };
-        last_success = Some(last_success.map_or(t, |m| m.max(t)));
-    }
+    // Entries are newest-first: the first success is the last success.
+    let last_success: Option<u64> = match entries.iter().find(|e| is_success_code(&e.code)) {
+        Some(entry) => {
+            let Some(t) = entry.endtime.or(entry.starttime).or(entry.readytime) else {
+                // The newest success has no usable time: the last
+                // success cannot be dated, so the duration is unproven.
+                return false;
+            };
+            Some(t)
+        }
+        None => None,
+    };
     match last_success {
         Some(t) => t < cutoff,
         None => {
             // No success in the window: sustained only when the
-            // window reaches back past the cutoff.
+            // window reaches back past the cutoff. Entries are
+            // newest-first, so the oldest dated entry is the last
+            // dated one in the list.
             match entries
                 .iter()
-                .filter_map(|e| e.endtime.or(e.starttime).or(e.readytime))
-                .min()
+                .rev()
+                .find_map(|e| e.endtime.or(e.starttime).or(e.readytime))
             {
                 Some(oldest) => oldest < cutoff,
                 None => false,
@@ -881,6 +886,63 @@ mod tests {
         assert!(!sustained_broken(&[], now));
         // An undated success: unproven.
         assert!(!sustained_broken(&[job("succeeded", None)], now));
+    }
+
+    #[test]
+    fn sustained_broken_reads_newest_first() {
+        let now = 1_800_000_000u64;
+        let cutoff = now - BROKEN_DURATION_SECS;
+        // Newest-first: the newest success is inside the threshold
+        // and an older success is past it. The last success is the
+        // newest one, so the break is not sustained.
+        let newest_first = vec![
+            job("succeeded", Some(cutoff + 100)),
+            job("succeeded", Some(cutoff - 100)),
+            job("failed", Some(cutoff - 200)),
+        ];
+        assert!(!sustained_broken(&newest_first, now));
+        // The same entries in oldest-first order: the first success
+        // the function reads is the old one, past the cutoff, so it
+        // reports sustained — the wrong answer for data that is
+        // actually oldest-first. This pins the newest-first
+        // assumption: the function must not accept either order.
+        let oldest_first = vec![
+            job("failed", Some(cutoff - 200)),
+            job("succeeded", Some(cutoff - 100)),
+            job("succeeded", Some(cutoff + 100)),
+        ];
+        assert!(sustained_broken(&oldest_first, now));
+        // Failures-only: the last dated entry is the oldest.
+        // Newest-first, the window reaches past the cutoff;
+        // oldest-first, the function reads the last dated entry
+        // (the newest) as the oldest and the window does not reach.
+        let newest_first_failures = vec![
+            job("failed", Some(cutoff + 100)),
+            job("failed", Some(cutoff - 100)),
+        ];
+        assert!(sustained_broken(&newest_first_failures, now));
+        let oldest_first_failures = vec![
+            job("failed", Some(cutoff - 100)),
+            job("failed", Some(cutoff + 100)),
+        ];
+        assert!(!sustained_broken(&oldest_first_failures, now));
+        // An older undated success does not veto a dated newest
+        // success: the last success is the newest one.
+        assert!(sustained_broken(
+            &[job("succeeded", Some(cutoff - 100)), job("succeeded", None),],
+            now
+        ));
+        // An undated oldest entry does not defeat the no-success
+        // proof: an earlier entry past the cutoff already proves the
+        // window reaches back.
+        assert!(sustained_broken(
+            &[
+                job("failed", Some(cutoff + 100)),
+                job("failed", Some(cutoff - 100)),
+                job("failed", None),
+            ],
+            now
+        ));
     }
 
     #[test]
