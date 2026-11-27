@@ -682,10 +682,7 @@ mod tests {
         // reason on the entry instead of only printing it.
         let mut queue = Queue::open(&path).unwrap();
         let mut gateway = gateway_for("foo", "1.9", false);
-        gateway.devel_version = Err(GeectlError::new(
-            ErrorKind::NetworkError,
-            "transport error",
-        ));
+        gateway.devel_version = Err(GeectlError::new(ErrorKind::NetworkError, "transport error"));
         let executor = DryRunExecutor;
         let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
@@ -736,10 +733,7 @@ mod tests {
         // — escalate fail-closed.
         let mut queue = Queue::open(&path).unwrap();
         let mut gateway = gateway_for("foo", "1.9", false);
-        gateway.has_open_sr = Err(GeectlError::new(
-            ErrorKind::NetworkError,
-            "transport error",
-        ));
+        gateway.has_open_sr = Err(GeectlError::new(ErrorKind::NetworkError, "transport error"));
         let executor = DryRunExecutor;
         let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
@@ -851,10 +845,7 @@ mod tests {
         // the entry is not marked done and carries no SR id.
         let mut queue = Queue::open(&path).unwrap();
         let mut gateway = gateway_for("foo", "1.9", false);
-        gateway.file_submit = Err(GeectlError::new(
-            ErrorKind::NetworkError,
-            "transport error",
-        ));
+        gateway.file_submit = Err(GeectlError::new(ErrorKind::NetworkError, "transport error"));
         let executor = CompletedExecutor;
         let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
@@ -894,10 +885,7 @@ mod tests {
         // entry escalates fail-closed before anything is filed.
         let mut queue = Queue::open(&path).unwrap();
         let mut gateway = FakeObsGateway::new();
-        gateway.devel_project = Err(GeectlError::new(
-            ErrorKind::NetworkError,
-            "transport error",
-        ));
+        gateway.devel_project = Err(GeectlError::new(ErrorKind::NetworkError, "transport error"));
         let executor = DryRunExecutor;
         let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &live);
         let cfg = config(4, 20);
