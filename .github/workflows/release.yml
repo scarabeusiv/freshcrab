@@ -178,11 +178,12 @@ jobs:
           version="$PACKAGE_VERSION"
           target="${{ matrix.target }}"
           stage="dist-$target"
-          mkdir -p "$stage"
+          mkdir -p "$stage/man"
           cp "target/$target/release/freshcrab" "$stage/"
           cp LICENSE README.md "$stage/"
+          cp man/*.1 "$stage/man/"
           out="freshcrab-${version}-${target}.tar.gz"
-          tar -czf "$out" -C "$stage" freshcrab LICENSE README.md
+          tar -czf "$out" -C "$stage" freshcrab LICENSE README.md man
           shasum -a 256 "$out" > "$out.sha256"
           echo "asset=$out" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -441,13 +442,13 @@ jobs:
           # Stage only the version surfaces: the bump script ran
           # third-party build code (cargo), and anything else it touched
           # must fail the job rather than ride along in a version-bump PR.
-          git add Cargo.toml Cargo.lock
-          # Exactly the two version surfaces, staged as modifications,
+          git add Cargo.toml Cargo.lock man/freshcrab.1
+          # Exactly the three version surfaces, staged as modifications,
           # may be present — nothing else. The old `^[AMD] ` filter let
           # staged adds/deletes through; renames (`R` lines) fell
           # outside its vocabulary too (failing closed, noisily). An
           # exact allowlist fails closed on any of those.
-          stray=$(git status --porcelain=v1 | grep -v '^M  Cargo\.toml$' | grep -v '^M  Cargo\.lock$' || true)
+          stray=$(git status --porcelain=v1 | grep -v '^M  Cargo\.toml$' | grep -v '^M  Cargo\.lock$' | grep -v '^M  man/freshcrab\.1$' || true)
           if [ -n "$stray" ]; then
             echo "::error::the bump changed files outside the version surfaces:" >&2
             echo "$stray" >&2

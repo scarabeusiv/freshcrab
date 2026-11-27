@@ -3,15 +3,17 @@
 #
 # Usage: scripts/bump-version.sh X.Y.Z
 #
-# Freshcrab is a single crate, so the version surfaces are exactly two:
-# the [package] version in Cargo.toml and the freshcrab entry in
-# Cargo.lock. A repo-wide grep for the current version confirms nothing
-# else carries it (README.md and docs/ hold no version string; the two
-# exclusions in the check below cite the pinned geectl dependency's
-# version, not this repo's), so there are no doc sentences or generated
-# files to rewrite — unlike rpmcrab's script, there is no `make gen` and
-# no version-consistency gate to run afterwards; the script ends with its
-# own consistency check instead.
+# Freshcrab is a single crate, so the version surfaces are exactly three:
+# the [package] version in Cargo.toml, the freshcrab entry in
+# Cargo.lock, and the man pages under man/, which stamp the version in
+# their `.TH` header. A repo-wide grep for the current version confirms
+# nothing else carries it (README.md and docs/ hold no version string;
+# the check below excludes the two bumped manifests, `:!Cargo.lock`
+# and `:!Cargo.toml`, whose other version strings are dependency
+# versions, not this repo's), so there are no doc sentences to rewrite
+# — the script rewrites the two manifest surfaces and regenerates the
+# pages, then verifies the result, so a half-applied bump fails here
+# rather than riding along in a version-bump PR.
 set -euo pipefail
 
 # No leading zeros: Cargo rejects them, and only after the tree is edited.
@@ -34,7 +36,7 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 # One EXIT cleanup for the whole script: it removes every tempfile
-# the script creates and, on any nonzero exit, restores the two
+# the script creates and, on any nonzero exit, restores the three
 # version surfaces. EXIT (not ERR) is what makes explicit `exit 1`
 # validation failures restore too — ERR never fires for an explicit
 # exit, so a post-edit drift/mismatch/stale failure would leave a
@@ -43,15 +45,22 @@ fi
 # to restore.
 subst_tmp=""
 stale_tmp=""
+gen_tmp=""
 cleanup() {
   local rc=$?
   if [ -n "$subst_tmp" ]; then rm -f "$subst_tmp"; fi
   if [ -n "$stale_tmp" ]; then rm -f "$stale_tmp"; fi
+  if [ -n "$gen_tmp" ]; then rm -rf "$gen_tmp"; fi
   if [ "$rc" -ne 0 ]; then
     # One file at a time: a single checkout naming a surface that is
     # not in the index (no Cargo.lock yet, say) restores neither.
     git checkout -- Cargo.toml 2>/dev/null || true
     git checkout -- Cargo.lock 2>/dev/null || true
+    # The regenerated pages are restored the same way. The tree was
+    # clean at entry (see the precondition above), so any untracked
+    # file under man/ was created by this run and is removed with it.
+    git checkout -- man/ 2>/dev/null || true
+    git clean -f man/ 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -119,8 +128,27 @@ if [ "$toml_diff" != "$(printf '1\t1')" ] || [ "$lock_diff" != "$(printf '1\t1')
   exit 1
 fi
 
-# Verify both surfaces carry the new version, and that no other
-# tracked file still carries the old one.
+# The man pages stamp the version in their `.TH` header, so they are
+# a version surface too — regenerated, never edited: the generator is
+# the single source of truth for their content (the assets-drift job
+# fails if the committed pages differ from a fresh generation).
+# Generate into a temp dir and copy only the pages over; the
+# completions carry no version string and stay untouched. This runs
+# after the manifest edits, so the generator builds against the new
+# version.
+gen_tmp=$(mktemp -d)
+cargo run --locked --quiet --features gen --bin freshcrab-gen -- "$gen_tmp"
+cp "$gen_tmp"/man/*.1 man/
+# Prune pages the generator no longer produces, mirroring the
+# generator pruning of stale pages: a removed command leaves no orphan
+# page behind.
+for page in man/*.1; do
+  [ -f "$gen_tmp/man/$(basename "$page")" ] || rm -f "$page"
+done
+
+# Verify the two manifest surfaces carry the new version, and that no
+# other tracked file still carries the old one. The man pages are
+# covered by the stale-version grep below, not by this check.
 manifest=$(manifest_version Cargo.toml)
 locked=$(sed -n '/^[[:space:]]*name[[:space:]]*=[[:space:]]*"freshcrab"/,/^[[:space:]]*version[[:space:]]*=/s/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.lock | head -1)
 if [ "$manifest" != "$new" ] || [ "$locked" != "$new" ]; then

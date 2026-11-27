@@ -42,4 +42,9 @@ jobs:
           # the CI failure on the qualified form). The allow is
           # therefore per-package, not per-licence; that is accepted
           # because the action is CI-only and never linked.
-          allow-dependencies-licenses: 'pkg:githubactions/Swatinem/rust-cache'
+          # r-efi is MIT OR Apache-2.0 OR LGPL-2.1-or-later: usable
+          # under MIT or Apache-2.0, so the LGPL arm never binds — but
+          # the action's matcher trips on it anyway. It arrives only as
+          # a dev-dependency (tempfile via rustix, test code only) and is
+          # never linked into the shipped binary.
+          allow-dependencies-licenses: 'pkg:githubactions/Swatinem/rust-cache, pkg:cargo/r-efi'

@@ -13,6 +13,7 @@
 //! to the devel project (dry-run by default: the plan and the exact SR
 //! payload are logged, nothing is filed).
 
+pub mod cli;
 pub mod collectors;
 pub mod config;
 pub mod cve;
