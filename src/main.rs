@@ -23,6 +23,10 @@ use freshcrab::dry_run::resolve as resolve_dry_run;
 use freshcrab::factory::FactoryClient;
 use freshcrab::http::{map_obs_credentials_error, UreqClient};
 use freshcrab::queue::{DedupChecks, Queue, QueueEntry};
+use freshcrab::review_queue::{
+    classify_records, discover, human_handoff_report, own_sr_ids, post_comments, refresh_signals,
+    request_changes, ReviewQueue,
+};
 use freshcrab::watcher::Watcher;
 use freshcrab::worker::{DryRunExecutor, Worker};
 use geectl::auth::Credentials;
@@ -30,10 +34,19 @@ use geectl::error::{ErrorKind, GeectlError};
 use std::process::ExitCode;
 
 fn print_usage() {
-    eprintln!("Usage: freshcrab [--config <path>] [--packages <pkg>...] [--queue <path>] [--dry-run | --live]");
+    eprintln!("Usage: freshcrab [--config <path>] [--packages <pkg>...] [--queue <path>] [--review-queue <path>] [--review-ruleset <path>] [--dry-run | --live]");
     eprintln!("  --config <path>     path to config.yaml (default: config.yaml)");
     eprintln!("  --packages <pkg>... check only these packages (overrides the config list)");
     eprintln!("  --queue <path>      path to the queue state file (default: queue.json)");
+    eprintln!(
+        "  --review-queue <path> path to the review queue state file (default: review_queue.json)"
+    );
+    eprintln!(
+        "  --review-ruleset <path> path to the review ruleset file (default: review_ruleset.json)"
+    );
+    eprintln!(
+        "  --review-decide <instance> <ref> <decision> record a human decision (approved | declined | dismissed) on a review item and exit"
+    );
     eprintln!("  --dry-run           force dry-run mode (default)");
     eprintln!("  --live              force live mode (writes the queue; overrides config and env)");
     eprintln!(
@@ -51,6 +64,9 @@ fn main() -> ExitCode {
     let mut config_path = "config.yaml".to_string();
     let mut packages: Option<Vec<String>> = None;
     let mut queue_path = "queue.json".to_string();
+    let mut review_queue_path = "review_queue.json".to_string();
+    let mut review_ruleset_path = "review_ruleset.json".to_string();
+    let mut review_decide: Option<(String, String, String)> = None;
     let mut cli_dry_run: Option<bool> = None;
 
     let mut args = std::env::args().skip(1);
@@ -72,6 +88,37 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            "--review-queue" => match args.next() {
+                Some(path) => review_queue_path = path,
+                None => {
+                    eprintln!("--review-queue needs a path");
+                    print_usage();
+                    return ExitCode::from(2);
+                }
+            },
+            "--review-ruleset" => match args.next() {
+                Some(path) => review_ruleset_path = path,
+                None => {
+                    eprintln!("--review-ruleset needs a path");
+                    print_usage();
+                    return ExitCode::from(2);
+                }
+            },
+            "--review-decide" => {
+                let instance = args.next();
+                let reference = args.next();
+                let decision = args.next();
+                match (instance, reference, decision) {
+                    (Some(instance), Some(reference), Some(decision)) => {
+                        review_decide = Some((instance, reference, decision));
+                    }
+                    _ => {
+                        eprintln!("--review-decide needs <instance> <ref> <decision>");
+                        print_usage();
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--dry-run" => {
                 if cli_dry_run == Some(false) {
                     eprintln!("--dry-run and --live conflict; pass only one");
@@ -140,6 +187,44 @@ fn main() -> ExitCode {
         }
     };
     dry_run.log_mode();
+
+    // A human decision on a review item (--review-decide): record
+    // it on the queue record and exit. This is an operator action
+    // on local state, not a pipeline stage, so it runs before the
+    // kill switch: a paused pipeline must not block recording what
+    // a human decided.
+    if let Some((instance, reference, decision)) = &review_decide {
+        match ReviewQueue::open(&review_queue_path) {
+            Ok(mut queue) => match queue.record_human_decision(instance, reference, decision) {
+                Ok(true) => {
+                    if let Err(e) = queue.save(&dry_run) {
+                        eprintln!("{e}");
+                        return ExitCode::from(1);
+                    }
+                    if dry_run.enabled() {
+                        eprintln!(
+                            "would record human decision {decision} on {reference} ({instance})"
+                        );
+                    } else {
+                        eprintln!("recorded human decision {decision} on {reference} ({instance})");
+                    }
+                    return ExitCode::from(0);
+                }
+                Ok(false) => {
+                    eprintln!("no review record for {reference} on {instance}");
+                    return ExitCode::from(1);
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            },
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
 
     if config.kill_switch {
         // The human message goes to stderr; stdout stays valid JSON
@@ -310,6 +395,245 @@ fn main() -> ExitCode {
     if let Err(e) = queue.save(&dry_run) {
         eprintln!("{e}");
         return ExitCode::from(1);
+    }
+
+    // The review queue discovers submissions across all configured
+    // instances on every run (report-only: it reads and records,
+    // posts nothing). It runs after the update queue is saved, so
+    // the sr_ids it matches freshcrab's own filings against are
+    // current. The review queue reads through geectl's pull-request
+    // surface with geectl's own credentials (GEECTL_*), not the
+    // update pipeline's OSC_* pair. A discovery failure is logged
+    // loudly and the run continues: the review queue is sidecar
+    // state, and a corrupt review queue or a malformed geectl
+    // config must not break the update pipeline or its stdout JSON.
+    let sr_ids = own_sr_ids(queue.entries());
+    match discover(&config, &sr_ids, &geectl_http, &review_queue_path, &dry_run) {
+        Ok(report) => {
+            let scanned = report.instances.iter().filter(|i| !i.skipped).count();
+            eprintln!(
+                "review queue: {scanned} instance arm(s) scanned, {} discovered, {} new, {} updated, {} terminal, {} unresolved",
+                report.discovered,
+                report.new_records,
+                report.updated_records,
+                report.terminal_marked,
+                report.unresolved
+            );
+            for (alias, reason) in &report.unscannable {
+                eprintln!("review queue: instance {alias} unscannable: {reason}");
+            }
+            for instance in &report.instances {
+                if let Some(error) = &instance.error {
+                    if instance.skipped {
+                        eprintln!(
+                            "review queue: {} {} skipped: {error}",
+                            instance.alias, instance.backend
+                        );
+                    } else {
+                        eprintln!(
+                            "review queue: {} {} search failed: {error}",
+                            instance.alias, instance.backend
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("review queue discovery failed: {e}");
+        }
+    }
+
+    // The review queue reads the signal snapshot for every
+    // non-terminal record on every run (step 2, report-only: it
+    // reads and records, posts nothing). It runs after discovery,
+    // so the records it refreshes are current. A refresh failure
+    // is logged loudly and the run continues, like discovery: the
+    // review queue is sidecar state and must not break the update
+    // pipeline or its stdout JSON.
+    match refresh_signals(&config, &sr_ids, &geectl_http, &review_queue_path, &dry_run) {
+        Ok(report) => {
+            eprintln!(
+                "review queue: signals refreshed for {} records, {} with failed reads",
+                report.refreshed, report.failed
+            );
+            for instance in &report.instances {
+                if let Some(error) = &instance.error {
+                    if instance.skipped {
+                        eprintln!(
+                            "review queue: {} {} skipped: {error}",
+                            instance.alias, instance.backend
+                        );
+                    } else {
+                        eprintln!(
+                            "review queue: {} {} refresh failed: {error}",
+                            instance.alias, instance.backend
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("review queue signal refresh failed: {e}");
+        }
+    }
+
+    // The review queue classifies every snapshot against the
+    // ruleset (step 3, report-only: it records the tier and the
+    // decided action; it posts nothing). It runs after the signal
+    // refresh, so the snapshots it classifies are current. A
+    // ruleset that fails to load refuses the run: the failure is
+    // logged loudly and the run classifies nothing (the
+    // classification is skipped, not defaulted). Like discovery
+    // and refresh, a classification failure is sidecar state and
+    // must not break the update pipeline or its stdout JSON.
+    match classify_records(&review_ruleset_path, &review_queue_path, &dry_run) {
+        Ok(report) => {
+            eprintln!(
+                "review queue: classified {} records ({} auto, {} mid, {} human; {} skipped: {} terminal, {} escalated, {} without snapshot, {} no longer open)",
+                report.classified,
+                report.auto,
+                report.mid,
+                report.human,
+                report.skipped_terminal
+                    + report.skipped_escalated
+                    + report.skipped_no_snapshot
+                    + report.skipped_not_open,
+                report.skipped_terminal,
+                report.skipped_escalated,
+                report.skipped_no_snapshot,
+                report.skipped_not_open
+            );
+        }
+        Err(e) => {
+            eprintln!("review queue classification failed: {e}");
+        }
+    }
+
+    // The human handoff (step 4): each run lists the human-tier
+    // items with ref, tier, signal snapshot, ruleset version, and
+    // the exact question for the human. The report is the handoff;
+    // the human acts through the geectl `pull-request` CLI or the
+    // web UI. A failure to read the handoff is logged loudly and
+    // the run continues.
+    match human_handoff_report(&review_queue_path) {
+        Ok(items) => {
+            for item in &items {
+                let snapshot = item.signal_snapshot.as_ref().map_or_else(
+                    || "no snapshot".to_string(),
+                    |snapshot| snapshot.to_string(),
+                );
+                eprintln!(
+                    "review queue: human tier: {} {} tier={} ruleset={} question: {} snapshot: {}",
+                    item.instance,
+                    item.reference,
+                    item.tier,
+                    item.ruleset_version.as_deref().unwrap_or("none"),
+                    item.question,
+                    snapshot
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("review queue handoff report failed: {e}");
+        }
+    }
+
+    // The review queue posts triage comments (step 5,
+    // comment-only stage): records whose decided action is
+    // `comment`, through geectl's pull-request comment call. The
+    // stage is off by default and runs only on its explicit
+    // go-ahead (`review_comment_stage`); the driver refuses a
+    // misordered stage. Like discovery, refresh, and classify,
+    // this runs before the `report_only` return below: the stage
+    // flags gate the queue's actions, while `report_only` gates
+    // filing (the queue files nothing). A failure is logged
+    // loudly and the run continues.
+    match post_comments(
+        &config,
+        &sr_ids,
+        &geectl_http,
+        &review_queue_path,
+        &review_ruleset_path,
+        &dry_run,
+    ) {
+        Ok(report) => {
+            eprintln!(
+                "review queue: comments posted for {} records, {} already posted, {} adopted from the server, {} planned (dry-run), {} skipped, {} failed",
+                report.posted,
+                report.skipped_unchanged,
+                report.skipped_adopted,
+                report.planned,
+                report.skipped,
+                report.failed
+            );
+            for instance in &report.instances {
+                if let Some(error) = &instance.error {
+                    if instance.skipped {
+                        eprintln!(
+                            "review queue: {} {} skipped: {error}",
+                            instance.alias, instance.backend
+                        );
+                    } else {
+                        eprintln!(
+                            "review queue: {} {} comment failed: {error}",
+                            instance.alias, instance.backend
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("review queue comment stage failed: {e}");
+        }
+    }
+
+    // The review queue requests changes (step 6, reject stage):
+    // records whose decided action is `request-changes`, through
+    // geectl's pull-request request-changes call. The stage is off
+    // by default and runs only on its explicit go-ahead
+    // (`review_request_changes_stage`, which needs the comment
+    // stage on); the driver refuses a misordered stage. Like the
+    // comment stage, this runs before the `report_only` return
+    // below: the stage flags gate the queue's actions, while
+    // `report_only` gates filing (the queue files nothing). A
+    // failure is logged loudly and the run continues.
+    match request_changes(
+        &config,
+        &sr_ids,
+        &geectl_http,
+        &review_queue_path,
+        &review_ruleset_path,
+        &dry_run,
+    ) {
+        Ok(report) => {
+            eprintln!(
+                "review queue: changes requested for {} records, {} already requested, {} already changes-requested on the server, {} planned (dry-run), {} skipped, {} failed",
+                report.requested,
+                report.skipped_unchanged,
+                report.skipped_already_requested,
+                report.planned,
+                report.skipped,
+                report.failed
+            );
+            for instance in &report.instances {
+                if let Some(error) = &instance.error {
+                    if instance.skipped {
+                        eprintln!(
+                            "review queue: {} {} skipped: {error}",
+                            instance.alias, instance.backend
+                        );
+                    } else {
+                        eprintln!(
+                            "review queue: {} {} request-changes failed: {error}",
+                            instance.alias, instance.backend
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("review queue request-changes stage failed: {e}");
+        }
     }
 
     // Report-only gates the dispatcher only: the watcher above has

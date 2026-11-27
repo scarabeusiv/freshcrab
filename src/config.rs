@@ -45,6 +45,9 @@ const KNOWN_KEYS: &[&str] = &[
     "report_only",
     "dry_run",
     "home_project",
+    "review_comment_stage",
+    "review_request_changes_stage",
+    "review_accept_stage",
 ];
 
 /// Validated configuration.
@@ -77,6 +80,15 @@ pub struct Config {
     /// branch project to build an SR payload; without it, live filing
     /// escalates and dry-run planning notes the gap.
     pub home_project: String,
+    /// The review-queue stages (steps 5-7). Each stage is off by
+    /// default and starts only on an explicit go-ahead: the
+    /// comment-only stage first, then request-changes (which needs
+    /// the comment stage on), then trivial-fix accept (which needs
+    /// the request-changes stage on). The kill switch pauses every
+    /// stage. Default: all false.
+    pub review_comment_stage: bool,
+    pub review_request_changes_stage: bool,
+    pub review_accept_stage: bool,
 }
 
 impl Default for Config {
@@ -91,6 +103,9 @@ impl Default for Config {
             report_only: true,
             dry_run: true,
             home_project: String::new(),
+            review_comment_stage: false,
+            review_request_changes_stage: false,
+            review_accept_stage: false,
         }
     }
 }
@@ -356,6 +371,9 @@ fn validate(map: HashMap<String, Value>) -> Result<Config, ConfigError> {
         report_only: require_bool(&map, "report_only", true)?,
         dry_run: require_bool(&map, "dry_run", true)?,
         home_project: validate_home_project(require_string(&map, "home_project")?)?,
+        review_comment_stage: require_bool(&map, "review_comment_stage", false)?,
+        review_request_changes_stage: require_bool(&map, "review_request_changes_stage", false)?,
+        review_accept_stage: require_bool(&map, "review_accept_stage", false)?,
     })
 }
 
@@ -488,6 +506,22 @@ mod tests {
     #[test]
     fn kill_switch_must_be_bool() {
         assert!(load_config_text("kill_switch: yes\n").is_err());
+    }
+
+    #[test]
+    fn review_stages_default_off() {
+        let cfg = load_config_text("").unwrap();
+        assert!(!cfg.review_comment_stage);
+        assert!(!cfg.review_request_changes_stage);
+        assert!(!cfg.review_accept_stage);
+        let cfg = load_config_text(
+            "review_comment_stage: true\nreview_request_changes_stage: true\nreview_accept_stage: true\n",
+        )
+        .unwrap();
+        assert!(cfg.review_comment_stage);
+        assert!(cfg.review_request_changes_stage);
+        assert!(cfg.review_accept_stage);
+        assert!(load_config_text("review_comment_stage: yes\n").is_err());
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod dry_run;
 pub mod factory;
 pub mod http;
 pub mod queue;
+pub mod review_queue;
 pub mod target;
 pub mod version;
 pub mod watcher;
