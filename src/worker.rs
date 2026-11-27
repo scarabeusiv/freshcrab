@@ -15,13 +15,14 @@
 //!    must name its CVE; see `docs/leap-and-cve.md`),
 //! 5. builds the [`SrPayload`](geectl::obs::SrPayload) for the submission,
 //! 6. executes the update steps through the [`UpdateExecutor`], and
-//! 7. files the SR through [`SrFiling`](geectl::obs::SrFiling).
+//! 7. files the SR through the [`ObsGateway`](crate::obs_gateway::ObsGateway)
+//!    (geectl's `SrFiling` behind it).
 //!
 //! A Leap entry takes a different path (`Worker::run_maintenance`):
 //! the maintained instances are listed, the incident payload is
 //! built from the matching instance, and the maintenance incident
-//! is filed through `SrFiling::file_maintenance_incident` instead
-//! of a submit request. There is no devel project, no
+//! is filed through the gateway (`SrFiling::file_maintenance_incident`
+//! behind it) instead of a submit request. There is no devel project, no
 //! devel-version check, and no open-SR check on that path — the
 //! open-incident dedup lives in geectl's filing path.
 //!
@@ -43,14 +44,14 @@
 use crate::cve::{changelog_names_cve, CveId};
 use crate::dry_run::DryRun;
 use crate::http::map_obs_credentials_error;
+use crate::obs_gateway::ObsGateway;
 use crate::queue::{QueueEntry, UpdateKind};
 use crate::target::Target;
 use crate::version::is_newer;
 use geectl::auth::Credentials;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::obs::{
-    MaintainedInstance, MaintenanceBranchOptions, MaintenanceIncidentPayload, ObsClient, SrFiling,
-    SrPayload,
+    MaintainedInstance, MaintenanceBranchOptions, MaintenanceIncidentPayload, SrPayload,
 };
 use std::fmt;
 
@@ -315,7 +316,7 @@ impl std::error::Error for WorkerError {}
 
 /// The worker: one queue entry, one update.
 pub struct Worker<'a> {
-    obs: &'a ObsClient<'a>,
+    gateway: &'a dyn ObsGateway,
     executor: &'a dyn UpdateExecutor,
     credentials: Option<&'a Credentials>,
     /// The OBS home project from config (empty = unset; see
@@ -326,14 +327,14 @@ pub struct Worker<'a> {
 
 impl<'a> Worker<'a> {
     pub fn new(
-        obs: &'a ObsClient<'a>,
+        gateway: &'a dyn ObsGateway,
         executor: &'a dyn UpdateExecutor,
         credentials: Option<&'a Credentials>,
         home_project: &str,
         dry_run: &'a DryRun,
     ) -> Self {
         Worker {
-            obs,
+            gateway,
             executor,
             credentials,
             home_project: home_project.to_string(),
@@ -352,7 +353,7 @@ impl<'a> Worker<'a> {
         // 1. Resolve the devel project (public API read) against
         // Factory, the target the lookup reads.
         let devel_project = match self
-            .obs
+            .gateway
             .devel_project(geectl::obs::FACTORY_PROJECT, &entry.package)
         {
             Ok(Some((project, _devel_package))) => project,
@@ -368,7 +369,7 @@ impl<'a> Worker<'a> {
         // version (the queue entry may be stale). A failed check
         // escalates (fail-closed): filing on an unchecked dedup would
         // file a duplicate.
-        match self.obs.devel_version(&entry.package) {
+        match self.gateway.devel_version(&entry.package) {
             Ok(Some(current)) => {
                 if !is_newer(&entry.upstream_version, &current) {
                     return WorkerOutcome::Skipped {
@@ -385,7 +386,7 @@ impl<'a> Worker<'a> {
             }
         }
         // 3. Dedup re-check: an open SR may already target the package.
-        match self.obs.has_open_sr(&entry.package) {
+        match self.gateway.has_open_sr(&entry.package) {
             Ok(true) => {
                 return WorkerOutcome::Skipped {
                     reason: "open submit request already targets it".to_string(),
@@ -438,7 +439,7 @@ impl<'a> Worker<'a> {
             },
             Execution::Completed => {
                 // Live: file the SR. The filing is gated by the dry-run
-                // guard inside SrFiling::file, so this path only files
+                // guard inside the gateway, so this path only files
                 // when the mode is really live.
                 let Some(payload) = payload else {
                     // Completed implies live, and live requires a
@@ -449,16 +450,13 @@ impl<'a> Worker<'a> {
                         reason: "cannot file: no SR payload was built".to_string(),
                     };
                 };
-                // The filing runs through geectl's own DryRun (built
-                // from the worker's mode). Its dry-run lines are merged
-                // back into freshcrab's plan below, so `DryRun::plan()`
-                // consumers see the filing detail alongside the
-                // executor/queue notes (in live mode the geectl plan
-                // is empty: the merge is a no-op).
-                let geectl_dry = geectl::obs::DryRun::new(self.dry_run.enabled());
-                let filing = SrFiling::new(self.obs, &geectl_dry);
-                let result = filing.file(&payload);
-                self.dry_run.merge_plan(&geectl_dry.plan());
+                // The filing runs through the gateway (geectl's
+                // `SrFiling` behind it); its dry-run lines are merged
+                // back into freshcrab's plan by the gateway, so
+                // `DryRun::plan()` consumers see the filing detail
+                // alongside the executor/queue notes (in live mode
+                // the geectl plan is empty: the merge is a no-op).
+                let result = self.gateway.file_submit(&payload, self.dry_run);
                 match result {
                     Ok(Some(filed)) => WorkerOutcome::Filed {
                         sr_id: filed.id,
@@ -483,8 +481,9 @@ impl<'a> Worker<'a> {
     /// The devel-project lookup, devel-version check, and open-SR
     /// check of the Factory path do not apply: a Leap update has no
     /// devel project, and an open maintenance incident is refused by
-    /// geectl's filing-time dedup (`SrFiling::file_maintenance_incident`
-    /// in live mode), so there is no worker-side open-incident
+    /// geectl's filing-time dedup (the gateway's
+    /// `file_maintenance_incident` in live mode), so there is no
+    /// worker-side open-incident
     /// check — geectl exposes none. A duplicate found that way
     /// escalates with the blocking id for human triage, not
     /// `Skipped`: the dedup identity carries no fix/CVE identity,
@@ -493,7 +492,7 @@ impl<'a> Worker<'a> {
     /// The branch
     /// itself is an executor step, as on the Factory path: the plan
     /// names the branch project the listing reports, and the live
-    /// executor creates it with `ObsClient::maintenance_branch`
+    /// executor creates it with geectl's `ObsClient::maintenance_branch`
     /// before executing the steps (see `UpdateExecutor`).
     fn run_maintenance(&self, entry: &QueueEntry) -> WorkerOutcome {
         // 1. The maintained project for this target — the update
@@ -518,7 +517,7 @@ impl<'a> Worker<'a> {
         // the incident files from. The listing's source project is
         // the maintained project found above.
         let instances = match self
-            .obs
+            .gateway
             .maintained_instances(&entry.package, &MaintenanceBranchOptions::new())
         {
             Ok(instances) => instances,
@@ -594,13 +593,11 @@ impl<'a> Worker<'a> {
                     };
                 };
                 // Live: file the maintenance incident. The filing is
-                // gated by the dry-run guard inside
-                // `SrFiling::file_maintenance_incident`, so this path
-                // only files when the mode is really live.
-                let geectl_dry = geectl::obs::DryRun::new(self.dry_run.enabled());
-                let filing = SrFiling::new(self.obs, &geectl_dry);
-                let result = filing.file_maintenance_incident(&payload);
-                self.dry_run.merge_plan(&geectl_dry.plan());
+                // gated by the dry-run guard inside the gateway, so
+                // this path only files when the mode is really live.
+                let result = self
+                    .gateway
+                    .file_maintenance_incident(&payload, self.dry_run);
                 match result {
                     Ok(Some(sr_id)) => WorkerOutcome::Filed { sr_id, plan },
                     Ok(None) => WorkerOutcome::Planned {
@@ -916,9 +913,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::FakeHttpClient;
+    use crate::obs_gateway::FakeObsGateway;
     use geectl::auth::Credentials;
-    use geectl::obs::ObsClient;
 
     fn entry(package: &str) -> QueueEntry {
         QueueEntry::new(
@@ -931,52 +927,17 @@ mod tests {
         )
     }
 
-    /// The OBS search URL for `package`, from a throwaway geectl
-    /// client (the URL is a pure function of the package, so no canned
-    /// response is needed to build it).
-    fn search_url_for(package: &str) -> String {
-        let probe = FakeHttpClient::new();
-        let obs = ObsClient::new(&probe);
-        obs.search_url(package).unwrap()
-    }
-
-    /// An OBS client with credentials, for tests that need the
-    /// authenticated endpoints (the open-SR search, filing).
-    fn obs_with_creds(http: &FakeHttpClient) -> ObsClient<'_> {
-        ObsClient::with_credentials(
-            http,
-            Credentials::Basic {
-                username: "scarabeus_iv".to_string(),
-                password: "secret".to_string(),
-            },
-        )
-        .unwrap()
-    }
-
-    /// A canned OBS backend for one package: a devel project, a devel
-    /// spec at the given version, and an open-SR search result.
-    fn http_for_foo(devel_version: &str, open_sr_matches: u32) -> FakeHttpClient {
-        let search_body = if open_sr_matches == 0 {
-            "<collection matches=\"0\"></collection>".to_string()
-        } else {
-            // A full request element with a submit action: geectl's
-            // open-SR check counts only requests that carry one, so a
-            // bare self-closing `<request id="..."/>` would read as
-            // empty and the skip would silently stop happening.
-            format!(
-                "<collection matches=\"{open_sr_matches}\"><request id=\"1398492\"><action type=\"submit\"><source project=\"home:scarabeus_iv\" package=\"foo\"/><target project=\"devel:languages:python\" package=\"foo\"/></action></request></collection>"
-            )
-        };
-        FakeHttpClient::new()
-            .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
-                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
-            )
-            .with(
-                "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
-                &format!("Name: foo\nVersion: {devel_version}\n"),
-            )
-            .with(&search_url_for("foo"), &search_body)
+    /// A canned gateway for one Factory package: a devel project, a
+    /// devel version, and an open-SR answer.
+    fn gateway_for_foo(devel_version: &str, open_sr: bool) -> FakeObsGateway {
+        let mut gateway = FakeObsGateway::new();
+        gateway.devel_project = Ok(Some((
+            "devel:languages:python".to_string(),
+            "foo".to_string(),
+        )));
+        gateway.devel_version = Ok(Some(devel_version.to_string()));
+        gateway.has_open_sr = Ok(open_sr);
+        gateway
     }
 
     #[test]
@@ -1001,10 +962,9 @@ mod tests {
     #[test]
     fn build_plan_routine() {
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new();
-        let obs = ObsClient::new(&http);
+        let gateway = FakeObsGateway::new();
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let plan = worker
             .build_plan(
                 &entry("foo"),
@@ -1027,10 +987,9 @@ mod tests {
     #[test]
     fn build_plan_security_names_cve() {
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new();
-        let obs = ObsClient::new(&http);
+        let gateway = FakeObsGateway::new();
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let mut e = entry("foo");
         e.kind = UpdateKind::Security;
         e.cves = vec!["CVE-2026-12345".to_string()];
@@ -1049,10 +1008,9 @@ mod tests {
     #[test]
     fn build_plan_security_without_cve_escalates() {
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new();
-        let obs = ObsClient::new(&http);
+        let gateway = FakeObsGateway::new();
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let mut e = entry("foo");
         e.kind = UpdateKind::Security;
         let err = worker
@@ -1068,34 +1026,32 @@ mod tests {
     #[test]
     fn resolve_branch_project_prefers_config() {
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new();
-        let obs = ObsClient::new(&http);
+        let gateway = FakeObsGateway::new();
         let executor = DryRunExecutor;
         let creds = Credentials::Basic {
             username: "someone".to_string(),
             password: "secret".to_string(),
         };
-        let worker = Worker::new(&obs, &executor, Some(&creds), "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, Some(&creds), "home:scarabeus_iv", &dry);
         assert_eq!(
             worker.resolve_branch_project().as_deref(),
             Some("home:scarabeus_iv")
         );
-        let worker2 = Worker::new(&obs, &executor, Some(&creds), "", &dry);
+        let worker2 = Worker::new(&gateway, &executor, Some(&creds), "", &dry);
         assert_eq!(
             worker2.resolve_branch_project().as_deref(),
             Some("home:someone")
         );
-        let worker3 = Worker::new(&obs, &executor, None, "", &dry);
+        let worker3 = Worker::new(&gateway, &executor, None, "", &dry);
         assert_eq!(worker3.resolve_branch_project(), None);
     }
 
     #[test]
     fn run_skips_when_devel_already_new() {
         let dry = DryRun::new(true);
-        let http = http_for_foo("2.0", 0);
-        let obs = ObsClient::new(&http);
+        let gateway = gateway_for_foo("2.0", false);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
             worker.run(&entry("foo")),
             WorkerOutcome::Skipped { .. }
@@ -1105,10 +1061,9 @@ mod tests {
     #[test]
     fn run_skips_when_open_sr_exists() {
         let dry = DryRun::new(true);
-        let http = http_for_foo("1.9", 1);
-        let obs = obs_with_creds(&http);
+        let gateway = gateway_for_foo("1.9", true);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
             worker.run(&entry("foo")),
             WorkerOutcome::Skipped { .. }
@@ -1117,23 +1072,14 @@ mod tests {
 
     #[test]
     fn run_auth_rejected_on_open_sr_check() {
-        // The OBS search API 401s (rotated credentials): the worker
-        // reports AuthRejected — a run-level failure — not an
-        // escalation of the package.
+        // The open-SR check rejects the credentials (rotated
+        // credentials): the worker reports AuthRejected — a run-level
+        // failure — not an escalation of the package.
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new()
-            .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
-                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
-            )
-            .with(
-                "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
-                "Name: foo\nVersion: 1.9\n",
-            )
-            .with_status(&search_url_for("foo"), 401, "unauthorized");
-        let obs = obs_with_creds(&http);
+        let mut gateway = gateway_for_foo("1.9", false);
+        gateway.has_open_sr = Err(GeectlError::new(ErrorKind::AuthFailed, "unauthorized"));
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
             worker.run(&entry("foo")),
             WorkerOutcome::AuthRejected { .. }
@@ -1142,22 +1088,16 @@ mod tests {
 
     #[test]
     fn run_transport_error_on_open_sr_check_escalates() {
-        // A non-auth failure (no canned search response = transport
-        // error) still escalates the package; only auth rejection is
-        // run-level.
+        // A non-auth failure of the open-SR check still escalates the
+        // package; only auth rejection is run-level.
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new()
-            .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
-                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
-            )
-            .with(
-                "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
-                "Name: foo\nVersion: 1.9\n",
-            );
-        let obs = obs_with_creds(&http);
+        let mut gateway = gateway_for_foo("1.9", false);
+        gateway.has_open_sr = Err(GeectlError::new(
+            ErrorKind::NetworkError,
+            "transport error",
+        ));
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
             worker.run(&entry("foo")),
             WorkerOutcome::Escalated { .. }
@@ -1166,8 +1106,8 @@ mod tests {
 
     #[test]
     fn run_auth_rejected_on_filing() {
-        // The filing POST 401s (rotated credentials): the worker
-        // reports AuthRejected, not an escalation of the package.
+        // Filing rejects the credentials (rotated credentials): the
+        // worker reports AuthRejected, not an escalation of the package.
         struct CompletedExecutor;
         impl UpdateExecutor for CompletedExecutor {
             fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
@@ -1175,32 +1115,22 @@ mod tests {
             }
         }
         let dry = DryRun::new(false);
-        let http = http_for_foo("1.9", 0).with_post_status(
-            "https://api.opensuse.org/request?cmd=create",
-            401,
-            "unauthorized",
-        );
-        let obs = obs_with_creds(&http);
+        let mut gateway = gateway_for_foo("1.9", false);
+        gateway.file_submit = Err(GeectlError::new(ErrorKind::AuthFailed, "unauthorized"));
         let executor = CompletedExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
             worker.run(&entry("foo")),
             WorkerOutcome::AuthRejected { .. }
         ));
-        // The POST was attempted (and rejected); nothing was filed.
-        assert_eq!(http.posted().len(), 1);
     }
 
     #[test]
     fn run_no_devel_project() {
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new().with(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
-            "<package name=\"foo\" project=\"openSUSE:Factory\"></package>",
-        );
-        let obs = ObsClient::new(&http);
+        let gateway = FakeObsGateway::new();
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
             worker.run(&entry("foo")),
             WorkerOutcome::NoDevelProject
@@ -1210,10 +1140,9 @@ mod tests {
     #[test]
     fn run_dry_run_plans_with_payload() {
         let dry = DryRun::new(true);
-        let http = http_for_foo("1.9", 0);
-        let obs = obs_with_creds(&http);
+        let gateway = gateway_for_foo("1.9", false);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&entry("foo")) {
             WorkerOutcome::Planned { plan, payload } => {
                 assert_eq!(plan.package, "foo");
@@ -1237,54 +1166,42 @@ mod tests {
     }
 
     #[test]
-    fn run_dry_run_with_completed_executor_merges_filing_plan() {
+    fn run_dry_run_with_completed_executor_stays_planned() {
         struct CompletedExecutor;
         impl UpdateExecutor for CompletedExecutor {
             fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
                 Ok(Execution::Completed)
             }
         }
+        // A completed executor in dry-run mode: the worker takes the
+        // Completed arm, the gateway files nothing (Ok(None)), and the
+        // outcome stays Planned — with the submit payload carried for
+        // the plan record. (The would-file lines geectl's filing
+        // produces live behind the gateway, so they are not asserted
+        // here: geectl's behaviour is tested in geectl.)
         let dry = DryRun::new(true);
-        let http = http_for_foo("1.9", 0);
-        let obs = obs_with_creds(&http);
+        let gateway = gateway_for_foo("1.9", false);
         let executor = CompletedExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&entry("foo")) {
-            WorkerOutcome::Planned { plan, .. } => {
+            WorkerOutcome::Planned { plan, payload } => {
                 assert_eq!(plan.package, "foo");
+                assert!(matches!(payload, Some(FilingPayload::Submit(_))));
             }
             other => panic!("expected Planned, got {other:?}"),
         }
-        // The filing's dry-run lines live in freshcrab's plan, not
-        // only in geectl's: the would-file line and the payload detail.
-        let plan = dry.plan();
-        assert!(
-            plan.iter()
-                .any(|l| l.contains("would: file submit request for foo")),
-            "filing line missing from plan: {plan:?}"
-        );
-        assert!(
-            plan.iter()
-                .any(|l| l.contains("source: home:scarabeus_iv/foo")),
-            "filing detail missing from plan: {plan:?}"
-        );
-        // And nothing was posted (dry-run files nothing).
-        assert!(http.posted().is_empty());
     }
 
     #[test]
     fn run_live_without_live_executor_escalates() {
         let dry = DryRun::new(false);
-        let http = http_for_foo("1.9", 0);
-        let obs = obs_with_creds(&http);
+        let gateway = gateway_for_foo("1.9", false);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
             worker.run(&entry("foo")),
             WorkerOutcome::Escalated { .. }
         ));
-        // And nothing was posted (no live SR was filed).
-        assert!(http.posted().is_empty());
     }
 
     #[test]
@@ -1296,13 +1213,10 @@ mod tests {
             }
         }
         let dry = DryRun::new(false);
-        let http = http_for_foo("1.9", 0).with_post(
-            "https://api.opensuse.org/request?cmd=create",
-            "<request id=\"1400001\" creator=\"scarabeus_iv\"></request>",
-        );
-        let obs = obs_with_creds(&http);
+        let mut gateway = gateway_for_foo("1.9", false);
+        gateway.file_submit = Ok(Some(("1400001".to_string(), Vec::new())));
         let executor = CompletedExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&entry("foo")) {
             WorkerOutcome::Filed { sr_id, plan } => {
                 assert_eq!(sr_id, "1400001");
@@ -1310,37 +1224,21 @@ mod tests {
             }
             other => panic!("expected Filed, got {other:?}"),
         }
-        // Exactly one POST, to the create-request endpoint, with the SR XML,
-        // and it carried the credentials.
-        let posted = http.posted();
-        assert_eq!(http.posted_auth(), vec![true]);
-        assert_eq!(posted.len(), 1);
-        assert_eq!(posted[0].0, "https://api.opensuse.org/request?cmd=create");
-        assert!(posted[0].1.contains("<action type=\"submit\">"));
-        assert!(posted[0].1.contains("devel:languages:python"));
-        // The filed SR carries the cleanup default: the source branch
-        // dies on accept.
-        assert!(posted[0]
-            .1
-            .contains("<options><sourceupdate>cleanup</sourceupdate></options>"));
-        // Filing runs its own dedup check in live mode: the open-SR
-        // search was fetched with credentials too.
-        assert!(http.authed_gets().contains(&search_url_for("foo")));
     }
 
     #[test]
     fn run_escalates_when_devel_version_recheck_fails() {
         // Dispatch-time dedup re-check: the devel project resolves,
-        // but the spec fetch fails (no canned response) — the worker
-        // escalates fail-closed instead of filing on an unchecked dedup.
+        // but the devel-version check fails — the worker escalates
+        // fail-closed instead of filing on an unchecked dedup.
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new().with(
-            "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
-            "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
-        );
-        let obs = ObsClient::new(&http);
+        let mut gateway = gateway_for_foo("1.9", false);
+        gateway.devel_version = Err(GeectlError::new(
+            ErrorKind::NetworkError,
+            "transport error",
+        ));
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&entry("foo")) {
             WorkerOutcome::Escalated { reason } => {
                 assert!(reason.contains("devel version check failed"));
@@ -1351,21 +1249,16 @@ mod tests {
 
     #[test]
     fn run_escalates_when_open_sr_recheck_fails() {
-        // The devel version check passes, but the open-SR search fails
-        // (no canned response) — escalate fail-closed.
+        // The devel version check passes, but the open-SR check fails
+        // — escalate fail-closed.
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new()
-            .with(
-                "https://api.opensuse.org/public/source/openSUSE:Factory/foo/_meta",
-                "<package name=\"foo\" project=\"openSUSE:Factory\"><devel project=\"devel:languages:python\" package=\"foo\"/></package>",
-            )
-            .with(
-                "https://api.opensuse.org/public/source/devel:languages:python/foo/foo.spec",
-                "Name: foo\nVersion: 1.9\n",
-            );
-        let obs = obs_with_creds(&http);
+        let mut gateway = gateway_for_foo("1.9", false);
+        gateway.has_open_sr = Err(GeectlError::new(
+            ErrorKind::NetworkError,
+            "transport error",
+        ));
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&entry("foo")) {
             WorkerOutcome::Escalated { reason } => {
                 assert!(reason.contains("open-SR check failed"));
@@ -1376,11 +1269,10 @@ mod tests {
 
     #[test]
     fn run_live_without_credentials_escalates_at_open_sr_check() {
-        // No credentials: the worker's own open-SR re-check refuses
-        // before any request (geectl requires credentials up front),
-        // so the run escalates fail-closed there and never reaches
-        // filing — nothing is posted. The filing-level no-creds
-        // fail-closed is covered by tests/test_sr.rs.
+        // No credentials: the open-SR re-check reports the missing
+        // credentials, so the run escalates fail-closed there and
+        // never reaches filing. The filing-level no-creds fail-closed
+        // is covered by tests/test_sr.rs.
         struct CompletedExecutor;
         impl UpdateExecutor for CompletedExecutor {
             fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
@@ -1388,10 +1280,13 @@ mod tests {
             }
         }
         let dry = DryRun::new(false);
-        let http = http_for_foo("1.9", 0);
-        let obs = ObsClient::new(&http);
+        let mut gateway = gateway_for_foo("1.9", false);
+        gateway.has_open_sr = Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            "checking for open submit requests requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+        ));
         let executor = CompletedExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&entry("foo")) {
             WorkerOutcome::Escalated { reason } => {
                 assert!(reason.contains("open-SR check failed"), "{reason}");
@@ -1404,7 +1299,6 @@ mod tests {
             }
             other => panic!("expected Escalated, got {other:?}"),
         }
-        assert!(http.posted().is_empty());
     }
 
     #[test]
@@ -1472,10 +1366,9 @@ mod tests {
     #[test]
     fn payload_from_plan_without_branch_project_errors() {
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new();
-        let obs = ObsClient::new(&http);
+        let gateway = FakeObsGateway::new();
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "", &dry);
         let plan = worker
             .build_plan(&entry("foo"), Some("devel:languages:python"), None)
             .unwrap();
@@ -1503,79 +1396,46 @@ mod tests {
         e
     }
 
-    /// The maintained-instances listing POST URL for `foo`, built
-    /// with geectl's own query encoder so the test pins the query
-    /// shape (the branch command with the maintained attributes and
-    /// `dryrun=1`), not hand-computed percent-encoding.
-    fn maintained_instances_url() -> String {
-        let query = [
-            ("cmd", "branch"),
-            ("attribute", "OBS:Maintained"),
-            ("update_project_attribute", "OBS:UpdateProject"),
-            ("package", "foo"),
-            ("dryrun", "1"),
-        ];
-        let mut url = "https://api.opensuse.org/source?".to_string();
-        for (i, (name, value)) in query.iter().enumerate() {
-            if i > 0 {
-                url.push('&');
-            }
-            url.push_str(&geectl::url::encode_query_value(name));
-            url.push('=');
-            url.push_str(&geectl::url::encode_query_value(value));
+    /// The 15.6 maintained instance for `foo`: the source project is
+    /// the update project, and the branch project is the listing's
+    /// target project.
+    fn leap_15_6_instance() -> MaintainedInstance {
+        MaintainedInstance {
+            source_project: "openSUSE:Leap:15.6:Update".to_string(),
+            source_package: "foo".to_string(),
+            devel_project: Some("devel:languages:python".to_string()),
+            devel_package: Some("foo".to_string()),
+            target_project: "home:scarabeus_iv:branches:OBS_Maintained:foo".to_string(),
+            target_package: "foo.openSUSE_Leap_15.6_Update".to_string(),
         }
-        url
     }
 
-    /// The open-incident dedup search URL for the maintenance filing
-    /// (the match expression, encoded with geectl's own encoder).
-    /// The source package is the branch package name from the
-    /// listing, not the plain package.
-    fn maintenance_dedup_url() -> String {
-        let match_expr = "(state/@name='new' or state/@name='review') and action/@type='maintenance_incident' and action[source/@package='foo.openSUSE_Leap_15.6_Update' and target/@project='openSUSE:Maintenance']";
-        format!(
-            "https://api.opensuse.org/search/request?match={}",
-            geectl::url::encode_query_value(match_expr)
-        )
+    /// The 15.5 maintained instance for `foo` (no devel project).
+    fn leap_15_5_instance() -> MaintainedInstance {
+        MaintainedInstance {
+            source_project: "openSUSE:Leap:15.5:Update".to_string(),
+            source_package: "foo".to_string(),
+            devel_project: None,
+            devel_package: None,
+            target_project: "home:scarabeus_iv:branches:OBS_Maintained:foo".to_string(),
+            target_package: "foo.openSUSE_Leap_15.5_Update".to_string(),
+        }
     }
 
-    /// A maintained-instances listing body for `foo`: geectl's
-    /// `dry_run_report()` shape — the source project is the update
-    /// project (`openSUSE:Leap:15.6:Update`), with a second instance
-    /// on 15.5. The target package keeps its dots in the report
-    /// (`foo.openSUSE:Leap:15.6:Update`); the parser turns `:` into
-    /// `_` (`foo.openSUSE_Leap_15.6_Update`).
-    fn maintained_instances_body() -> &'static str {
-        "<collection><package project=\"openSUSE:Leap:15.6:Update\" package=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\" /><target project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.6:Update\" /></package><package project=\"openSUSE:Leap:15.5:Update\" package=\"foo\"><target project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.5:Update\" /></package></collection>"
-    }
-
-    /// The same listing with only the 15.5 instance: `foo` is
-    /// maintained, but not on the entry's 15.6 target.
-    fn maintained_instances_body_15_5_only() -> &'static str {
-        "<collection><package project=\"openSUSE:Leap:15.5:Update\" package=\"foo\"><target project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.5:Update\" /></package></collection>"
-    }
-
-    /// Geectl's verbatim `dry_run_report()` fixture (`obs.rs`): the
-    /// regression test below feeds these exact bytes to the worker so
-    /// the matcher is proven against geectl's own fixture, not only
-    /// against a re-typed copy of it.
-    fn maintained_instances_body_geectl_verbatim() -> &'static str {
-        "<collection><package project=\"openSUSE:Leap:15.6:Update\" package=\"foo\"><devel project=\"devel:languages:python\" package=\"foo\" /><target project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.6:Update\" /></package><package project=\"openSUSE:Leap:15.5:Update\" package=\"foo\"><target project=\"home:alice:branches:OBS_Maintained:foo\" package=\"foo.openSUSE:Leap:15.5:Update\" /></package></collection>"
-    }
-
-    /// A canned OBS backend for a Leap `foo`: the maintained-instances
-    /// listing for 15.6 (plus the 15.5 instance the report carries).
-    fn http_for_leap_foo() -> FakeHttpClient {
-        FakeHttpClient::new().with_post(&maintained_instances_url(), maintained_instances_body())
+    /// A canned gateway for a Leap `foo`: the maintained-instances
+    /// listing for 15.6 (plus the 15.5 instance the listing carries).
+    fn gateway_for_leap_foo() -> FakeObsGateway {
+        let mut gateway = FakeObsGateway::new();
+        gateway.maintained_instances = Ok(vec![leap_15_6_instance(), leap_15_5_instance()]);
+        gateway
     }
 
     #[test]
     fn build_plan_leap_has_no_devel_project() {
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new();
-        let obs = ObsClient::new(&http);
+        let gateway = FakeObsGateway::new();
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let plan = worker
             .build_plan(
                 &leap_entry("foo"),
@@ -1607,10 +1467,9 @@ mod tests {
     #[test]
     fn run_maintenance_dry_run_plans_with_incident_payload() {
         let dry = DryRun::new(true);
-        let http = http_for_leap_foo();
-        let obs = obs_with_creds(&http);
+        let gateway = gateway_for_leap_foo();
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&leap_entry("foo")) {
             WorkerOutcome::Planned { plan, payload } => {
                 assert_eq!(plan.package, "foo");
@@ -1654,11 +1513,6 @@ mod tests {
             }
             other => panic!("expected Planned, got {other:?}"),
         }
-        // The listing is a POST (a dry-run branch listing): exactly
-        // one POST, and no filing POST in dry-run.
-        let posted = http.posted();
-        assert_eq!(posted.len(), 1);
-        assert_eq!(posted[0].0, maintained_instances_url());
     }
 
     #[test]
@@ -1670,18 +1524,10 @@ mod tests {
             }
         }
         let dry = DryRun::new(false);
-        let http = http_for_leap_foo()
-            .with(
-                &maintenance_dedup_url(),
-                "<collection matches=\"0\"></collection>",
-            )
-            .with_post(
-                "https://api.opensuse.org/request?cmd=create&addrevision=1",
-                "<request id=\"1400002\" creator=\"scarabeus_iv\"></request>",
-            );
-        let obs = obs_with_creds(&http);
+        let mut gateway = gateway_for_leap_foo();
+        gateway.file_maintenance_incident = Ok(Some("1400002".to_string()));
         let executor = CompletedExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&leap_entry("foo")) {
             WorkerOutcome::Filed { sr_id, plan } => {
                 assert_eq!(sr_id, "1400002");
@@ -1689,39 +1535,14 @@ mod tests {
             }
             other => panic!("expected Filed, got {other:?}"),
         }
-        // Two POSTs: the maintained-instances listing, then the
-        // incident filing — both authenticated.
-        let posted = http.posted();
-        assert_eq!(http.posted_auth(), vec![true, true]);
-        assert_eq!(posted.len(), 2);
-        assert_eq!(posted[0].0, maintained_instances_url());
-        assert_eq!(
-            posted[1].0,
-            "https://api.opensuse.org/request?cmd=create&addrevision=1"
-        );
-        assert!(posted[1]
-            .1
-            .contains("<action type=\"maintenance_incident\">"));
-        assert!(posted[1].1.contains("openSUSE:Maintenance"));
-        assert!(posted[1]
-            .1
-            .contains("releaseproject=\"openSUSE:Leap:15.6:Update\""));
-        assert!(posted[1].1.contains("foo.openSUSE_Leap_15.6_Update"));
-        // No cleanup opt-in on an incident: the source is the
-        // maintenance working area.
-        assert!(!posted[1].1.contains("<sourceupdate>cleanup</sourceupdate>"));
-        // The filing's own dedup search ran (with credentials).
-        assert!(http.authed_gets().contains(&maintenance_dedup_url()));
     }
 
     #[test]
     fn run_maintenance_not_maintained_escalates() {
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new()
-            .with_post(&maintained_instances_url(), "<collection></collection>");
-        let obs = obs_with_creds(&http);
+        let gateway = FakeObsGateway::new();
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&leap_entry("foo")) {
             WorkerOutcome::NotMaintained { reason } => {
                 assert!(
@@ -1738,13 +1559,10 @@ mod tests {
         // The package is maintained, but only on another release
         // (15.5): no instance matches this entry's 15.6 target.
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new().with_post(
-            &maintained_instances_url(),
-            maintained_instances_body_15_5_only(),
-        );
-        let obs = obs_with_creds(&http);
+        let mut gateway = FakeObsGateway::new();
+        gateway.maintained_instances = Ok(vec![leap_15_5_instance()]);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         assert!(matches!(
             worker.run(&leap_entry("foo")),
             WorkerOutcome::NotMaintained { .. }
@@ -1761,10 +1579,9 @@ mod tests {
         // exists; geectl documents the server stores a
         // filing-time-resolved value when none is filed.
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new();
-        let obs = ObsClient::new(&http);
+        let gateway = FakeObsGateway::new();
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let mut e = leap_entry("foo");
         e.target = Target::Leap {
             version: "16.0".to_string(),
@@ -1798,10 +1615,9 @@ mod tests {
         // a maintained instance for it — even when the listing
         // carries instances for other releases.
         let dry = DryRun::new(true);
-        let http = http_for_leap_foo();
-        let obs = obs_with_creds(&http);
+        let gateway = gateway_for_leap_foo();
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         let mut e = leap_entry("foo");
         e.target = Target::Leap {
             version: "16.0".to_string(),
@@ -1812,24 +1628,23 @@ mod tests {
             }
             other => panic!("expected NotMaintained, got {other:?}"),
         }
-        // The unknown version is refused before the listing call:
-        // no network round-trip is spent on it.
-        assert!(http.posted().is_empty());
+        // The unknown version is refused before the listing call (see
+        // `run_maintenance`): no listing round-trip is spent on it.
     }
 
     #[test]
-    fn run_maintenance_selects_update_project_from_geectl_fixture() {
-        // Regression: geectl's verbatim `dry_run_report()` bytes —
-        // the source project is the update project, and the worker
-        // must select that instance, not look for the release project.
+    fn run_maintenance_selects_update_project_instance() {
+        // The worker selects the instance whose source project is
+        // the update project, not the release project — even when
+        // that instance branches from another maintainer's home.
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new().with_post(
-            &maintained_instances_url(),
-            maintained_instances_body_geectl_verbatim(),
-        );
-        let obs = obs_with_creds(&http);
+        let mut instance_15_6 = leap_15_6_instance();
+        instance_15_6.target_project =
+            "home:alice:branches:OBS_Maintained:foo".to_string();
+        let mut gateway = FakeObsGateway::new();
+        gateway.maintained_instances = Ok(vec![instance_15_6, leap_15_5_instance()]);
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&leap_entry("foo")) {
             WorkerOutcome::Planned { payload, .. } => {
                 let payload = payload.expect("payload built in dry-run");
@@ -1855,14 +1670,6 @@ mod tests {
         }
     }
 
-    /// An open incident in the dedup search, releasing to the given
-    /// project (the parser narrows on the target's `releaseproject`).
-    fn open_incident_body(release_project: &str) -> String {
-        format!(
-            "<collection matches=\"1\"><request id=\"1399001\" creator=\"alice\"><action type=\"maintenance_incident\"><source project=\"home:scarabeus_iv:branches:OBS_Maintained:foo\" package=\"foo.openSUSE_Leap_15.6_Update\" /><target project=\"openSUSE:Maintenance\" releaseproject=\"{release_project}\" /></action><state name=\"new\" /></request></collection>"
-        )
-    }
-
     #[test]
     fn run_maintenance_live_duplicate_incident_escalates() {
         // An open incident already targets this package: the filing
@@ -1878,13 +1685,13 @@ mod tests {
             }
         }
         let dry = DryRun::new(false);
-        let http = http_for_leap_foo().with(
-            &maintenance_dedup_url(),
-            &open_incident_body("openSUSE:Leap:15.6:Update"),
-        );
-        let obs = obs_with_creds(&http);
+        let mut gateway = gateway_for_leap_foo();
+        gateway.file_maintenance_incident = Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "an open maintenance_incident request already targets foo.openSUSE_Leap_15.6_Update (request 1399001)",
+        ));
         let executor = CompletedExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&leap_entry("foo")) {
             WorkerOutcome::Escalated { reason } => {
                 assert!(reason.contains("already open"), "{reason}");
@@ -1892,94 +1699,48 @@ mod tests {
             }
             other => panic!("expected Escalated, got {other:?}"),
         }
-        // No filing POST: the dedup refusal stopped it, after the
-        // one listing POST.
-        assert_eq!(http.posted().len(), 1);
-        assert_eq!(http.posted()[0].0, maintained_instances_url());
     }
 
     #[test]
-    fn run_maintenance_live_other_release_project_does_not_block() {
-        // An open incident releasing elsewhere (15.5) is a different
-        // incident: the parser narrows on the release project, so the
-        // 15.6 filing proceeds.
-        struct CompletedExecutor;
-        impl UpdateExecutor for CompletedExecutor {
-            fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
-                Ok(Execution::Completed)
-            }
-        }
-        let dry = DryRun::new(false);
-        let http = http_for_leap_foo()
-            .with(
-                &maintenance_dedup_url(),
-                &open_incident_body("openSUSE:Leap:15.5:Update"),
-            )
-            .with_post(
-                "https://api.opensuse.org/request?cmd=create&addrevision=1",
-                "<request id=\"1400002\" creator=\"scarabeus_iv\"></request>",
-            );
-        let obs = obs_with_creds(&http);
-        let executor = CompletedExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
-        match worker.run(&leap_entry("foo")) {
-            WorkerOutcome::Filed { sr_id, .. } => assert_eq!(sr_id, "1400002"),
-            other => panic!("expected Filed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn run_maintenance_dry_run_completed_executor_notes_would_be_incident() {
+    fn run_maintenance_dry_run_completed_executor_stays_planned() {
         // CompletedExecutor in dry-run mode (mirrors the Factory
-        // test): the worker takes the Completed arm, the filing call
-        // is dry-run guarded, and the would-be incident lines land in
-        // freshcrab's plan — the human-readable record of what would
-        // be filed.
+        // test).
         struct CompletedExecutor;
         impl UpdateExecutor for CompletedExecutor {
             fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
                 Ok(Execution::Completed)
             }
         }
+        // A completed executor in dry-run mode: the worker takes the
+        // Completed arm, the gateway files nothing (Ok(None)), and the
+        // outcome stays Planned — with the incident payload carried
+        // for the plan record. (The would-file lines geectl's filing
+        // produces live behind the gateway, so they are not asserted
+        // here: geectl's behaviour is tested in geectl.)
         let dry = DryRun::new(true);
-        let http = http_for_leap_foo();
-        let obs = obs_with_creds(&http);
+        let gateway = gateway_for_leap_foo();
         let executor = CompletedExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&leap_entry("foo")) {
-            WorkerOutcome::Planned { .. } => {}
+            WorkerOutcome::Planned { payload, .. } => {
+                assert!(matches!(payload, Some(FilingPayload::Maintenance(_))));
+            }
             other => panic!("expected Planned, got {other:?}"),
         }
-        let plan = dry.plan();
-        assert!(
-            plan.iter()
-                .any(|l| l.contains("would: file maintenance incident request for")),
-            "filing line missing from plan: {plan:?}"
-        );
-        assert!(
-            plan.iter().any(|l| l.contains(
-                "source: home:scarabeus_iv:branches:OBS_Maintained:foo/foo.openSUSE_Leap_15.6_Update"
-            )),
-            "filing detail missing from plan: {plan:?}"
-        );
-        assert!(
-            plan.iter()
-                .any(|l| l.contains("target: openSUSE:Maintenance")),
-            "filing detail missing from plan: {plan:?}"
-        );
-        // And nothing was posted beyond the listing (dry-run files nothing).
-        assert_eq!(http.posted().len(), 1);
     }
 
     #[test]
     fn run_maintenance_listing_failure_escalates() {
-        // No canned listing response (transport error): escalate
-        // fail-closed instead of filing without a branch project.
+        // The maintained-instances lookup fails: escalate fail-closed
+        // instead of filing without a branch project.
         let dry = DryRun::new(true);
-        let http = FakeHttpClient::new();
-        let obs = obs_with_creds(&http);
+        let mut gateway = FakeObsGateway::new();
+        gateway.maintained_instances = Err(GeectlError::new(
+            ErrorKind::NetworkError,
+            "transport error",
+        ));
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&leap_entry("foo")) {
             WorkerOutcome::Escalated { reason } => {
                 assert!(
@@ -1993,14 +1754,17 @@ mod tests {
 
     #[test]
     fn run_maintenance_no_credentials_escalates_at_listing() {
-        // No credentials: the maintained-instances listing refuses
-        // before any request, so the run escalates fail-closed
-        // there and never reaches filing — nothing is posted.
+        // No credentials: the maintained-instances lookup reports the
+        // missing credentials, so the run escalates fail-closed there
+        // and never reaches filing.
         let dry = DryRun::new(true);
-        let http = http_for_leap_foo();
-        let obs = ObsClient::new(&http);
+        let mut gateway = gateway_for_leap_foo();
+        gateway.maintained_instances = Err(GeectlError::new(
+            ErrorKind::ConfigError,
+            "listing maintained instances requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+        ));
         let executor = DryRunExecutor;
-        let worker = Worker::new(&obs, &executor, None, "home:scarabeus_iv", &dry);
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
         match worker.run(&leap_entry("foo")) {
             WorkerOutcome::Escalated { reason } => {
                 assert!(
@@ -2013,6 +1777,5 @@ mod tests {
             }
             other => panic!("expected Escalated, got {other:?}"),
         }
-        assert!(http.posted().is_empty());
     }
 }
