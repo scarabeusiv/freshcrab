@@ -21,6 +21,18 @@ and acts through geectl's library. The per-user state files
 (`~/.local/state`, per-task ledgers, baseline files) conflict with
 the single queue store in every case; the store replaces them.
 
+## Implementation rule — reimplement in Rust, carry no scripts over
+
+Takeovers are reimplemented in Rust; no bash or Python script is
+carried into the daemon. The daemon is Rust so freshcrab runs
+anywhere. What transfers is the behaviour and the guard semantics;
+what is dropped is the shell/Python harness, the per-user state
+files, and the osc/git-obs/tea calls (forge access goes through
+geectl's library, per the note above). Every script verdict below
+reads "Adapt — reimplement in Rust" on this rule; the
+`_obs_scope.py` "Adopt as-is" is the shared-scope design only,
+reimplemented in Rust — the Python file does not transfer.
+
 ## Verdicts
 
 | Item | Verdict |
@@ -28,23 +40,25 @@ the single queue store in every case; the store replaces them.
 | `references/token-budget.md` | Adapt |
 | `SKILL.md` (three-block pipeline) | Adapt |
 | `agents/` playbooks | Adapt |
-| `scripts/incoming-requests.py` | Adapt |
-| `scripts/outdated.py` | Adapt |
-| `scripts/watch-submissions.sh` | Adapt |
-| `scripts/sr-status.py` | Adapt |
-| `scripts/preflight.sh` | Adapt |
-| `scripts/incoming-review.sh` | Adapt |
-| `scripts/pr-guard.py` | Adapt (rule set only) |
-| `scripts/bug-guard.py` | Adapt (predicate only) |
-| `scripts/obs-wait.py` + `scripts/build-wait.sh` | Adapt |
-| `scripts/gate.sh` | Adapt |
-| `scripts/target-gate.sh` + `scripts/pool-pr.sh` | Adapt |
-| `scripts/autoforward-gate.sh` + `scripts/forward-check.py` | Adapt |
+| `scripts/incoming-requests.py` | Adapt — reimplement in Rust |
+| `scripts/outdated.py` | Adapt — reimplement in Rust |
+| `scripts/watch-submissions.sh` | Adapt — reimplement in Rust |
+| `scripts/sr-status.py` | Adapt — reimplement in Rust |
+| `scripts/preflight.sh` | Adapt — reimplement in Rust |
+| `scripts/incoming-review.sh` | Adapt — reimplement in Rust |
+| `scripts/pr-guard.py` | Adapt — reimplement in Rust (rule set only) |
+| `scripts/bug-guard.py` | Adapt — reimplement in Rust (predicate only) |
+| `scripts/obs-wait.py` + `scripts/build-wait.sh` | Adapt — reimplement in Rust |
+| `scripts/gate.sh` | Adapt — reimplement in Rust |
+| `scripts/target-gate.sh` + `scripts/pool-pr.sh` | Adapt — reimplement in Rust |
+| `scripts/autoforward-gate.sh` + `scripts/forward-check.py` | Adapt — reimplement in Rust |
 | `contrib/container/` | Adapt (deployment pattern) |
-| `scripts/_obs_scope.py` | Adopt as-is |
+| `scripts/_obs_scope.py` | Adopt as-is (design) — reimplement in Rust |
 
 16 adapt, 1 adopt as-is, 0 idea-only: every listed behaviour transfers
-in some form.
+in some form. 12 of the adapts are reimplementations in Rust and the
+adopt is the shared-scope design reimplemented in Rust; no script
+file transfers.
 
 ## `references/token-budget.md` — Adapt
 
@@ -179,7 +193,7 @@ reviewed as text" — supporting the two-roles claim but also showing
 changes-review is the updater's own gate, not a standalone queue
 role in the skill's framing.
 
-## `scripts/incoming-requests.py` — Adapt
+## `scripts/incoming-requests.py` — Adapt, reimplemented in Rust
 
 The discovery logic is the reviewer-discovery shape freshcrab needs:
 buckets A (SR `new`, no reviewer, explicit person `role="maintainer"`
@@ -201,7 +215,9 @@ instances. In the daemon this becomes reviewer discovery writing
 queue items to the single store, with per-leg UNKNOWN as item/leg
 state — not stderr text, since `main()` exits 0 even when the PR leg
 is UNKNOWN, so an unattended caller keying on exit code cannot see
-it.
+it. Reimplemented in Rust: keeps the three-bucket discovery, the
+own-item drop and the fail-closed UNKNOWN legs; drops the one-shot
+CLI, the printed table and the osc/git-obs subprocess calls.
 
 Flags: a silent cap the issue omits — bucket C's search is
 `limit=50` with no full-page warning, so a larger review-requested
@@ -211,7 +227,7 @@ UNKNOWN; a per-PR detail fetch failure appends a row with state
 "?" and reason "detail fetch failed" while the leg still counts as
 known.
 
-## `scripts/outdated.py` — Adapt
+## `scripts/outdated.py` — Adapt, reimplemented in Rust
 
 The fail-closed contract is exactly the updater-discovery contract
 freshcrab needs: Repology (paginated, 60 s timeout, retries
@@ -231,7 +247,9 @@ What must change: it is a one-shot CLI over a piped/`--names` list
 printing text. In the daemon the COVERAGE verdict and exit-3 contract
 become per-source state on updater queue items, and the gaps below
 must be closed so "partial" is always machine-visible rather than
-text-only.
+text-only. Reimplemented in Rust: keeps the multi-source sweep, the
+COVERAGE verdict and the exit-3 contract as per-source item state;
+drops the one-shot CLI and the piped text output.
 
 Flags: the issue's exit-3 claim is true but incomplete in two
 directions. First, silent losses exist: Anitya homepage-retry
@@ -246,7 +264,7 @@ as clean. Omitted: deliberate `--no-*` skips are named on the
 complete line (`# COVERAGE: complete except, on purpose: …`) and exit
 0; a run with no names at all also exits 3.
 
-## `scripts/watch-submissions.sh` — Adapt
+## `scripts/watch-submissions.sh` — Adapt, reimplemented in Rust
 
 The delta semantics transfer: it diffs active OBS SRs
 (`roles=creator`, `states=new,review`), incoming SRs
@@ -269,7 +287,10 @@ with the decided single-store shape (the same conflict already
 flagged for #33's `review_queue.json`). In the daemon the observer
 diffs queue-item states in the store on its loop; the baseline file
 and the cron entry point go away, keeping the delta vocabulary and
-the fail-closed leg rules.
+the fail-closed leg rules. Reimplemented in Rust on the rule above:
+the delta vocabulary and fail-closed leg rules transfer as daemon
+behaviour; the shell + embedded-Python cron one-shot and the
+per-user JSON baseline file do not.
 
 Flags: "RESOLVE lines → fetch final states" misdescribes the file.
 Final states are fetched only with `--resolve`, only for outgoing
@@ -291,7 +312,7 @@ reviews that `incoming-requests.py` deliberately excludes), while its
 PR leg covers PRs the user created, not review-requested ones. Exit
 codes are 0 (INIT/NOCHANGE/CHANGED) / 2 only.
 
-## `scripts/sr-status.py` — Adapt
+## `scripts/sr-status.py` — Adapt, reimplemented in Rust
 
 The status-view design is the observer view freshcrab needs: one
 Markdown table of OBS SRs + src.opensuse.org PRs (two legs: created
@@ -310,7 +331,9 @@ What must change: it is a one-shot human-facing renderer over
 header scope string saying PRs are UNKNOWN when a leg fails). In the
 daemon this becomes the observer's status view over the store, with
 UNKNOWN/STALE as item state, and the caps below either removed or
-kept as explicit, disclosed policy.
+kept as explicit, disclosed policy. Reimplemented in Rust: keeps the
+unified status view, the declines-first ordering and STALE detection
+as item state; drops the one-shot renderer and the osc/git-obs calls.
 
 Flags: "No silent cap" is wrong — there is a cap. `--limit`
 defaults to 40 SR rows: excess non-decline rows are dropped (all
@@ -337,7 +360,7 @@ caveats the issue omits: multi-action requests yield `STALE not
 checked (N actions)`, and a request pinning no revision is not
 checked at all.
 
-## `scripts/preflight.sh` — Adapt
+## `scripts/preflight.sh` — Adapt, reimplemented in Rust
 
 The dispatch-gate lattice is the right gate logic and is genuinely
 fail-closed: 7 checks (devel spec Version + `.changes` header;
@@ -358,7 +381,9 @@ is exit codes plus printed text, using `osc`/`git-obs` and
 `_incoming.py` review stamps on disk. In the daemon this becomes the
 dispatch gate over queue items in the single store (verdicts as
 item-state transitions, stamps as store state, geectl library for
-forge reads).
+forge reads). Reimplemented in Rust: keeps the dispatch-gate lattice
+and the exact STOP/INCOMING precedence; drops the shell one-shot,
+the exit-code interface and the on-disk review stamps.
 
 Flags — the issue misstates the precedence, which is the thing to
 get exactly right: "INCOMING beats FORWARD and STOP" is wrong about
@@ -386,7 +411,7 @@ devel project gets no PR check at all. The reviewer-role notice
 (check 5) prints a branch-don't-commit-directly instruction but does
 not change the verdict.
 
-## `scripts/incoming-review.sh` — Adapt
+## `scripts/incoming-review.sh` — Adapt, reimplemented in Rust
 
 The record/key/hold semantics the issue describes are real, but the
 mechanism is a one-shot human/agent CLI writing sidecar JSON files,
@@ -415,7 +440,10 @@ reimplement re-derivation as a daemon-side re-check (no `osc` /
 `git-obs` CLI subprocesses, no `$TMPDIR` scratch, no 60 s timeouts),
 and turn prune into store GC plus queue-item hold state. The
 1,900-line spec parse-surface scanner does not transfer — only the
-verdict/key/hold shape does.
+verdict/key/hold shape does. Reimplemented in Rust: keeps the
+verdict/key/hold semantics (re-derivation, key-moved refusal,
+FIXABLE hold); drops the one-shot CLI, the sidecar JSON files and
+the osc/git-obs subprocesses.
 
 Flags: stamp key contents are incomplete as stated, and PR keys are
 a different shape. The OBS key is a sha256 over canonical JSON of
@@ -436,7 +464,7 @@ always stays, even merged/closed ("a FIXABLE PR's hold reads the
 commit OBS synced, which this does not"). A failed lookup removes
 nothing and makes `--prune` exit 5.
 
-## `scripts/pr-guard.py` — Adapt (rule set only, not the hook)
+## `scripts/pr-guard.py` — Adapt (rule set only, not the hook), reimplemented in Rust
 
 `pr-guard.py` (372 lines) is a thin harness wrapper, not a second
 implementation. It holds only a prefilter regex, a 50 s deadline,
@@ -472,6 +500,9 @@ with ask mapped to escalate-to-human queue state, not a harness
 prompt. Harness-only rules (sleep limits, script pinning to a git
 ref, PATH/BASH_ENV bans, credential-file reads by the agent's own
 shell) have no daemon equivalent and must be dropped, not ported.
+Reimplemented in Rust: keeps the rule set as an evaluator over queue
+actions, with ask mapped to escalate-to-human queue state; drops the
+harness hook, the tool-call events and the 50 s alarm.
 
 Flags: "Refuse fixed sleeps" is overbroad. The sleep rule refuses
 only when a call's sleeps total 60 s or more (operands summed, GNU
@@ -499,7 +530,7 @@ incoming-review agent's parse/build bans (rpm family, quilt, `osc
 build`, services, `gate.sh` — the review reads the submission as
 text only).
 
-## `scripts/bug-guard.py` — Adapt (the predicate, not the hook)
+## `scripts/bug-guard.py` — Adapt (the predicate, not the hook), reimplemented in Rust
 
 The claim is essentially accurate: a harness `PreToolUse` hook for
 the Bugzilla MCP server; reads get no decision, every write except
@@ -524,7 +555,9 @@ admission/authorization check for bug items admitted via bugwarden —
 a bug item is actionable unattended only when the SR proof above
 holds at action time, with the SR number, `.changes` evidence and
 factory-auto state recorded on the item, not re-derived from a live
-hook call.
+hook call. Reimplemented in Rust: keeps the SR-proof predicate as a
+stored, re-verifiable admission check; drops the hook, the stdin
+event and the osc subprocesses.
 
 Flags: "security bug" is not verified. The code never checks the
 bug's product, component, classification or security flag — any
@@ -534,7 +567,7 @@ property comes only from the assignee being the security team. The
 (`osrcmd5` from `acceptinfo`; empty old text for an accepted-as-new
 package), not against current Factory — a nuance the issue omits.
 
-## `scripts/obs-wait.py` + `scripts/build-wait.sh` — Adapt
+## `scripts/obs-wait.py` + `scripts/build-wait.sh` — Adapt, reimplemented in Rust
 
 Both are one-shot bounded waits whose exit code is the verdict, as
 claimed. `obs-wait.py` (read-only; opens OBS's public SSE event
@@ -562,7 +595,9 @@ BLOCKED-UPSTREAM) with a next-check time on the item and release the
 worker; the SSE-feed + poll loop is replaced by the daemon's own
 scheduler/observer pacing. `build-wait.sh` is a different domain
 (local process groups on a build host) and only its exit-code-verdict
-shape transfers.
+shape transfers. Reimplemented in Rust: keeps the exit-code-verdict
+shape as queue-item retry state with next-check times; drops the
+synchronous blocking waits and the local process-group waiting.
 
 Flags: "never file" is caller policy, not something in the code.
 `obs-wait.py` files nothing — it is read-only. The "never file"
@@ -575,7 +610,7 @@ primitive covers requests as well as builds. `build-wait.sh
 ended; "its outcome is in LOG". Only the default path (via
 `build-summary.sh`) yields a green verdict.
 
-## `scripts/gate.sh` — Adapt
+## `scripts/gate.sh` — Adapt, reimplemented in Rust
 
 A 2,303-line one-shot commit/SR gate for a local osc checkout,
 ending in one `VERDICT: GREEN/RED` line, and its check list transfers
@@ -592,7 +627,10 @@ What must change: port the check list and the stamp semantics
 (verdict bound to an exact tree hash; review/build/RPM-check as
 separable sub-records; changelog-only carry rules) into daemon
 pre-submit checks recorded in the single store; drop the shell /
-`osc`-CLI / bwrap / local-state execution shape.
+`osc`-CLI / bwrap / local-state execution shape. Reimplemented in
+Rust: keeps the check list and the stamp semantics (exact-tree
+binding, separable sub-records, changelog-only carry rules) as
+daemon pre-submit checks.
 
 Flags — the issue misdescribes the gate count badly. It is not "six
 gates": the header and the check calls enumerate 18 red-able checks
@@ -610,7 +648,7 @@ end UNKNOWN-not-red (rpmspec/%prep host limits), surfacing as "not
 proven on this host" on the verdict line — a daemon must not treat
 that GREEN as fully proven.
 
-## `scripts/target-gate.sh` + `scripts/pool-pr.sh` — Adapt
+## `scripts/target-gate.sh` + `scripts/pool-pr.sh` — Adapt, reimplemented in Rust
 
 The claimed mechanism is essentially accurate. `pool-pr.sh` runs
 `target-gate.sh` in check mode first and exits 7 with nothing pushed
@@ -628,6 +666,10 @@ submitter queue, but the Leap/Gitea/pool specifics, local-build
 mechanics, and git-dir file stamps must become daemon-side pre-submit
 checks in the single store, with the "only route" enforced by the
 queue owning the sole forge write path (via geectl's library).
+Reimplemented in Rust: keeps the exact-tree+base stamp,
+check-before-open and never-merge pattern as daemon-side pre-submit
+checks; drops the shell scripts, the git-dir stamp files and the
+local-build mechanics.
 
 Flags: (a) Scope is Leap-only — bases `leap-16.x`, repos
 `pool/<pkg>` on src.opensuse.org, builds against
@@ -646,7 +688,7 @@ no-double-filing (someone else's open PR on the base refuses; two of
 yours refuses; one head branch per base) and pushes LFS objects
 before the ref.
 
-## `scripts/autoforward-gate.sh` + `scripts/forward-check.py` — Adapt
+## `scripts/autoforward-gate.sh` + `scripts/forward-check.py` — Adapt, reimplemented in Rust
 
 This pair is the closest to queue-ready logic: `forward-check.py`
 decides per package (FORWARDED / MINE-OPEN / IN-FACTORY / declined
@@ -662,7 +704,8 @@ queue item states, but reimplement the decision logic over the single
 store (with re-discovery and cooldown) and geectl-library reads
 instead of shell + `osc` CLI + batch files + exit-code signalling.
 Note the gate decides unattended accept+forward of your own request;
-it does not itself accept or forward anything.
+it does not itself accept or forward anything. Reimplemented in Rust:
+keeps the verdict taxonomy and DUE conditions as queue item states.
 
 Flags — the issue's three-clause summary is wrong/incomplete in five
 places: (1) "Only an own accepted request" is overstated.
@@ -724,7 +767,7 @@ are created by a human-run `secrets` subcommand ("run it yourself,
 never from an agent"), and podman keeps secrets unencrypted under
 the home dir (mode 0600).
 
-## `scripts/_obs_scope.py` — Adopt as-is
+## `scripts/_obs_scope.py` — Adopt as-is (design), reimplemented in Rust
 
 The claim is accurate, including the docstring's own statement:
 "shared by gate.sh --obs-build and obs-wait.py so the gate and the
@@ -744,7 +787,10 @@ edit. `judged()` also accepts optional extra repos/arches regexes for
 widening. Adopt as-is as the pattern — one scope module shared by the
 observer and the queues — with the literal regexes being the
 Factory/Leap scope; any further freshcrab targets get added in that
-one place, never per-consumer.
+one place, never per-consumer. The "adopt as-is" is the design only:
+one scope module shared by the observer and the queues, with the
+literal regexes as data. It is reimplemented in Rust; the Python file
+is not carried into the daemon.
 
 ## Proposed `docs/architecture.md` edits
 
