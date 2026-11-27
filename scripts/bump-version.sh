@@ -8,11 +8,12 @@
 # Cargo.lock, and the man pages under man/, which stamp the version in
 # their `.TH` header. A repo-wide grep for the current version confirms
 # nothing else carries it (README.md and docs/ hold no version string;
-# the two exclusions in the check below cite the pinned geectl
-# dependency's version, not this repo's), so there are no doc sentences
-# to rewrite — the script rewrites the two manifest surfaces and
-# regenerates the pages, then verifies the result, so a half-applied
-# bump fails here rather than riding along in a version-bump PR.
+# the check below excludes the two bumped manifests, `:!Cargo.lock`
+# and `:!Cargo.toml`, whose other version strings are dependency
+# versions, not this repo's), so there are no doc sentences to rewrite
+# — the script rewrites the two manifest surfaces and regenerates the
+# pages, then verifies the result, so a half-applied bump fails here
+# rather than riding along in a version-bump PR.
 set -euo pipefail
 
 # No leading zeros: Cargo rejects them, and only after the tree is edited.
@@ -35,7 +36,7 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 # One EXIT cleanup for the whole script: it removes every tempfile
-# the script creates and, on any nonzero exit, restores the two
+# the script creates and, on any nonzero exit, restores the three
 # version surfaces. EXIT (not ERR) is what makes explicit `exit 1`
 # validation failures restore too — ERR never fires for an explicit
 # exit, so a post-edit drift/mismatch/stale failure would leave a
@@ -145,8 +146,9 @@ for page in man/*.1; do
   [ -f "$gen_tmp/man/$(basename "$page")" ] || rm -f "$page"
 done
 
-# Verify both surfaces carry the new version, and that no other
-# tracked file still carries the old one.
+# Verify the two manifest surfaces carry the new version, and that no
+# other tracked file still carries the old one. The man pages are
+# covered by the stale-version grep below, not by this check.
 manifest=$(manifest_version Cargo.toml)
 locked=$(sed -n '/^[[:space:]]*name[[:space:]]*=[[:space:]]*"freshcrab"/,/^[[:space:]]*version[[:space:]]*=/s/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.lock | head -1)
 if [ "$manifest" != "$new" ] || [ "$locked" != "$new" ]; then
