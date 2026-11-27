@@ -799,6 +799,11 @@ mod tests {
             "openSUSE_Leap_15.6",
             vec![("openSUSE:Leap:15.6".to_string(), "standard".to_string())]
         )));
+        // Slowroll is a distinct distribution, not Tumbleweed.
+        assert!(!repo_is_tumbleweed(&repo_named(
+            "openSUSE_Slowroll",
+            vec![("openSUSE:Slowroll".to_string(), "standard".to_string())]
+        )));
         assert!(!repo_is_tumbleweed(&repo_named("standard", vec![])));
         // Only the first path decides: a secondary Factory path on a
         // Leap repo does not make it Tumbleweed.
