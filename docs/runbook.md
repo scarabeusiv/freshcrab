@@ -162,6 +162,38 @@ The watcher prints "kill switch is on: pipeline paused, nothing
 queued." and exits without doing anything. Set it back to `false` to
 resume.
 
+## Project hygiene (report-only)
+
+`freshcrab hygiene` sweeps a project for two kinds of staleness and
+prints the findings as JSON. Report-only: the sweeps read only and
+change nothing on OBS — there is no `--live` flag and nothing is
+deleted or removed. The kill switch pauses the run like the pipeline.
+
+```sh
+cargo run -- hygiene --project devel:languages:python
+```
+
+With no `--project` flag the projects come from `hygiene_projects`
+in `config.yaml`, else the home project (`home_project`, or
+`home:{OSC_USERNAME}`). The sweeps need OBS credentials
+(`OSC_USERNAME` / `OSC_PASSWORD`): the build results and the request
+search are authenticated reads, and without them the run fails closed.
+
+- **Obsolete repositories.** A repository whose build path targets
+  a project or repository that no longer exists: the target project
+  is gone (404), or the target project exists but carries no such
+  repository. Each finding names the repository, the path, and the
+  reason.
+- **Long-broken packages.** A package that fails in every repository
+  that counts for it, has not built successfully in 90 days, and was
+  never integrated — no accepted submit request ever came from the
+  project or a branch of it. A package in Factory counts Tumbleweed
+  among its repositories; a package only in the devel project does
+  not — failing on Tumbleweed is fine as long as it builds on the
+  older releases. Each finding names the package, whether it is in
+  Factory, the failing repositories with their codes, and the last
+  successful build time (or none).
+
 ## Read the queue
 
 The watcher prints the queue as JSON (one entry per package behind):

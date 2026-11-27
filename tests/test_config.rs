@@ -57,6 +57,29 @@ fn invalid_config_is_rejected() {
 }
 
 #[test]
+fn hygiene_projects_parse() {
+    // Default: no projects configured.
+    let cfg = load_config_text("").unwrap();
+    assert!(cfg.hygiene_projects.is_empty());
+
+    let cfg =
+        load_config_text("hygiene_projects:\n  - devel:languages:python\n  - home:scarabeus_iv\n")
+            .unwrap();
+    assert_eq!(
+        cfg.hygiene_projects,
+        vec![
+            "devel:languages:python".to_string(),
+            "home:scarabeus_iv".to_string()
+        ]
+    );
+
+    // A scalar is not a list.
+    assert!(load_config_text("hygiene_projects: devel:languages:python\n").is_err());
+    // A name with a space is not a valid OBS project name.
+    assert!(load_config_text("hygiene_projects:\n  - bad name\n").is_err());
+}
+
+#[test]
 fn exclusions_win_over_package_list() {
     let cfg = load_config_text("packages:\n  - gcc\nexclusions:\n  - gcc\n").unwrap();
     assert!(!cfg.watched("gcc"));
