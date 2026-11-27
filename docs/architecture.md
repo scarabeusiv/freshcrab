@@ -1,12 +1,15 @@
 # Architecture
 
-freshcrab is the automatic updater and validator for openSUSE
-Tumbleweed/Factory — the updater crab, paired with rpmcrab (the linter
-crab). It runs queues over updates and submissions: it watches upstream
-releases, files updates, triages submissions through a ruleset, and
-sweeps projects for hygiene. Forge access goes through geectl's
-library for the forges it covers — freshcrab implements no forge
-logic of its own.
+freshcrab is the central queue planner for openSUSE packaging work —
+a long-running daemon over one coherent queue across forges. It
+plans and runs the work: the updater queue (watch upstream releases,
+bump, build, validate), the reviewer queue (triage submissions through a ruleset), the submitter queue (file
+submissions), a hotfix queue, and cleanups (hygiene sweeps). A
+central observer controls token budget and cost, forge assignment,
+and item locking. Sources span OBS, Gitea, GitHub, GitLab, and
+bugwarden bugs; targets span Factory updates and Leap maintenance.
+Forge access goes through geectl's library for the forges it covers
+— freshcrab implements no forge logic of its own.
 
 This document describes the target state — the system as designed,
 not the current implementation.

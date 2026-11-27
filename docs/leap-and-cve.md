@@ -1,7 +1,7 @@
 # Leap and CVE validation (planned)
 
-This is the design for extending freshcrab beyond Factory: validate
-CVEs and submit updates to Leap. It is a **plan + scaffold**; the Leap
+This is the design for the Leap target: validate CVEs and submit
+updates to Leap. It is a **plan + scaffold**; the Leap
 watcher logic, the CVE data-source integration, and Leap SR filing are
 the remaining work. The extension points are:
 `src/target.rs` (distribution targets + the per-target update-policy

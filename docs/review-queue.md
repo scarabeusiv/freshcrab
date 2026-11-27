@@ -1,6 +1,6 @@
 # Reviewer queue
 
-freshcrab triages submissions: OBS submit requests and Gitea pull
+The reviewer queue triages submissions: OBS submit requests and Gitea pull
 requests, read and acted on through geectl's unified pull-request
 surface. A ruleset auto-comments or rejects the clear cases,
 mid-confidence items sit in a maintained queue, and the rest go to a
