@@ -7,6 +7,9 @@ releases, files updates, triages submissions through a ruleset, and
 sweeps projects for hygiene. All forge access goes through geectl's
 library — freshcrab implements no forge logic of its own.
 
+This document describes the target state — the system as designed,
+not the current implementation.
+
 ## Architecture
 
 ```mermaid
@@ -40,7 +43,7 @@ flowchart TD
     Updater --> Submitter
     Submitter --> Devel
     Devel -. "re-discovery — cooldown on self-owned" .-> Reviewer
-    Hotfix -. "bypasses the cooldown" .-> Submitter
+    Hotfix -. "bypasses the cooldown" .-> Reviewer
 ```
 
 ### Central queue planner
@@ -60,7 +63,12 @@ flowchart TD
   in-flight items go back to the queue on restart. On restart, the
   already-attempted items are prioritised in the processing schedule
   — there is already something to base off (partial work/state from
-  the earlier attempt).
+  the earlier attempt). A mutating item is never auto-reclaimed on
+  lock expiry alone: the queue records a durable action intent
+  before acting, and a reclaimed item is reconciled against the
+  server — fencing token, forge idempotency key, or deterministic
+  comment marker — before any repeat, so a comment, accept, or
+  commit is never posted twice.
 
 ### Updater queue
 
@@ -91,20 +99,26 @@ flowchart TD
   matching the SR id. A self-filed submission gets a cooldown
   before the reviewer acts on it — a self-owned submission getting
   self-approved is a last-instance effort — unless a human
-  overrides it directly with geectl. The cooldown duration is
+  overrides it directly with geectl. The cooldown is a timer, not
+  authorization: a self-authored submission always requires an
+  independent human accept bound to the exact reviewed revision,
+  cooldown or no cooldown. The cooldown duration is
   open. See Open questions.
 - A hotfix queue carries concentrated nits that were quick-fixed:
   quick commit and forward, processed and reviewed as priority. It
   bypasses the cooldown on self-owned submissions — the priority
-  exception to the re-discovery/cooldown rule. The queue's exact
-  shape, its priority ordering, and what counts as a concentrated
-  nit are open. See Open questions.
+  exception to the re-discovery/cooldown rule. Priority is
+  scheduling only: a hotfix never changes authorization, accept,
+  or direct-commit rules — a self-authored submission still
+  requires an independent human accept bound to the exact reviewed
+  revision. The queue's exact shape, its priority ordering, and
+  what counts as a concentrated nit are open. See Open questions.
 
 ### Submitter queue
 
 - Files submissions: the SR to the devel project (Factory updates),
   and maintenance-request filing for Leap
-  ([#15](https://github.com/scarabeusiv/freshcrab/issues/15),
+  ([#15](https://github.com/scarabeusiv/freshcrab/pull/15),
   [#7](https://github.com/scarabeusiv/freshcrab/issues/7)).
 - Filing is the submitter queue's job: the worker builds the SR
   payload and hands filing to the submitter queue, which works in
@@ -113,7 +127,7 @@ flowchart TD
   already done when filing is queued, so a tail-appended filing
   would sit while the completed work waits. The exact insertion
   position is open. See Open questions.
-- [#15](https://github.com/scarabeusiv/freshcrab/issues/15) reworks Leap
+- [#15](https://github.com/scarabeusiv/freshcrab/pull/15) reworks Leap
   maintenance-request filing to go through geectl only.
 
 ### Cleanups
@@ -125,7 +139,8 @@ flowchart TD
   never-integrated packages (90-day threshold; broken means not
   building anywhere, Tumbleweed counting only for Factory packages;
   never-integrated means no accepted submit request ever; scope is
-  both devel and home projects).
+  both devel and home projects — policy decided on the issue,
+  comments 7221694672 and 7221715192).
 - [#22](https://github.com/scarabeusiv/freshcrab/issues/22) is a CLI
   sweep (`freshcrab hygiene`), report-only. Whether
   the planner invokes it on a schedule or it stays manual is open.
@@ -140,11 +155,17 @@ flowchart TD
   budget lasts the month. The daemon must not spend it in a day or a
   week. The daemon is built for labs that pay per token, so pacing is
   a first-class concern. Cost is token spend, not API call count or
-  wall time. The budget unit is token cost (money), scoped per lab,
-  per month, with day/week pacing. The budget values are per-lab
-  config; the pacing mechanism is open. The initial setup is
-  'unlimited' by default; budget enforcement is open. See Open
-  questions.
+  wall time. The budget carries two caps: a raw-token cap and a
+  monetary cap, with per-model pricing — prices differ per model
+  and token type. The budget values are per-lab config; the pacing
+  mechanism is open. The initial setup is 'unlimited' by default;
+  budget enforcement is open. 'Unlimited' is never the live acting
+  default: a queue goes live only with a finite budget configured —
+  unlimited is valid only for report-only and dry-run — and a live
+  run that acts on submissions carries a finite budget. The observer reserves budget to finish or roll back an
+  action unit. If the observer dies or cannot read budget state,
+  the queues stop new mutations (fail-closed), never run
+  unbounded. See Open questions.
 - Clients that exist: the forge clients — OBS, Gitea, and later
   GitHub and GitLab — all reached through geectl's library; and the
   collectors (Repology, Anitya, PyPI, Distrowatch) that the updater
@@ -161,9 +182,13 @@ flowchart TD
   next budget period is open. See Open questions.
 - Coherent queue: one queue across forges, in one store for the whole
   queue — not the union of the per-queue state files. An item is
-  identified by its handle, not by who filed it; one record per ref
-  (`obs:<id>` / `gitea:<owner>/<repo>#<number>`); re-discovery
-  updates the record in place, never duplicates it. No cross-forge
+  identified by its handle, not by who filed it; one record per ref,
+  keyed by instance (`obs:<instance>:<id>` /
+  `gitea:<instance>:<owner>/<repo>#<number>`). The record persists
+  the instance identity with its binding, credentials, authority,
+  and history; an item never migrates between instances — work on
+  another instance is a new item. Re-discovery updates the record
+  in place, never duplicates it. No cross-forge
   dedup: the same logical change on two forges is two items, one per
   forge — there might be a reason it exists in two places (an OBS
   submission copied to an internal SUSE instance for security
@@ -205,7 +230,7 @@ flowchart TD
 | Version watching (watcher, collectors, confirmation) | Updater |
 | One queue store, dispatcher, worker (branch, bump, clean, build, validate) | Updater |
 | SR filing to devel | Submitter |
-| [#15](https://github.com/scarabeusiv/freshcrab/issues/15) Leap maintenance-request filing | Submitter |
+| [#15](https://github.com/scarabeusiv/freshcrab/pull/15) Leap maintenance-request filing | Submitter |
 | [#21](https://github.com/scarabeusiv/freshcrab/issues/21) review queue | Reviewer |
 | [#22](https://github.com/scarabeusiv/freshcrab/issues/22) hygiene sweeps | Cleanup (planner-run) |
 | [#24](https://github.com/scarabeusiv/freshcrab/issues/24) crates.io publish | — |
@@ -434,7 +459,7 @@ unchecked dedup. The credentials are read from the `OSC_USERNAME` /
 `OSC_PASSWORD` environment variables; the search uses them (HTTP Basic
 auth) when present, and filing a submit request requires them (the OBS
 API accepts HTTP Basic auth with oscrc credentials). The values are
-Logging excludes the values.
+never logged.
 
 ## Layout
 
@@ -520,58 +545,55 @@ by the design above.
 5. Post-exhaustion state: after the daemon finishes on budget
    exhaustion, does it exit or idle waiting for the next budget
    period? Decision: post-exhaustion state.
-6. Observer failure: if the observer dies or cannot read budget
-   state, do the queues run unbounded (fail-open) or stop
-   (fail-closed)? Decision: observer failure mode.
 
 ### Coherent queue
 
-7. Reprioritisation mechanism: how does a human tell the daemon to
+6. Reprioritisation mechanism: how does a human tell the daemon to
     prioritise CVEs or cleanups — a command, an API, a config file?
     Decision: reprioritisation mechanism.
-8. Lock durations: what is the per-worker duration limit, and after
+7. Lock durations: what is the per-worker duration limit, and after
     how long does the daemon reclaim a long-running item back into
     the queue? Decision: lock durations.
 
 ### Forge assignment
 
-9. Adding a forge mid-run: is a newly configured forge picked up on
+8. Adding a forge mid-run: is a newly configured forge picked up on
     the next run, or does the planner need a restart? Are existing
     items re-evaluated against the new forge? Decision: forge
     onboarding.
 
 ### Queue interaction
 
-10. Cooldown duration: how long is the cooldown on a self-owned
+9. Cooldown duration: how long is the cooldown on a self-owned
     submission before the reviewer acts on it? Decision: cooldown
     duration.
-11. Filing insertion position: filing items are inserted with
+10. Filing insertion position: filing items are inserted with
     priority, not tail-appended — where exactly: at the head, or at
     a high-priority position? Decision: filing insertion position.
-12. Hotfix queue shape: what is the hotfix queue's exact shape,
+11. Hotfix queue shape: what is the hotfix queue's exact shape,
     its priority ordering, and what counts as a concentrated nit?
     Decision: hotfix queue shape.
 
 ### State, guards, config
 
-13. Planner state: does the planner keep spawn and cleanup state?
+12. Planner state: does the planner keep spawn and cleanup state?
     Decision: planner state.
-14. Kill switch scope: does the kill switch pause the planner (all
+13. Kill switch scope: does the kill switch pause the planner (all
     queues) or one queue? Decision: kill-switch scope.
-15. Dry-run scope: is dry-run global, or can one queue be live while
+14. Dry-run scope: is dry-run global, or can one queue be live while
     another is dry-run? Decision: dry-run granularity.
-16. Config placement: where do the planner schedule and the observer
+15. Config placement: where do the planner schedule and the observer
     budgets live — `config.yaml`, the ruleset, or a separate file?
     Decision: config placement.
 
 ### Cleanups
 
-17. Cleanup trigger: what triggers a cleanup — a planner schedule, a
+16. Cleanup trigger: what triggers a cleanup — a planner schedule, a
     threshold, manual? Is
     [#22](https://github.com/scarabeusiv/freshcrab/issues/22) hygiene
     invoked by the planner, or run
     manually? Decision: cleanup trigger.
-18. Cleanup safety: what guards an acting cleanup (dry-run, kill
+17. Cleanup safety: what guards an acting cleanup (dry-run, kill
     switch, human approval), and when does
     [#22](https://github.com/scarabeusiv/freshcrab/issues/22) move from
     report-only
@@ -579,25 +601,23 @@ by the design above.
 
 ### Failure modes
 
-19. Queue death: if one queue dies, does the planner restart it, mark
+18. Queue death: if one queue dies, does the planner restart it, mark
     it, or continue with the others? Does a dead queue block the
     run? Decision: queue-failure handling.
-20. Partial act: an item is half-acted (comment posted, state not
-    saved) — what resumes it? Decision: partial-act recovery.
 
 ### Scope
 
-21. Planner boundary ("whatever"): is release tooling (
+19. Planner boundary ("whatever"): is release tooling (
     [#24](https://github.com/scarabeusiv/freshcrab/issues/24) crates.io
     publish) planner-owned, or outside the architecture? Decision:
     planner boundary.
-22. GitHub and GitLab (
+20. GitHub and GitLab (
     [#26](https://github.com/scarabeusiv/freshcrab/issues/26)): are
     they forges under the observer (with
     tokens and budgets), or out of scope? Decision: forge scope.
-23. Bugwarden integration shape: how does discovery pull bugs from
+21. Bugwarden integration shape: how does discovery pull bugs from
     bugwarden (Bugzilla) into the queue — what fields, what filters,
     what maps to a queue item? Decision: bugwarden integration
     shape.
-24. Jira as a queue source: does Jira join bugwarden as a source of
+22. Jira as a queue source: does Jira join bugwarden as a source of
     queue items, and with what scope? Decision: Jira queue source.
