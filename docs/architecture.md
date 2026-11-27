@@ -180,7 +180,7 @@ flag and make no mutations. `freshcrab hygiene` (see the runbook)
 runs both sweeps per project and prints the report as JSON.
 
 - **Obsolete repositories.** A repository whose build path targets
-  a project or repository that no longer exists. The sweep reads the
+  a project or repository that is not found. The sweep reads the
   swept project's meta, then each distinct path target's meta; a
   target project that answers 404 is not found (gone or not
   visible to these credentials — the API does not distinguish the

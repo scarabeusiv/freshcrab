@@ -100,12 +100,19 @@ pub fn classify_repo(statuses: &[PackageBuildStatus]) -> RepoBuild {
 
 /// True when `project` is a Tumbleweed-family build target: the
 /// Factory project itself, the Tumbleweed distribution project, or a
-/// Factory port (`openSUSE:Factory:*` — zSystems, PowerPC, ARM,
-/// RISCV).
+/// Factory port (zSystems, PowerPC, ARM, RISCV). `openSUSE:Slowroll`
+/// is a distinct distribution, not a Tumbleweed build target, so it
+/// does not count here.
 pub fn is_tumbleweed_path_project(project: &str) -> bool {
-    project == "openSUSE:Factory"
-        || project == "openSUSE:Tumbleweed"
-        || project.starts_with("openSUSE:Factory:")
+    matches!(
+        project,
+        "openSUSE:Factory"
+            | "openSUSE:Tumbleweed"
+            | "openSUSE:Factory:zSystems"
+            | "openSUSE:Factory:PowerPC"
+            | "openSUSE:Factory:ARM"
+            | "openSUSE:Factory:RISCV"
+    )
 }
 
 /// True when the repository targets Tumbleweed: its primary build
@@ -117,6 +124,75 @@ pub fn repo_is_tumbleweed(repo: &Repository) -> bool {
         .first()
         .map(|(project, _)| is_tumbleweed_path_project(project))
         .unwrap_or(false)
+}
+
+/// Whether `repo` (in `project`) targets Tumbleweed, following the
+/// first path transitively through the project's own tree. A repo
+/// whose first path points at the swept project itself or one of its
+/// subprojects builds against that target repo, so the family check
+/// applies to the referenced repo's first path instead (e.g. the
+/// `py315` repo paths to the backports `py315` repo, which paths to
+/// `openSUSE:Tumbleweed`). The walk is bounded by a visited set, so
+/// a cycle stops it. An indirection that cannot be resolved because
+/// the target is not found excludes the repo from counting — the
+/// fail-closed direction for a deletion-pointing report (a package
+/// is not listed as long-broken on the strength of a repo whose
+/// target cannot be read). Any other read failure fails loudly.
+/// Target metas are cached in `cache` across repos.
+fn repo_is_tumbleweed_resolved(
+    obs: &ObsClient,
+    project: &str,
+    repo: &Repository,
+    cache: &mut HashMap<String, Option<ProjectMeta>>,
+) -> Result<bool, GeectlError> {
+    let mut current_project = project.to_string();
+    let mut current_name = repo.name.clone();
+    let mut current_paths = repo.paths.clone();
+    let mut visited: HashSet<(String, String)> = HashSet::new();
+    loop {
+        let Some((path_project, path_repo)) = current_paths.first().cloned() else {
+            return Ok(false);
+        };
+        if is_tumbleweed_path_project(&path_project) {
+            return Ok(true);
+        }
+        // Only follow the indirection inside the swept project's own
+        // tree; an external target is a direct build target, not
+        // Tumbleweed.
+        if path_project != project && !path_project.starts_with(&format!("{project}:")) {
+            return Ok(false);
+        }
+        if !visited.insert((current_project.clone(), current_name.clone())) {
+            // Cycle: cannot resolve; exclude from counting.
+            return Ok(true);
+        }
+        if !cache.contains_key(&path_project) {
+            match obs.project_meta_authenticated(&path_project) {
+                Ok(target) => {
+                    cache.insert(path_project.clone(), Some(target));
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    cache.insert(path_project.clone(), None);
+                }
+                Err(e) => return Err(map_credentials_error(e)),
+            }
+        }
+        let Some(target_meta) = &cache[&path_project] else {
+            // Target not found: exclude from counting.
+            return Ok(true);
+        };
+        let Some(target_repo) = target_meta
+            .repositories
+            .iter()
+            .find(|r| r.name == path_repo)
+        else {
+            // Referenced repo not in the target: exclude from counting.
+            return Ok(true);
+        };
+        current_project = path_project;
+        current_name = target_repo.name.clone();
+        current_paths = target_repo.paths.clone();
+    }
 }
 
 /// True when `source_project` is `project` itself or a branch of it.
@@ -372,9 +448,11 @@ fn ever_integrated(obs: &ObsClient, project: &str, package: &str) -> Result<bool
 /// repository, or whose duration is unproven, is not listed.
 /// `factory_packages` is the Factory package list, fetched once by
 /// the caller and shared across projects. A repository flagged
-/// obsolete by the other sweep still counts here: the sweeps are
-/// independent, and an obsolete path says nothing about the
-/// repository's build state.
+/// obsolete by the other sweep still counts here: the sweeps do not
+/// filter each other by construction, and the report carries both
+/// findings, so a reader can tell a platform-caused failure (the
+/// path target is gone, which is plausibly what makes the repo's
+/// builds fail) from a package-caused one.
 pub fn sweep_long_broken(
     obs: &ObsClient,
     project: &str,
@@ -389,6 +467,18 @@ pub fn sweep_long_broken(
     let results = obs
         .results(project, &ResultsQuery::default())
         .map_err(map_credentials_error)?;
+
+    // Each repository's Tumbleweed status, resolved once: the check
+    // follows the first path transitively through the project's own
+    // tree (a repo building against a subproject repo ultimately
+    // builds against that repo's target), and may fetch subproject
+    // metas, cached.
+    let mut meta_cache: HashMap<String, Option<ProjectMeta>> = HashMap::new();
+    let mut is_tumbleweed: HashMap<String, bool> = HashMap::new();
+    for repo in &meta.repositories {
+        let tw = repo_is_tumbleweed_resolved(obs, project, repo, &mut meta_cache)?;
+        is_tumbleweed.insert(repo.name.clone(), tw);
+    }
 
     // The build matrix, keyed by (repository, package): the statuses
     // with the architecture each came from.
@@ -412,7 +502,7 @@ pub fn sweep_long_broken(
         let mut failures: Vec<RepoFailure> = Vec::new();
         let mut builds_somewhere = false;
         for repo in &meta.repositories {
-            if in_factory || !repo_is_tumbleweed(repo) {
+            if in_factory || !is_tumbleweed[&repo.name] {
                 let statuses: Vec<PackageBuildStatus> = by_repo_package
                     .get(&(repo.name.clone(), package.clone()))
                     .map(|entries| entries.iter().map(|(_, s)| s.clone()).collect())
@@ -439,11 +529,12 @@ pub fn sweep_long_broken(
         // repository. The history runs on one architecture where the
         // package fails, so the jobs it returns are this package's.
         // Known limitation: a success on another architecture within
-        // the threshold is missed when that architecture's current
-        // status is neutral (disabled, in flight, or absent) — the
-        // package can then be listed despite a recent success there.
-        // The single-arch read keeps the sweep to one history call
-        // per repository; the current status is the guard for the
+        // the threshold is missed whenever that architecture's
+        // current status is not a success (it fails now, is
+        // disabled, in flight, or absent) — the package can then be
+        // listed despite a recent success there. The single-arch
+        // read keeps the sweep to one history call per repository;
+        // a current success on another arch is the guard for the
         // common case.
         let mut sustained = true;
         for failure in &mut failures {
@@ -546,9 +637,13 @@ pub fn run_hygiene(
 /// first, then `hygiene_projects` from the config, then the home
 /// project (`home_project` from the config, else `home:{OSC_USERNAME}`).
 /// Duplicates are kept here; `run_hygiene` dedupes them.
+/// `osc_username` is the `OSC_USERNAME` value (None when unset);
+/// taking it as a parameter keeps the resolution hermetically
+/// testable instead of depending on the ambient environment.
 pub fn resolve_hygiene_projects(
     config: &crate::config::Config,
     cli_projects: &[String],
+    osc_username: Option<&str>,
 ) -> Result<Vec<String>, String> {
     if !cli_projects.is_empty() {
         return Ok(cli_projects.to_vec());
@@ -559,16 +654,26 @@ pub fn resolve_hygiene_projects(
     if !config.home_project.is_empty() {
         return Ok(vec![config.home_project.clone()]);
     }
-    match std::env::var("OSC_USERNAME")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-    {
+    match osc_username.filter(|v| !v.trim().is_empty()) {
         Some(username) => Ok(vec![format!("home:{}", username.trim())]),
         None => Err(
             "no projects to sweep: pass --project, set hygiene_projects in the config, or set OSC_USERNAME"
                 .to_string(),
         ),
     }
+}
+
+/// The same resolution with the `OSC_USERNAME` value read from the
+/// environment. Thin wrapper over `resolve_hygiene_projects`.
+pub fn resolve_hygiene_projects_from_env(
+    config: &crate::config::Config,
+    cli_projects: &[String],
+) -> Result<Vec<String>, String> {
+    resolve_hygiene_projects(
+        config,
+        cli_projects,
+        std::env::var("OSC_USERNAME").ok().as_deref(),
+    )
 }
 
 /// The current unix time, for stamping a run.
@@ -768,18 +873,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_hygiene_projects(&cfg, &["home:scarabeus_iv".to_string()]).unwrap(),
+            resolve_hygiene_projects(&cfg, &["home:scarabeus_iv".to_string()], None).unwrap(),
             vec!["home:scarabeus_iv".to_string()]
         );
         // Config hygiene_projects next.
         assert_eq!(
-            resolve_hygiene_projects(&cfg, &[]).unwrap(),
+            resolve_hygiene_projects(&cfg, &[], None).unwrap(),
             vec!["devel:languages:python".to_string()]
         );
         // Then home_project.
         let cfg = load_config_text("home_project: home:scarabeus_iv\n").unwrap();
         assert_eq!(
-            resolve_hygiene_projects(&cfg, &[]).unwrap(),
+            resolve_hygiene_projects(&cfg, &[], None).unwrap(),
+            vec!["home:scarabeus_iv".to_string()]
+        );
+        // Then home:{OSC_USERNAME}.
+        let cfg = load_config_text("").unwrap();
+        assert_eq!(
+            resolve_hygiene_projects(&cfg, &[], Some("scarabeus_iv")).unwrap(),
             vec!["home:scarabeus_iv".to_string()]
         );
     }
@@ -788,12 +899,11 @@ mod tests {
     fn resolve_projects_errors_with_no_source() {
         use crate::config::load_config_text;
         let cfg = load_config_text("").unwrap();
-        // No CLI, no config, no OSC_USERNAME in the test env (the
-        // suite does not set it): an error, not a guessed project.
-        // (If the ambient env carries OSC_USERNAME this errors
-        // differently; the suite runs without it.)
-        if std::env::var("OSC_USERNAME").is_err() {
-            assert!(resolve_hygiene_projects(&cfg, &[]).is_err());
-        }
+        // No CLI, no config, no OSC_USERNAME: an error, not a
+        // guessed project. Hermetic: the username is passed
+        // explicitly, so the ambient environment cannot change it.
+        assert!(resolve_hygiene_projects(&cfg, &[], None).is_err());
+        // A blank username is the same as unset.
+        assert!(resolve_hygiene_projects(&cfg, &[], Some("   ")).is_err());
     }
 }

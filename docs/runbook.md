@@ -180,7 +180,7 @@ in `config.yaml`, else the home project (`home_project`, or
 search are authenticated reads, and without them the run fails closed.
 
 - **Obsolete repositories.** A repository whose build path targets
-  a project or repository that no longer exists: the target project
+  a project or repository that is not found: the target project
   is not found (404 — gone or not visible to these credentials),
   or the target project exists but carries no such
   repository. Each finding names the repository, the path, and the

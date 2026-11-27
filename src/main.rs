@@ -438,7 +438,7 @@ fn run_hygiene_cli(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let projects = match freshcrab::hygiene::resolve_hygiene_projects(&config, &projects) {
+    let projects = match freshcrab::hygiene::resolve_hygiene_projects_from_env(&config, &projects) {
         Ok(projects) => projects,
         Err(e) => {
             eprintln!("{e}");

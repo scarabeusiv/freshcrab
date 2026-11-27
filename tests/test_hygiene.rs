@@ -144,8 +144,10 @@ fn empty_collection() -> String {
 
 fn project_meta() -> String {
     // The real devel:languages:python shape: the Tumbleweed repo
-    // paths to openSUSE:Tumbleweed (not openSUSE:Factory), and there
-    // is a Factory port repo (zSystems) alongside the Leap repo.
+    // paths to openSUSE:Tumbleweed (not openSUSE:Factory), there is
+    // a Factory port repo (zSystems) alongside the Leap repo, and
+    // two repos build against the backports subproject — py315 is
+    // transitively Tumbleweed, 15.7 transitively Leap.
     meta_xml(
         PROJECT,
         &[
@@ -160,10 +162,33 @@ fn project_meta() -> String {
                 &[("openSUSE:Factory:zSystems", "standard")],
             ),
             (
+                "py315",
+                &["x86_64"],
+                &[("devel:languages:python:backports", "py315")],
+            ),
+            (
+                "15.7",
+                &["x86_64"],
+                &[("devel:languages:python:backports", "15.7")],
+            ),
+            (
                 "openSUSE_Leap_15.6",
                 &["x86_64"],
                 &[("openSUSE:Leap:15.6", "standard")],
             ),
+        ],
+    )
+}
+
+/// The backports subproject meta the transitive Tumbleweed check
+/// resolves through: its py315 repo paths to openSUSE:Tumbleweed,
+/// its 15.7 repo to openSUSE:Leap:15.7.
+fn backports_meta() -> String {
+    meta_xml(
+        "devel:languages:python:backports",
+        &[
+            ("py315", &["x86_64"], &[("openSUSE:Tumbleweed", "standard")]),
+            ("15.7", &["x86_64"], &[("openSUSE:Leap:15.7", "standard")]),
         ],
     )
 }
@@ -257,11 +282,11 @@ fn obsolete_sweep_fails_loudly_on_target_server_error() {
         )
         .with_status(&meta_url("openSUSE:Leap:15.5"), 500, "boom");
     let obs = obs_with_creds(&http);
-    let err = sweep_obsolete_repositories(&obs, PROJECT).unwrap_err();
-    // A 500 surfaces as a network error through the transport
-    // mapping (HttpError::Other); the point is the sweep fails
-    // loudly instead of listing the path as obsolete.
-    assert_eq!(err.kind(), geectl::error::ErrorKind::NetworkError);
+    // The sweep fails loudly instead of listing the path as
+    // obsolete. The error kind is not pinned: the test fake maps a
+    // 500 to NetworkError, while the production transport (geectl's
+    // UreqClient) retries then reports ServerError.
+    let _err = sweep_obsolete_repositories(&obs, PROJECT).unwrap_err();
     assert!(http.posted().is_empty());
 }
 
@@ -278,6 +303,10 @@ fn long_broken_lists_only_sustained_never_integrated() {
         .with(&list_url(FACTORY), &directory_xml(&["bar"]))
         .with(&list_url(PROJECT), &directory_xml(&["foo", "bar", "baz"]))
         .with(&meta_url(PROJECT), &project_meta())
+        .with(
+            &meta_url("devel:languages:python:backports"),
+            &backports_meta(),
+        )
         .with(
             &results_url(PROJECT),
             &results_xml(&[
@@ -329,6 +358,10 @@ fn tumbleweed_counts_for_a_factory_package() {
         .with(&list_url(PROJECT), &directory_xml(&["qux"]))
         .with(&meta_url(PROJECT), &project_meta())
         .with(
+            &meta_url("devel:languages:python:backports"),
+            &backports_meta(),
+        )
+        .with(
             &results_url(PROJECT),
             &results_xml(&[
                 ("openSUSE_Tumbleweed", "x86_64", &[("qux", "failed")]),
@@ -375,6 +408,10 @@ fn accepted_request_from_the_project_excludes_but_another_project_does_not() {
         .with(&list_url(PROJECT), &directory_xml(&["quux", "corge"]))
         .with(&meta_url(PROJECT), &project_meta())
         .with(
+            &meta_url("devel:languages:python:backports"),
+            &backports_meta(),
+        )
+        .with(
             &results_url(PROJECT),
             &results_xml(&[
                 (
@@ -419,6 +456,31 @@ fn accepted_request_from_the_project_excludes_but_another_project_does_not() {
     assert_eq!(broken.len(), 1);
     assert_eq!(broken[0].package, "corge");
     assert!(!broken[0].in_factory);
+    assert!(http.posted().is_empty());
+}
+
+#[test]
+fn transitive_tumbleweed_repo_does_not_count() {
+    // solo: devel-only, fails only on py315. py315 paths to the
+    // backports py315 repo, which paths to openSUSE:Tumbleweed, so
+    // py315 does not count for a devel-only package and solo has no
+    // counting failure at all. No py315 job history is canned: the
+    // sweep must never check it.
+    let http = FakeHttpClient::new()
+        .with(&list_url(FACTORY), &directory_xml(&[]))
+        .with(&list_url(PROJECT), &directory_xml(&["solo"]))
+        .with(&meta_url(PROJECT), &project_meta())
+        .with(
+            &meta_url("devel:languages:python:backports"),
+            &backports_meta(),
+        )
+        .with(
+            &results_url(PROJECT),
+            &results_xml(&[("py315", "x86_64", &[("solo", "failed")])]),
+        );
+    let obs = obs_with_creds(&http);
+    let broken = sweep_long_broken(&obs, PROJECT, &factory_set(&[]), NOW).unwrap();
+    assert!(broken.is_empty());
     assert!(http.posted().is_empty());
 }
 
@@ -474,10 +536,15 @@ fn run_hygiene_reports_both_sweeps_per_project() {
         .with(&search_url_for("foo"), &empty_collection());
     let obs = obs_with_creds(&http);
     let report = run_hygiene(&obs, &[PROJECT.to_string()], NOW).unwrap();
+    assert_eq!(report.generated_unix, NOW);
     assert_eq!(report.projects.len(), 1);
     assert_eq!(report.projects[0].project, PROJECT);
     assert_eq!(report.projects[0].obsolete_repositories.len(), 1);
     assert_eq!(report.projects[0].long_broken_packages.len(), 1);
     assert_eq!(report.projects[0].long_broken_packages[0].package, "foo");
     assert!(http.posted().is_empty());
+    // A duplicate project is swept once, first occurrence wins.
+    let report = run_hygiene(&obs, &[PROJECT.to_string(), PROJECT.to_string()], NOW).unwrap();
+    assert_eq!(report.projects.len(), 1);
+    assert_eq!(report.projects[0].project, PROJECT);
 }
