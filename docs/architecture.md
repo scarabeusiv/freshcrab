@@ -15,30 +15,38 @@ library — freshcrab implements no forge logic of its own.
 
 ## Architecture
 
-```
-                    ┌──────────────────────┐
-                    │ central queue planner │
-                    │ runs queues, cleanups │
-                    └──────┬───────┬────────┘
-                           │       │
-              ┌────────────▼──┐ ┌──▼──────────────┐
-              │  cleanups     │ │  queues         │
-              │  (hygiene)    │ │  updater        │
-              └───────────────┘ │  reviewer       │
-                                │  submitter      │
-                                └──────┬──────────┘
-                                       │
-                                ┌──────▼──────────┐
-                                │ central observer │
-                                │ token budget /   │
-                                │ cost, coherent   │
-                                │ queue, forge     │
-                                │ assignment       │
-                                └──────┬───────────┘
-                                       │
-              ┌────────────────────────┼────────────────────────┐
-              │ OBS (geectl)           │ Gitea (geectl)         │ GitHub / GitLab (geectl)
-              └────────────────────────┴────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Forges["Forges — all access through geectl"]
+        OBS[OBS]
+        Gitea[Gitea]
+        GHGL[GitHub / GitLab]
+        BW[bugwarden — bugs from Bugzilla]
+        Jira[Jira — possible source]
+    end
+
+    Queue["One coherent queue<br/>single store — one item per forge"]
+    Observer["Central observer<br/>token budget and cost<br/>forge assignment<br/>item locking with timestamps"]
+    Planner["Central queue planner<br/>long-running daemon"]
+    Updater[Updater queue — watch, bump, build, validate]
+    Reviewer[Reviewer queue — triage submissions]
+    Submitter[Submitter queue — file submissions]
+    Hotfix["Hotfix queue — priority<br/>quick commit and forward"]
+    Cleanups[Cleanups — hygiene sweeps]
+    Devel[Devel project — SR filed]
+
+    Forges --> Queue
+    Observer -- "budget · assignment · locking" --> Queue
+    Queue --> Planner
+    Planner --> Updater
+    Planner --> Reviewer
+    Planner --> Submitter
+    Planner --> Hotfix
+    Planner --> Cleanups
+    Updater --> Submitter
+    Submitter --> Devel
+    Devel -. "re-discovery — cooldown on self-owned" .-> Reviewer
+    Hotfix -. "bypasses the cooldown" .-> Submitter
 ```
 
 ### Central queue planner
