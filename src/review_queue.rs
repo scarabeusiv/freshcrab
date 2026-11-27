@@ -987,9 +987,23 @@ pub fn discover(
     path: &str,
     dry_run: &DryRun,
 ) -> Result<DiscoveryReport, ReviewQueueError> {
-    let mut queue = ReviewQueue::open(path)?;
     let scan = enumerate_instances()
         .map_err(|e| ReviewQueueError(format!("cannot enumerate geectl instances: {e}")))?;
+    discover_with_scan(config, own_sr_ids, http, path, dry_run, scan)
+}
+
+/// Run discovery over an already-enumerated scan, so tests drive
+/// the per-arm report construction (including skipped arms) without
+/// touching the real geectl config or environment.
+fn discover_with_scan(
+    config: &Config,
+    own_sr_ids: &[u64],
+    http: &dyn geectl::http::HttpClient,
+    path: &str,
+    dry_run: &DryRun,
+    scan: InstanceScan,
+) -> Result<DiscoveryReport, ReviewQueueError> {
+    let mut queue = ReviewQueue::open(path)?;
     let mut report = DiscoveryReport {
         unscannable: scan.unscannable,
         ..DiscoveryReport::default()
@@ -1912,7 +1926,137 @@ mod tests {
         );
         assert!(report.error.is_some());
         assert_eq!(report.searched, 0);
+        // A genuine search failure is not a skipped arm.
+        assert!(!report.skipped);
         assert!(queue.entries().is_empty());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    /// An HTTP client that fails every request. The skipped-arm
+    /// test never reaches it (the arm is skipped before any client
+    /// is built), so its methods are never called.
+    struct FailingHttp;
+
+    impl geectl::http::HttpClient for FailingHttp {
+        fn get(&self, _url: &str) -> Result<String, GeectlError> {
+            Err(err(ErrorKind::NetworkError, "failing http client"))
+        }
+
+        fn get_with(&self, _url: &str, _credentials: &Credentials) -> Result<String, GeectlError> {
+            Err(err(ErrorKind::NetworkError, "failing http client"))
+        }
+
+        fn post(
+            &self,
+            _url: &str,
+            _body: &str,
+            _credentials: &Credentials,
+        ) -> Result<String, GeectlError> {
+            Err(err(ErrorKind::NetworkError, "failing http client"))
+        }
+
+        fn post_json(&self, _url: &str, _body: &str) -> Result<String, GeectlError> {
+            Err(err(ErrorKind::NetworkError, "failing http client"))
+        }
+
+        fn post_json_with(
+            &self,
+            _url: &str,
+            _body: &str,
+            _credentials: &Credentials,
+        ) -> Result<String, GeectlError> {
+            Err(err(ErrorKind::NetworkError, "failing http client"))
+        }
+
+        fn put_json_with(
+            &self,
+            _url: &str,
+            _body: &str,
+            _credentials: &Credentials,
+        ) -> Result<String, GeectlError> {
+            Err(err(ErrorKind::NetworkError, "failing http client"))
+        }
+
+        fn patch_json_with(
+            &self,
+            _url: &str,
+            _body: &str,
+            _credentials: &Credentials,
+        ) -> Result<String, GeectlError> {
+            Err(err(ErrorKind::NetworkError, "failing http client"))
+        }
+
+        fn post_text(
+            &self,
+            _url: &str,
+            _body: &str,
+            _credentials: &Credentials,
+        ) -> Result<String, GeectlError> {
+            Err(err(ErrorKind::NetworkError, "failing http client"))
+        }
+
+        fn put(
+            &self,
+            _url: &str,
+            _body: &str,
+            _credentials: &Credentials,
+        ) -> Result<String, GeectlError> {
+            Err(err(ErrorKind::NetworkError, "failing http client"))
+        }
+
+        fn put_file(
+            &self,
+            _url: &str,
+            _body: &str,
+            _credentials: &Credentials,
+        ) -> Result<String, GeectlError> {
+            Err(err(ErrorKind::NetworkError, "failing http client"))
+        }
+
+        fn delete(&self, _url: &str, _credentials: &Credentials) -> Result<String, GeectlError> {
+            Err(err(ErrorKind::NetworkError, "failing http client"))
+        }
+
+        fn delete_json_with(
+            &self,
+            _url: &str,
+            _body: &str,
+            _credentials: &Credentials,
+        ) -> Result<String, GeectlError> {
+            Err(err(ErrorKind::NetworkError, "failing http client"))
+        }
+    }
+
+    #[test]
+    fn discover_marks_a_misconfigured_arm_skipped() {
+        let path = tmp_path("discover-skipped");
+        let config = test_config();
+        let http = FailingHttp;
+        // One instance whose OBS arm is misconfigured (credentials
+        // unusable) and whose Gitea arm has nothing at all: the OBS
+        // arm is reported skipped, the Gitea arm stays silent, and
+        // no search runs.
+        let scan = InstanceScan {
+            instances: vec![Instance {
+                alias: "staging".to_string(),
+                url: "https://api.staging.example.org".to_string(),
+                obs_credentials: None,
+                gitea_credentials: None,
+                obs_error: Some("half-configured OBS pair".to_string()),
+                gitea_error: None,
+            }],
+            unscannable: Vec::new(),
+        };
+        let report = discover_with_scan(&config, &[], &http, &path, &dry(), scan).unwrap();
+        assert_eq!(report.instances.len(), 1);
+        let arm = &report.instances[0];
+        assert_eq!(arm.alias, "staging");
+        assert_eq!(arm.backend, "obs");
+        assert!(arm.error.is_some());
+        assert!(arm.error.as_ref().unwrap().contains("half-configured"));
+        assert!(arm.skipped);
+        assert_eq!(arm.searched, 0);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }
@@ -2025,8 +2169,23 @@ mod tests {
         let path = tmp_path("recheck-out-of-scope");
         let mut queue = open_queue(&path);
         let config = test_config();
+        // The stored title and binding deliberately differ from the
+        // shown PR's ("bump foo" / srcmd5), so the test pins that
+        // terminal-marking keeps the stored values instead of
+        // rewriting them from the shown PR.
+        let stored_binding = ReviewBinding {
+            source_repository: "home:alice/foo".to_string(),
+            source_commit: Some("old-src".to_string()),
+            target_repository: "devel:foo/foo".to_string(),
+            target_commit: Some("old-target".to_string()),
+        };
         queue.upsert(ReviewRecord::new(
-            "obs:60", "default", "obs", "bump foo", "someone", None,
+            "obs:60",
+            "default",
+            "obs",
+            "original title",
+            "someone",
+            Some(stored_binding.clone()),
         ));
         // The search still returns the ref, but it now targets an
         // excluded package, so it is out of scope. Its show says
@@ -2060,7 +2219,8 @@ mod tests {
         assert_eq!(record.status, "terminal");
         // Terminal-marking keeps the stored title and binding; only
         // the status changes.
-        assert_eq!(record.title, "bump foo");
+        assert_eq!(record.title, "original title");
+        assert_eq!(record.binding, Some(stored_binding));
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }
