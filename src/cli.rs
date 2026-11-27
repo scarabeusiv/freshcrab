@@ -11,13 +11,16 @@ use clap::{CommandFactory, Parser};
 #[command(
     name = "freshcrab",
     version,
+    args_override_self = true,
     about = "Automatic updater and validator for openSUSE Tumbleweed/Factory",
     long_about = "Report-only by default: prints the queue (packages behind on Factory) \
         and files nothing. Dry-run mode (default true) is global: the watcher polls the \
         collectors and prints what it WOULD queue, the queue evaluates the dedup rules \
         and prints the decision for each candidate, and the dispatcher logs the would-do \
         plan and the exact SR payload and files nothing. All plan output goes to stderr, \
-        so stdout stays machine-readable JSON."
+        so stdout stays machine-readable JSON. Report-only mode gates \
+        only the dispatcher: the watcher still enqueues, and in live \
+        mode the queue state file is still written."
 )]
 pub struct Cli {
     /// path to config.yaml
@@ -107,5 +110,37 @@ mod tests {
     fn config_without_a_value_rejected() {
         let err = Cli::try_parse_from(["freshcrab", "--config"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{err}");
+    }
+
+    #[test]
+    fn repeated_config_last_wins() {
+        let cli = Cli::try_parse_from([
+            "freshcrab",
+            "--config",
+            "first.yaml",
+            "--config",
+            "second.yaml",
+        ])
+        .unwrap();
+        assert_eq!(cli.config, "second.yaml");
+    }
+
+    #[test]
+    fn repeated_queue_last_wins() {
+        let cli =
+            Cli::try_parse_from(["freshcrab", "--queue", "a.json", "--queue", "b.json"]).unwrap();
+        assert_eq!(cli.queue, "b.json");
+    }
+
+    #[test]
+    fn repeated_dry_run_idempotent() {
+        let cli = Cli::try_parse_from(["freshcrab", "--dry-run", "--dry-run"]).unwrap();
+        assert!(cli.dry_run);
+    }
+
+    #[test]
+    fn repeated_packages_accumulates() {
+        let cli = Cli::try_parse_from(["freshcrab", "--packages", "a", "--packages", "b"]).unwrap();
+        assert_eq!(cli.packages, Some(vec!["a".to_string(), "b".to_string()]));
     }
 }

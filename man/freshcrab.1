@@ -6,7 +6,7 @@ freshcrab \- Automatic updater and validator for openSUSE Tumbleweed/Factory
 .SH SYNOPSIS
 \fBfreshcrab\fR [\fB\-\-config\fR] [\fB\-\-packages\fR] [\fB\-\-queue\fR] [\fB\-\-dry\-run\fR] [\fB\-\-live\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] 
 .SH DESCRIPTION
-Report\-only by default: prints the queue (packages behind on Factory) and files nothing. Dry\-run mode (default true) is global: the watcher polls the collectors and prints what it WOULD queue, the queue evaluates the dedup rules and prints the decision for each candidate, and the dispatcher logs the would\-do plan and the exact SR payload and files nothing. All plan output goes to stderr, so stdout stays machine\-readable JSON.
+Report\-only by default: prints the queue (packages behind on Factory) and files nothing. Dry\-run mode (default true) is global: the watcher polls the collectors and prints what it WOULD queue, the queue evaluates the dedup rules and prints the decision for each candidate, and the dispatcher logs the would\-do plan and the exact SR payload and files nothing. All plan output goes to stderr, so stdout stays machine\-readable JSON. Report\-only mode gates only the dispatcher: the watcher still enqueues, and in live mode the queue state file is still written.
 .SH OPTIONS
 .TP
 \fB\-\-config\fR \fI<path>\fR [default: config.yaml]
