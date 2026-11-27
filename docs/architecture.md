@@ -97,7 +97,7 @@ this: a freshcrab PR adding OBS logic is refused.
    payload is built from the matching instance (source package is
    the branch package name), and the maintenance incident is filed
    to `openSUSE:Maintenance` via geectl — see `docs/leap-and-cve.md`.
-   The live executor creates a Leap branch with
+   The live executor (a follow-up) will create a Leap branch with
    `ObsClient::maintenance_branch`, never a plain branch (see
    `UpdateExecutor`). The executor is the `UpdateExecutor` trait:
    only the `DryRunExecutor` is shipped (dry-run: logs the
