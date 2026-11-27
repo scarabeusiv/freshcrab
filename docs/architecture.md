@@ -76,6 +76,13 @@ library — freshcrab implements no forge logic of its own.
   a human for review or decision. Detail: `docs/review-queue.md`.
 - State: one record per ref in the queue store, with the same shape
   and conventions as the updater entries.
+- An updater-filed SR enters the reviewer queue by re-discovery,
+  not direct handoff: the reviewer finds it on its next sweep by
+  matching the SR id. A self-filed submission gets a cooldown
+  before the reviewer acts on it — a self-owned submission getting
+  self-approved is a last-instance effort — unless a human
+  overrides it directly with geectl. The cooldown duration is
+  open. See Open questions.
 
 ### Submitter queue
 
@@ -528,12 +535,12 @@ by the design above.
 
 ### Queue interaction
 
-14. Updater to reviewer: does an updater-filed SR enter the reviewer
-    queue by direct handoff, or only via re-discovery (sr_id
-    match)? Decision: handoff mechanism.
-15. Reviewer to submitter: does a reviewer-accepted item (trivial-fix
+14. Reviewer to submitter: does a reviewer-accepted item (trivial-fix
     accept) feed the submitter queue for the follow-up, or does the
     reviewer act directly? Decision: reviewer-to-submitter handoff.
+15. Cooldown duration: how long is the cooldown on a self-owned
+    submission before the reviewer acts on it? Decision: cooldown
+    duration.
 16. Filing insertion position: filing items are inserted with
     priority, not tail-appended — where exactly: at the head, or at
     a high-priority position? Decision: filing insertion position.
