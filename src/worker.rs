@@ -489,8 +489,8 @@ impl<'a> Worker<'a> {
     /// `Skipped`: the dedup identity carries no fix/CVE identity,
     /// so the open incident may be another maintainer's or for a
     /// different CVE (see `is_open_maintenance_incident_duplicate`).
-    /// The branch
-    /// itself is an executor step, as on the Factory path: the plan
+    /// The branch itself is an executor step, as on the Factory path:
+    /// the plan
     /// names the branch project the listing reports, and the live
     /// executor creates it with geectl's `ObsClient::maintenance_branch`
     /// before executing the steps (see `UpdateExecutor`).
@@ -1274,7 +1274,7 @@ mod tests {
         let mut gateway = gateway_for_foo("1.9", false);
         gateway.has_open_sr = Err(GeectlError::new(
             ErrorKind::ConfigError,
-            "checking for open submit requests requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            "checking for open submit requests requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
         ));
         let executor = CompletedExecutor;
         let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
@@ -1299,7 +1299,7 @@ mod tests {
         // and the kind still decides auth-reject vs escalate.
         let err = GeectlError::new(
             ErrorKind::ConfigError,
-            "checking for open submit requests requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            "checking for open submit requests requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
         );
         match obs_failure(&err, "open-SR check failed for foo") {
             WorkerOutcome::Escalated { reason } => {
@@ -1330,7 +1330,7 @@ mod tests {
         // escalates.
         let err = GeectlError::new(
             ErrorKind::ConfigError,
-            "filing requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            "filing requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
         );
         match filing_failure(&err, "SR filing failed") {
             WorkerOutcome::Escalated { reason } => {
@@ -1678,7 +1678,7 @@ mod tests {
         let mut gateway = gateway_for_leap_foo();
         gateway.file_maintenance_incident = Err(GeectlError::new(
             ErrorKind::InvalidInput,
-            "an open maintenance_incident request already targets foo.openSUSE_Leap_15.6_Update (request 1399001)",
+            "an open maintenance_incident request already targets openSUSE:Maintenance for foo.openSUSE_Leap_15.6_Update (1399001); not filing a duplicate",
         ));
         let executor = CompletedExecutor;
         let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
@@ -1686,6 +1686,38 @@ mod tests {
             WorkerOutcome::Escalated { reason } => {
                 assert!(reason.contains("already open"), "{reason}");
                 assert!(reason.contains("1399001"), "{reason}");
+            }
+            other => panic!("expected Escalated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_maintenance_live_nonduplicate_invalid_input_is_filing_failure() {
+        // An InvalidInput that is NOT the open-incident dedup refusal
+        // (e.g. payload validation) must take the filing_failure
+        // branch, not the duplicate branch: the matcher keys on the
+        // dedup wording, not on the kind alone.
+        struct CompletedExecutor;
+        impl UpdateExecutor for CompletedExecutor {
+            fn execute(&self, _plan: &UpdatePlan, _dry_run: &DryRun) -> Result<Execution, String> {
+                Ok(Execution::Completed)
+            }
+        }
+        let dry = DryRun::new(false);
+        let mut gateway = gateway_for_leap_foo();
+        gateway.file_maintenance_incident = Err(GeectlError::new(
+            ErrorKind::InvalidInput,
+            "maintenance incident payload rejected: no source packages",
+        ));
+        let executor = CompletedExecutor;
+        let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);
+        match worker.run(&leap_entry("foo")) {
+            WorkerOutcome::Escalated { reason } => {
+                assert!(
+                    reason.contains("maintenance incident filing failed"),
+                    "{reason}"
+                );
+                assert!(!reason.contains("already open"), "{reason}");
             }
             other => panic!("expected Escalated, got {other:?}"),
         }
@@ -1749,7 +1781,7 @@ mod tests {
         let mut gateway = gateway_for_leap_foo();
         gateway.maintained_instances = Err(GeectlError::new(
             ErrorKind::ConfigError,
-            "listing maintained instances requires OBS credentials (GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD or GEECTL_OBS_PASSWORD_FILE)",
+            "listing maintained instances requires OBS credentials (GEECTL_OBS_APIKEY[_FILE] or GEECTL_OBS_USERNAME + GEECTL_OBS_PASSWORD[_FILE])",
         ));
         let executor = DryRunExecutor;
         let worker = Worker::new(&gateway, &executor, None, "home:scarabeus_iv", &dry);

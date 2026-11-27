@@ -70,8 +70,10 @@ impl Target {
     /// here covers the 15.x line). An incident for a release with no
     /// known update project omits the release project; geectl
     /// documents the server stores a filing-time-resolved value when
-    /// none is filed (see `docs/leap-and-cve.md`). Factory has no
-    /// update project.
+    /// none is filed (see `docs/leap-and-cve.md`). Unreachable via
+    /// `run_maintenance`: a release with no known update project is
+    /// refused before any payload is built. Factory has no update
+    /// project.
     pub fn update_project(&self) -> Option<String> {
         match self {
             Target::Factory => None,

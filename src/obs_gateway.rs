@@ -120,6 +120,10 @@ pub struct FakeObsGateway {
     pub maintained_instances: Result<Vec<MaintainedInstance>, GeectlError>,
     pub file_submit: Result<Option<(String, Vec<String>)>, GeectlError>,
     pub file_maintenance_incident: Result<Option<String>, GeectlError>,
+    /// Packages `has_open_sr` was called for, in call order (test
+    /// pin: the dispatcher must stop at the first auth rejection,
+    /// so a later package is never checked).
+    pub has_open_sr_calls: std::cell::RefCell<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -132,7 +136,16 @@ impl FakeObsGateway {
             maintained_instances: Ok(Vec::new()),
             file_submit: Ok(None),
             file_maintenance_incident: Ok(None),
+            has_open_sr_calls: std::cell::RefCell::new(Vec::new()),
         }
+    }
+}
+
+#[cfg(test)]
+impl FakeObsGateway {
+    /// Packages `has_open_sr` was called for, in call order.
+    pub fn has_open_sr_calls(&self) -> Vec<String> {
+        self.has_open_sr_calls.borrow().clone()
     }
 }
 
@@ -157,7 +170,10 @@ impl ObsGateway for FakeObsGateway {
         self.devel_version.clone()
     }
 
-    fn has_open_sr(&self, _package: &str) -> Result<bool, GeectlError> {
+    fn has_open_sr(&self, package: &str) -> Result<bool, GeectlError> {
+        self.has_open_sr_calls
+            .borrow_mut()
+            .push(package.to_string());
         self.has_open_sr.clone()
     }
 
@@ -190,5 +206,65 @@ impl ObsGateway for FakeObsGateway {
         _dry_run: &DryRun,
     ) -> Result<Option<String>, GeectlError> {
         self.file_maintenance_incident.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::FakeHttpClient;
+    use geectl::obs::ObsClient;
+
+    /// The gateway merges geectl's dry-run filing lines into
+    /// freshcrab's plan: filing in dry-run returns None and the
+    /// would-file lines land in `DryRun::plan()`. Deleting the merge
+    /// in `file_submit` / `file_maintenance_incident` must fail this.
+    /// The submit target is a devel project, not Factory, so no
+    /// factory check (which needs the network) runs before the
+    /// dry-run guard; the fake HTTP client carries no responses.
+    #[test]
+    fn dry_run_filing_lines_reach_freshcrab_plan() {
+        let http = FakeHttpClient::new();
+        let obs = ObsClient::new(&http);
+        let gateway = GeectlObsGateway::new(&obs);
+        let dry = DryRun::new(true);
+
+        let payload = SrPayload::new(
+            "home:scarabeus_iv",
+            "foo",
+            "devel:languages:python",
+            "foo",
+            "Update foo to 2.0",
+            "- Update to version 2.0.",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(gateway.file_submit(&payload, &dry).unwrap(), None);
+        assert!(
+            dry.plan()
+                .iter()
+                .any(|l| l.contains("file submit request for foo")),
+            "submit filing line missing from plan: {:?}",
+            dry.plan()
+        );
+
+        let incident = MaintenanceIncidentPayload::new(
+            "home:scarabeus_iv",
+            &["foo.openSUSE_Leap_15.6_Update"],
+            "openSUSE:Maintenance",
+            "Backport the fix for foo",
+        )
+        .unwrap();
+        assert_eq!(
+            gateway.file_maintenance_incident(&incident, &dry).unwrap(),
+            None
+        );
+        assert!(
+            dry.plan()
+                .iter()
+                .any(|l| l.contains("maintenance incident")),
+            "incident filing line missing from plan: {:?}",
+            dry.plan()
+        );
     }
 }
