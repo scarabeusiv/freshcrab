@@ -51,6 +51,9 @@ library — freshcrab implements no forge logic of its own.
 - The planner is the entry point: one freshcrab run is one planner
   run. Each queue runs under the planner's run; the queues share the
   one queue store.
+- The planner runs items in parallel, as defined in configuration.
+  Default concurrency: 1 worker per 4 cores or 1 worker per 4 GB of
+  RAM — whichever is the binding constraint.
 
 ### Updater queue
 
@@ -159,7 +162,11 @@ library — freshcrab implements no forge logic of its own.
   forge — there might be a reason it exists in two places (an OBS
   submission copied to an internal SUSE instance for security
   patching). Discovery runs across ALL configured instances — every
-  OBS and every Gitea instance in the config, not just the default. Priorities are
+  OBS and every Gitea instance in the config, not just the default.
+  Bugs are a source of queue items too: bugwarden integration grabs
+  bugs (from Bugzilla) into the queue. Jira is a possible future
+  source, not decided. The bugwarden integration shape and the Jira
+  scope are open. See Open questions. Priorities are
   adjustable at runtime: a human can tell the daemon to prioritise
   CVEs, or cleanups, as they see fit. The daemon runs until the token
   budget is exhausted, so the order items are processed in — what
@@ -169,11 +176,16 @@ library — freshcrab implements no forge logic of its own.
   it to the queue. Each worker is limited on duration; the duration
   limit and the reclaim timeout are open. How a human tells the
   daemon is open. See Open questions.
-- Forge assignment: an item executes on the forge that owns it (its
-  handle's forge). Capability differences are per forge: OBS decline
-  is human-only; Gitea labels are Gitea-only library operations,
-  not part of the queue surface. What happens when an item's forge
-  is down or unconfigured is open. See Open questions.
+- Forge assignment: an item's forge is where it was discovered — an
+  OBS SR is OBS, a bug is bugwarden, and so on. All forges feed the
+  same one queue: OBS, Gitea, bugwarden, Jira, GitHub, GitLab, any
+  forge. An item does not move forges; work that moves to another
+  forge is a new item. A down forge is no problem: the daemon skips
+  anything from that forge's queue until the forge returns, and keeps
+  working on the other forges. Capability differences are per forge:
+  OBS decline is human-only; Gitea labels are Gitea-only library
+  operations, not part of the queue surface. What happens when an
+  item's forge is unconfigured is open. See Open questions.
 - Fail-closed throughout: a failed signal read is never read as
   green; a malformed forge response bails out with a wrong-response
   error carrying the trace; a missing credential fails the dedup
@@ -492,85 +504,75 @@ by the design above.
 
 1. Wake-up: after the planner goes quiet, what wakes it for new work
    — a timer, an event, a poll interval? Decision: wake-up trigger.
-2. Queue execution: does one planner run execute updater, reviewer,
-   and submitter sequentially or in parallel, and in what order?
-   Decision: execution order and parallelism.
-3. Planner failure: if the planner dies mid-run, what resumes and
+2. Planner failure: if the planner dies mid-run, what resumes and
    what is lost? Does it re-spawn queues from state, or start fresh?
    Decision: planner recovery semantics.
 
 ### Observer — token budget and cost
 
-4. Budget values: what are the numbers per client and forge? The
+3. Budget values: what are the numbers per client and forge? The
    values are per-lab config. Decision: budget values.
-5. Clients in scope: which clients does the observer budget — the
+4. Clients in scope: which clients does the observer budget — the
    forges only (OBS, Gitea, GitHub, GitLab), or also the collectors
    (Repology, Anitya, PyPI, Distrowatch)? Decision: observer scope.
-6. Pacing mechanism: how does the observer pace spending so the
+5. Pacing mechanism: how does the observer pace spending so the
    month's budget lasts the month — what does it throttle, and on
    what schedule? Decision: pacing mechanism.
-7. Post-exhaustion state: after the daemon finishes on budget
+6. Post-exhaustion state: after the daemon finishes on budget
    exhaustion, does it exit or idle waiting for the next budget
    period? Decision: post-exhaustion state.
-8. Observer failure: if the observer dies or cannot read budget
+7. Observer failure: if the observer dies or cannot read budget
    state, do the queues run unbounded (fail-open) or stop
    (fail-closed)? Decision: observer failure mode.
 
 ### Coherent queue
 
-9. Reprioritisation mechanism: how does a human tell the daemon to
+8. Reprioritisation mechanism: how does a human tell the daemon to
     prioritise CVEs or cleanups — a command, an API, a config file?
     Decision: reprioritisation mechanism.
-10. Lock durations: what is the per-worker duration limit, and after
+9. Lock durations: what is the per-worker duration limit, and after
     how long does the daemon reclaim a long-running item back into
     the queue? Decision: lock durations.
 
 ### Forge assignment
 
-11. Assignment rule: does the observer route an item to a forge, or
-    does the item's own forge (its handle) decide? Does assignment
-    account for per-forge capabilities (OBS decline is human-only,
-    Gitea labels are Gitea-only)? Decision: assignment rule.
-12. Forge down or unconfigured: does the item stay queued, get
-    reassigned, or escalate to a human? Decision: forge-failure
-    behaviour.
-13. Adding a forge mid-run: is a newly configured forge picked up on
+10. Adding a forge mid-run: is a newly configured forge picked up on
     the next run, or does the planner need a restart? Are existing
     items re-evaluated against the new forge? Decision: forge
     onboarding.
 
 ### Queue interaction
 
-14. Cooldown duration: how long is the cooldown on a self-owned
+11. Cooldown duration: how long is the cooldown on a self-owned
     submission before the reviewer acts on it? Decision: cooldown
     duration.
-15. Filing insertion position: filing items are inserted with
+12. Filing insertion position: filing items are inserted with
     priority, not tail-appended — where exactly: at the head, or at
     a high-priority position? Decision: filing insertion position.
-16. Hotfix queue shape: what is the hotfix queue's exact shape,
+13. Hotfix queue shape: what is the hotfix queue's exact shape,
     its priority ordering, and what counts as a concentrated nit?
     Decision: hotfix queue shape.
 
 ### State, guards, config
 
-17. Planner state: does the planner keep spawn and cleanup state?
+14. Planner state: does the planner keep spawn and cleanup state?
     Decision: planner state.
-18. Kill switch scope: does the kill switch pause the planner (all
+15. Kill switch scope: does the kill switch pause the planner (all
     queues) or one queue? Decision: kill-switch scope.
-19. Dry-run scope: is dry-run global, or can one queue be live while
+16. Dry-run scope: is dry-run global, or can one queue be live while
     another is dry-run? Decision: dry-run granularity.
-20. Config placement: where do the planner schedule and the observer
+17. Config placement: where do the planner schedule and the observer
     budgets live — `config.yaml`, the ruleset, or a separate file?
     Decision: config placement.
 
 ### Cleanups
 
-21. Cleanup trigger: what triggers a cleanup — a planner schedule, a
+18. Cleanup trigger: what triggers a cleanup — a planner schedule, a
     threshold, manual? Is
     [#22](https://github.com/scarabeusiv/freshcrab/issues/22) hygiene
     invoked by the planner, or run
     manually? Decision: cleanup trigger.
-22. Cleanup safety: what guards an acting cleanup (dry-run, kill
+19. Cleanup safety: what guards an acting cleanup (dry-run, kill
     switch, human approval), and when does
     [#22](https://github.com/scarabeusiv/freshcrab/issues/22) move from
     report-only
@@ -578,19 +580,25 @@ by the design above.
 
 ### Failure modes
 
-23. Queue death: if one queue dies, does the planner restart it, mark
+20. Queue death: if one queue dies, does the planner restart it, mark
     it, or continue with the others? Does a dead queue block the
     run? Decision: queue-failure handling.
-24. Partial act: an item is half-acted (comment posted, state not
+21. Partial act: an item is half-acted (comment posted, state not
     saved) — what resumes it? Decision: partial-act recovery.
 
 ### Scope
 
-25. Planner boundary ("whatever"): is release tooling (
+22. Planner boundary ("whatever"): is release tooling (
     [#24](https://github.com/scarabeusiv/freshcrab/issues/24) crates.io
     publish) planner-owned, or outside the architecture? Decision:
     planner boundary.
-26. GitHub and GitLab (
+23. GitHub and GitLab (
     [#26](https://github.com/scarabeusiv/freshcrab/issues/26)): are
     they forges under the observer (with
     tokens and budgets), or out of scope? Decision: forge scope.
+24. Bugwarden integration shape: how does discovery pull bugs from
+    bugwarden (Bugzilla) into the queue — what fields, what filters,
+    what maps to a queue item? Decision: bugwarden integration
+    shape.
+25. Jira as a queue source: does Jira join bugwarden as a source of
+    queue items, and with what scope? Decision: Jira queue source.
