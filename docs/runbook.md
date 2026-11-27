@@ -181,7 +181,8 @@ search are authenticated reads, and without them the run fails closed.
 
 - **Obsolete repositories.** A repository whose build path targets
   a project or repository that no longer exists: the target project
-  is gone (404), or the target project exists but carries no such
+  is not found (404 — gone or not visible to these credentials),
+  or the target project exists but carries no such
   repository. Each finding names the repository, the path, and the
   reason.
 - **Long-broken packages.** A package that fails in every repository

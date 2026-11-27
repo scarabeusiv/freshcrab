@@ -182,7 +182,9 @@ runs both sweeps per project and prints the report as JSON.
 - **Obsolete repositories.** A repository whose build path targets
   a project or repository that no longer exists. The sweep reads the
   swept project's meta, then each distinct path target's meta; a
-  target project that answers 404 is gone, a target project without
+  target project that answers 404 is not found (gone or not
+  visible to these credentials — the API does not distinguish the
+  two), a target project without
   the repository has no such repository. Any other read failure fails
   the sweep loudly instead of reporting a partial list.
 - **Long-broken packages.** A package is long-broken when it fails

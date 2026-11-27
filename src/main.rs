@@ -386,34 +386,6 @@ fn print_hygiene_usage() {
     eprintln!("inherent: the sweeps read only and take no --live flag.");
 }
 
-/// Resolve the projects a hygiene run sweeps: the `--project` flags
-/// first, then `hygiene_projects` from the config, then the home
-/// project (`home_project` from the config, else `home:{OSC_USERNAME}`).
-fn resolve_hygiene_projects(
-    config: &freshcrab::config::Config,
-    cli_projects: &[String],
-) -> Result<Vec<String>, String> {
-    if !cli_projects.is_empty() {
-        return Ok(cli_projects.to_vec());
-    }
-    if !config.hygiene_projects.is_empty() {
-        return Ok(config.hygiene_projects.clone());
-    }
-    if !config.home_project.is_empty() {
-        return Ok(vec![config.home_project.clone()]);
-    }
-    match std::env::var("OSC_USERNAME")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-    {
-        Some(username) => Ok(vec![format!("home:{}", username.trim())]),
-        None => Err(
-            "no projects to sweep: pass --project, set hygiene_projects in the config, or set OSC_USERNAME"
-                .to_string(),
-        ),
-    }
-}
-
 /// The `freshcrab hygiene` subcommand: run both project-hygiene
 /// sweeps (issue #22) report-only over the resolved projects and
 /// print the findings as JSON on stdout. The kill switch pauses the
@@ -466,7 +438,7 @@ fn run_hygiene_cli(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let projects = match resolve_hygiene_projects(&config, &projects) {
+    let projects = match freshcrab::hygiene::resolve_hygiene_projects(&config, &projects) {
         Ok(projects) => projects,
         Err(e) => {
             eprintln!("{e}");
@@ -475,7 +447,6 @@ fn run_hygiene_cli(args: &[String]) -> ExitCode {
     };
     if config.kill_switch {
         eprintln!("kill switch is on: hygiene run paused, nothing swept.");
-        println!("{{\"projects\": []}}");
         return ExitCode::from(0);
     }
 

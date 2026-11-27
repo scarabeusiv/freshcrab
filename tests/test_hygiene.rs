@@ -9,6 +9,8 @@
 //! under), and the canned XML is fixture input, not a re-test of
 //! geectl's parsing.
 
+use std::collections::HashSet;
+
 use freshcrab::http::FakeHttpClient;
 use freshcrab::hygiene::{
     run_hygiene, sweep_long_broken, sweep_obsolete_repositories, BROKEN_DURATION_SECS,
@@ -20,6 +22,10 @@ const PROJECT: &str = "devel:languages:python";
 const FACTORY: &str = "openSUSE:Factory";
 const NOW: u64 = 1_800_000_000;
 const CUTOFF: u64 = NOW - BROKEN_DURATION_SECS;
+
+fn factory_set(packages: &[&str]) -> HashSet<String> {
+    packages.iter().map(|p| p.to_string()).collect()
+}
 
 fn obs_with_creds(http: &FakeHttpClient) -> ObsClient<'_> {
     ObsClient::with_credentials(
@@ -137,13 +143,21 @@ fn empty_collection() -> String {
 }
 
 fn project_meta() -> String {
+    // The real devel:languages:python shape: the Tumbleweed repo
+    // paths to openSUSE:Tumbleweed (not openSUSE:Factory), and there
+    // is a Factory port repo (zSystems) alongside the Leap repo.
     meta_xml(
         PROJECT,
         &[
             (
                 "openSUSE_Tumbleweed",
                 &["x86_64"],
-                &[("openSUSE:Factory", "standard")],
+                &[("openSUSE:Tumbleweed", "standard")],
+            ),
+            (
+                "openSUSE_Factory_zSystems",
+                &["s390x"],
+                &[("openSUSE:Factory:zSystems", "standard")],
             ),
             (
                 "openSUSE_Leap_15.6",
@@ -165,7 +179,7 @@ fn obsolete_sweep_flags_missing_target_project_and_repository() {
                     (
                         "openSUSE_Tumbleweed",
                         &["x86_64"],
-                        &[("openSUSE:Factory", "standard")],
+                        &[("openSUSE:Tumbleweed", "standard")],
                     ),
                     (
                         "openSUSE_Leap_15.6",
@@ -186,8 +200,8 @@ fn obsolete_sweep_flags_missing_target_project_and_repository() {
             ),
         )
         .with(
-            &meta_url("openSUSE:Factory"),
-            &meta_xml("openSUSE:Factory", &[("standard", &["x86_64"], &[])]),
+            &meta_url("openSUSE:Tumbleweed"),
+            &meta_xml("openSUSE:Tumbleweed", &[("standard", &["x86_64"], &[])]),
         )
         .with(
             &meta_url("openSUSE:Leap:15.6"),
@@ -210,7 +224,10 @@ fn obsolete_sweep_flags_missing_target_project_and_repository() {
     // The missing target project.
     let missing_project = by_repo("openSUSE_Leap_15.5");
     assert_eq!(missing_project.path_project, "openSUSE:Leap:15.5");
-    assert_eq!(missing_project.reason, "target project does not exist");
+    assert_eq!(
+        missing_project.reason,
+        "target project not found or not visible to these credentials"
+    );
     // The target project exists but carries no such repository.
     let missing_repo = by_repo("SLE_15_SP5");
     assert_eq!(missing_repo.path_project, "SUSE:SLE-15-SP5:Update");
@@ -219,6 +236,32 @@ fn obsolete_sweep_flags_missing_target_project_and_repository() {
         "target repository does not exist in target project"
     );
     // Report-only: nothing was posted.
+    assert!(http.posted().is_empty());
+}
+
+#[test]
+fn obsolete_sweep_fails_loudly_on_target_server_error() {
+    // A 500 reading a target is not a missing target: the sweep
+    // errors instead of listing the path as obsolete.
+    let http = FakeHttpClient::new()
+        .with(
+            &meta_url(PROJECT),
+            &meta_xml(
+                PROJECT,
+                &[(
+                    "openSUSE_Leap_15.5",
+                    &["x86_64"],
+                    &[("openSUSE:Leap:15.5", "standard")],
+                )],
+            ),
+        )
+        .with_status(&meta_url("openSUSE:Leap:15.5"), 500, "boom");
+    let obs = obs_with_creds(&http);
+    let err = sweep_obsolete_repositories(&obs, PROJECT).unwrap_err();
+    // A 500 surfaces as a network error through the transport
+    // mapping (HttpError::Other); the point is the sweep fails
+    // loudly instead of listing the path as obsolete.
+    assert_eq!(err.kind(), geectl::error::ErrorKind::NetworkError);
     assert!(http.posted().is_empty());
 }
 
@@ -244,6 +287,11 @@ fn long_broken_lists_only_sustained_never_integrated() {
                     &[("foo", "failed"), ("bar", "failed"), ("baz", "failed")],
                 ),
                 (
+                    "openSUSE_Factory_zSystems",
+                    "s390x",
+                    &[("foo", "failed"), ("bar", "failed"), ("baz", "failed")],
+                ),
+                (
                     "openSUSE_Leap_15.6",
                     "x86_64",
                     &[("foo", "failed"), ("bar", "succeeded"), ("baz", "failed")],
@@ -260,7 +308,7 @@ fn long_broken_lists_only_sustained_never_integrated() {
         )
         .with(&search_url_for("foo"), &empty_collection());
     let obs = obs_with_creds(&http);
-    let broken = sweep_long_broken(&obs, PROJECT, NOW).unwrap();
+    let broken = sweep_long_broken(&obs, PROJECT, &factory_set(&["bar"]), NOW).unwrap();
     assert_eq!(broken.len(), 1);
     assert_eq!(broken[0].package, "foo");
     assert!(!broken[0].in_factory);
@@ -284,6 +332,7 @@ fn tumbleweed_counts_for_a_factory_package() {
             &results_url(PROJECT),
             &results_xml(&[
                 ("openSUSE_Tumbleweed", "x86_64", &[("qux", "failed")]),
+                ("openSUSE_Factory_zSystems", "s390x", &[("qux", "failed")]),
                 ("openSUSE_Leap_15.6", "x86_64", &[("qux", "unresolvable")]),
             ]),
         )
@@ -292,19 +341,27 @@ fn tumbleweed_counts_for_a_factory_package() {
             &jobhist_xml(&[("failed", CUTOFF + 1000), ("failed", CUTOFF - 1000)]),
         )
         .with(
+            &jobhist_url(PROJECT, "openSUSE_Factory_zSystems", "s390x", "qux"),
+            &jobhist_xml(&[("failed", CUTOFF - 1000)]),
+        )
+        .with(
             &jobhist_url(PROJECT, "openSUSE_Leap_15.6", "x86_64", "qux"),
             &jobhist_xml(&[("failed", CUTOFF - 1000)]),
         )
         .with(&search_url_for("qux"), &empty_collection());
     let obs = obs_with_creds(&http);
-    let broken = sweep_long_broken(&obs, PROJECT, NOW).unwrap();
+    let broken = sweep_long_broken(&obs, PROJECT, &factory_set(&["qux"]), NOW).unwrap();
     assert_eq!(broken.len(), 1);
     assert_eq!(broken[0].package, "qux");
     assert!(broken[0].in_factory);
-    assert_eq!(broken[0].failures.len(), 2);
+    assert_eq!(broken[0].failures.len(), 3);
     assert_eq!(broken[0].failures[0].repository, "openSUSE_Tumbleweed");
-    assert_eq!(broken[0].failures[1].repository, "openSUSE_Leap_15.6");
-    assert_eq!(broken[0].failures[1].codes, vec!["unresolvable"]);
+    assert_eq!(
+        broken[0].failures[1].repository,
+        "openSUSE_Factory_zSystems"
+    );
+    assert_eq!(broken[0].failures[2].repository, "openSUSE_Leap_15.6");
+    assert_eq!(broken[0].failures[2].codes, vec!["unresolvable"]);
     assert!(http.posted().is_empty());
 }
 
@@ -323,6 +380,11 @@ fn accepted_request_from_the_project_excludes_but_another_project_does_not() {
                 (
                     "openSUSE_Tumbleweed",
                     "x86_64",
+                    &[("quux", "failed"), ("corge", "failed")],
+                ),
+                (
+                    "openSUSE_Factory_zSystems",
+                    "s390x",
                     &[("quux", "failed"), ("corge", "failed")],
                 ),
                 (
@@ -353,7 +415,7 @@ fn accepted_request_from_the_project_excludes_but_another_project_does_not() {
             &accepted_request_xml(1400002, "devel:languages:ruby", "corge"),
         );
     let obs = obs_with_creds(&http);
-    let broken = sweep_long_broken(&obs, PROJECT, NOW).unwrap();
+    let broken = sweep_long_broken(&obs, PROJECT, &factory_set(&[]), NOW).unwrap();
     assert_eq!(broken.len(), 1);
     assert_eq!(broken[0].package, "corge");
     assert!(!broken[0].in_factory);
@@ -366,7 +428,7 @@ fn sweeps_without_credentials_fail_closed() {
     let obs = ObsClient::new(&http);
     let err = sweep_obsolete_repositories(&obs, PROJECT).unwrap_err();
     assert_eq!(err.kind(), geectl::error::ErrorKind::ConfigError);
-    let err = sweep_long_broken(&obs, PROJECT, NOW).unwrap_err();
+    let err = sweep_long_broken(&obs, PROJECT, &factory_set(&[]), NOW).unwrap_err();
     assert_eq!(err.kind(), geectl::error::ErrorKind::ConfigError);
 }
 
@@ -381,7 +443,7 @@ fn run_hygiene_reports_both_sweeps_per_project() {
                     (
                         "openSUSE_Tumbleweed",
                         &["x86_64"],
-                        &[("openSUSE:Factory", "standard")],
+                        &[("openSUSE:Tumbleweed", "standard")],
                     ),
                     (
                         "openSUSE_Leap_15.5",
@@ -392,8 +454,8 @@ fn run_hygiene_reports_both_sweeps_per_project() {
             ),
         )
         .with(
-            &meta_url("openSUSE:Factory"),
-            &meta_xml("openSUSE:Factory", &[("standard", &["x86_64"], &[])]),
+            &meta_url("openSUSE:Tumbleweed"),
+            &meta_xml("openSUSE:Tumbleweed", &[("standard", &["x86_64"], &[])]),
         )
         .with_status(&meta_url("openSUSE:Leap:15.5"), 404, "")
         .with(&list_url(FACTORY), &directory_xml(&[]))

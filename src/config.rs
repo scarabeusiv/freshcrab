@@ -561,26 +561,6 @@ mod tests {
     }
 
     #[test]
-    fn hygiene_projects_parse() {
-        // Default: empty (the home project only).
-        let cfg = load_config_text("").unwrap();
-        assert!(cfg.hygiene_projects.is_empty());
-        let cfg = load_config_text(
-            "hygiene_projects:\n  - devel:languages:python\n  - home:scarabeus_iv\n",
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.hygiene_projects,
-            vec!["devel:languages:python", "home:scarabeus_iv"]
-        );
-        // Not a list: rejected.
-        assert!(load_config_text("hygiene_projects: devel:languages:python\n").is_err());
-        // Not a valid OBS project name: rejected.
-        assert!(load_config_text("hygiene_projects:\n  - foo/bar\n").is_err());
-        assert!(load_config_text("hygiene_projects:\n  - \n").is_err());
-    }
-
-    #[test]
     fn home_project_parses() {
         // Default: empty (derive from the OBS username).
         let cfg = load_config_text("").unwrap();

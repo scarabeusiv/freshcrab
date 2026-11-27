@@ -47,14 +47,12 @@ pub const BROKEN_DURATION_DAYS: u64 = 90;
 /// The same threshold in seconds, for comparing unix timestamps.
 pub const BROKEN_DURATION_SECS: u64 = BROKEN_DURATION_DAYS * 24 * 60 * 60;
 
-/// The project a repository builds against when it targets
-/// Tumbleweed.
-pub const TUMBLEWEED_PATH_PROJECT: &str = "openSUSE:Factory";
-
 /// How many job-history entries to read per repository when dating
-/// the last success. The entries come newest first, so a window that
-/// reaches back past the threshold with no success proves no success
-/// in the threshold.
+/// the last success. The entries are the newest ones, returned
+/// oldest-first; the sustained check is order-independent (max last
+/// success, min oldest entry), so the order does not matter. A window
+/// that reaches back past the threshold with no success proves no
+/// success in the threshold.
 const JOB_HISTORY_LIMIT: u32 = 200;
 
 /// A build code that means the package failed to build.
@@ -100,12 +98,25 @@ pub fn classify_repo(statuses: &[PackageBuildStatus]) -> RepoBuild {
     }
 }
 
-/// True when the repository targets Tumbleweed: one of its build
-/// paths points at the Factory project.
+/// True when `project` is a Tumbleweed-family build target: the
+/// Factory project itself, the Tumbleweed distribution project, or a
+/// Factory port (`openSUSE:Factory:*` — zSystems, PowerPC, ARM,
+/// RISCV).
+pub fn is_tumbleweed_path_project(project: &str) -> bool {
+    project == "openSUSE:Factory"
+        || project == "openSUSE:Tumbleweed"
+        || project.starts_with("openSUSE:Factory:")
+}
+
+/// True when the repository targets Tumbleweed: its primary build
+/// path (the first path) targets the Tumbleweed family. The first
+/// path is the repo's primary target; a secondary Factory path on a
+/// Leap repo does not make it Tumbleweed.
 pub fn repo_is_tumbleweed(repo: &Repository) -> bool {
     repo.paths
-        .iter()
-        .any(|(project, _)| project == TUMBLEWEED_PATH_PROJECT)
+        .first()
+        .map(|(project, _)| is_tumbleweed_path_project(project))
+        .unwrap_or(false)
 }
 
 /// True when `source_project` is `project` itself or a branch of it.
@@ -134,7 +145,9 @@ pub fn request_integrated_package(req: &Request, project: &str, package: &str) -
 /// the threshold, or the window reaches back past the threshold with
 /// no success at all. An empty history, a success with no usable
 /// time, or a window that does not reach back past the threshold
-/// proves nothing: false (fail-closed).
+/// proves nothing: false (fail-closed). The boundary is exclusive: a
+/// success exactly at the 90-day cutoff counts as in the threshold
+/// (not sustained).
 pub fn sustained_broken(entries: &[JobHistoryEntry], now_unix: u64) -> bool {
     let cutoff = now_unix.saturating_sub(BROKEN_DURATION_SECS);
     let mut last_success: Option<u64> = None;
@@ -164,8 +177,10 @@ pub fn sustained_broken(entries: &[JobHistoryEntry], now_unix: u64) -> bool {
 }
 
 /// One obsolete repository path: a repository in the swept project
-/// whose build path targets a project or repository that no longer
-/// exists upstream.
+/// whose build path targets a project or repository that is not found
+/// upstream. A target that answers 404 is either gone or not visible
+/// to these credentials — the API does not distinguish the two, so
+/// the reason says so rather than asserting non-existence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObsoleteRepository {
     /// The swept project.
@@ -187,8 +202,9 @@ pub struct RepoFailure {
     pub repository: String,
     /// The failure codes seen across the repository's architectures.
     pub codes: Vec<String>,
-    /// The last successful build's unix time, when the package ever
-    /// succeeded in this repository.
+    /// The last successful build's unix time in the fetched history
+    /// window, when the package succeeded there; None when it did not
+    /// succeed in the window (it may have succeeded before it).
     pub last_success_unix: Option<u64>,
 }
 
@@ -222,6 +238,9 @@ pub struct ProjectHygiene {
 /// The hygiene report: one entry per swept project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HygieneReport {
+    /// When the report ran (unix time); the as-of date for the
+    /// 90-day threshold in the findings.
+    pub generated_unix: u64,
     /// The swept projects, in the order they were given.
     pub projects: Vec<ProjectHygiene>,
 }
@@ -253,7 +272,7 @@ fn map_credentials_error(e: GeectlError) -> GeectlError {
 }
 
 /// The obsolete-platforms sweep for one project: every repository
-/// path in the project meta whose target project does not exist, or
+/// path in the project meta whose target project is not found, or
 /// whose target repository is not in the target project. Target
 /// metas are cached: many repositories share path targets. A
 /// non-NotFound failure reading a target fails the sweep loudly
@@ -304,7 +323,8 @@ pub fn sweep_obsolete_repositories(
                         repository: repo.name.clone(),
                         path_project: path_project.clone(),
                         path_repository: path_repository.clone(),
-                        reason: "target project does not exist".to_string(),
+                        reason: "target project not found or not visible to these credentials"
+                            .to_string(),
                     });
                 }
             }
@@ -350,17 +370,18 @@ fn ever_integrated(obs: &ObsClient, project: &str, package: &str) -> Result<bool
 /// in any of those repositories, and no accepted submit request ever
 /// out of the project. A package that builds in any counting
 /// repository, or whose duration is unproven, is not listed.
+/// `factory_packages` is the Factory package list, fetched once by
+/// the caller and shared across projects. A repository flagged
+/// obsolete by the other sweep still counts here: the sweeps are
+/// independent, and an obsolete path says nothing about the
+/// repository's build state.
 pub fn sweep_long_broken(
     obs: &ObsClient,
     project: &str,
+    factory_packages: &HashSet<String>,
     now_unix: u64,
 ) -> Result<Vec<LongBrokenPackage>, GeectlError> {
     require_credentials(obs)?;
-    let factory_packages: HashSet<String> = obs
-        .list_packages(FACTORY_PROJECT)
-        .map_err(map_credentials_error)?
-        .into_iter()
-        .collect();
     let packages = obs.list_packages(project).map_err(map_credentials_error)?;
     let meta = obs
         .project_meta_authenticated(project)
@@ -415,8 +436,15 @@ pub fn sweep_long_broken(
             continue;
         }
         // Sustained: no success in the threshold in any counting
-        // repository. The history runs on an architecture where the
+        // repository. The history runs on one architecture where the
         // package fails, so the jobs it returns are this package's.
+        // Known limitation: a success on another architecture within
+        // the threshold is missed when that architecture's current
+        // status is neutral (disabled, in flight, or absent) — the
+        // package can then be listed despite a recent success there.
+        // The single-arch read keeps the sweep to one history call
+        // per repository; the current status is the guard for the
+        // common case.
         let mut sustained = true;
         for failure in &mut failures {
             let Some(failing_arch) = by_repo_package
@@ -469,32 +497,78 @@ pub fn sweep_long_broken(
     Ok(broken)
 }
 
-/// Both sweeps for one project.
+/// Both sweeps for one project. `factory_packages` is the Factory
+/// package list, fetched once by the caller.
 pub fn sweep_project(
     obs: &ObsClient,
     project: &str,
+    factory_packages: &HashSet<String>,
     now_unix: u64,
 ) -> Result<ProjectHygiene, GeectlError> {
     Ok(ProjectHygiene {
         project: project.to_string(),
         obsolete_repositories: sweep_obsolete_repositories(obs, project)?,
-        long_broken_packages: sweep_long_broken(obs, project, now_unix)?,
+        long_broken_packages: sweep_long_broken(obs, project, factory_packages, now_unix)?,
     })
 }
 
-/// Both sweeps for each project, in the order given.
+/// Both sweeps for each project, in the order given. Duplicate
+/// projects are swept once (first occurrence wins). The Factory
+/// package list is fetched once and shared across the projects.
 pub fn run_hygiene(
     obs: &ObsClient,
     projects: &[String],
     now_unix: u64,
 ) -> Result<HygieneReport, GeectlError> {
+    require_credentials(obs)?;
+    let factory_packages: HashSet<String> = obs
+        .list_packages(FACTORY_PROJECT)
+        .map_err(map_credentials_error)?
+        .into_iter()
+        .collect();
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut report = HygieneReport {
+        generated_unix: now_unix,
         projects: Vec::new(),
     };
     for project in projects {
-        report.projects.push(sweep_project(obs, project, now_unix)?);
+        if !seen.insert(project.as_str()) {
+            continue;
+        }
+        report
+            .projects
+            .push(sweep_project(obs, project, &factory_packages, now_unix)?);
     }
     Ok(report)
+}
+
+/// Resolve the projects a hygiene run sweeps: the `--project` flags
+/// first, then `hygiene_projects` from the config, then the home
+/// project (`home_project` from the config, else `home:{OSC_USERNAME}`).
+/// Duplicates are kept here; `run_hygiene` dedupes them.
+pub fn resolve_hygiene_projects(
+    config: &crate::config::Config,
+    cli_projects: &[String],
+) -> Result<Vec<String>, String> {
+    if !cli_projects.is_empty() {
+        return Ok(cli_projects.to_vec());
+    }
+    if !config.hygiene_projects.is_empty() {
+        return Ok(config.hygiene_projects.clone());
+    }
+    if !config.home_project.is_empty() {
+        return Ok(vec![config.home_project.clone()]);
+    }
+    match std::env::var("OSC_USERNAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        Some(username) => Ok(vec![format!("home:{}", username.trim())]),
+        None => Err(
+            "no projects to sweep: pass --project, set hygiene_projects in the config, or set OSC_USERNAME"
+                .to_string(),
+        ),
+    }
 }
 
 /// The current unix time, for stamping a run.
@@ -583,16 +657,47 @@ mod tests {
     }
 
     #[test]
-    fn tumbleweed_is_the_factory_path() {
-        assert!(repo_is_tumbleweed(&repo_named(
-            "openSUSE_Tumbleweed",
-            vec![("openSUSE:Factory".to_string(), "standard".to_string())]
-        )));
+    fn tumbleweed_is_the_factory_family_on_the_first_path() {
+        // The Factory project itself, the Tumbleweed distribution
+        // project, and the Factory ports all count.
+        for project in [
+            "openSUSE:Factory",
+            "openSUSE:Tumbleweed",
+            "openSUSE:Factory:zSystems",
+            "openSUSE:Factory:PowerPC",
+            "openSUSE:Factory:ARM",
+            "openSUSE:Factory:RISCV",
+        ] {
+            assert!(
+                repo_is_tumbleweed(&repo_named(
+                    "repo",
+                    vec![(project.to_string(), "standard".to_string())]
+                )),
+                "{project} should count as Tumbleweed"
+            );
+        }
         assert!(!repo_is_tumbleweed(&repo_named(
             "openSUSE_Leap_15.6",
             vec![("openSUSE:Leap:15.6".to_string(), "standard".to_string())]
         )));
         assert!(!repo_is_tumbleweed(&repo_named("standard", vec![])));
+        // Only the first path decides: a secondary Factory path on a
+        // Leap repo does not make it Tumbleweed.
+        assert!(!repo_is_tumbleweed(&repo_named(
+            "openSUSE_Leap_15.6",
+            vec![
+                ("openSUSE:Leap:15.6".to_string(), "standard".to_string()),
+                ("openSUSE:Factory".to_string(), "standard".to_string()),
+            ]
+        )));
+        // And a Factory first path with a Leap second path is Tumbleweed.
+        assert!(repo_is_tumbleweed(&repo_named(
+            "openSUSE_Tumbleweed",
+            vec![
+                ("openSUSE:Tumbleweed".to_string(), "standard".to_string()),
+                ("openSUSE:Leap:15.6".to_string(), "standard".to_string()),
+            ]
+        )));
     }
 
     #[test]
@@ -642,9 +747,53 @@ mod tests {
         ));
         // Failures only, window not reaching the cutoff: unproven.
         assert!(!sustained_broken(&[job("failed", Some(cutoff + 100))], now));
+        // A success exactly at the cutoff counts as in the threshold:
+        // not sustained (the boundary is exclusive).
+        assert!(!sustained_broken(&[job("succeeded", Some(cutoff))], now));
+        // A failure exactly at the cutoff with no success does not
+        // reach past it: not sustained either.
+        assert!(!sustained_broken(&[job("failed", Some(cutoff))], now));
         // No jobs at all: unproven.
         assert!(!sustained_broken(&[], now));
         // An undated success: unproven.
         assert!(!sustained_broken(&[job("succeeded", None)], now));
+    }
+
+    #[test]
+    fn resolve_projects_prefers_cli_then_config_then_home() {
+        use crate::config::load_config_text;
+        // CLI wins over everything.
+        let cfg = load_config_text(
+            "hygiene_projects:\n  - devel:languages:python\nhome_project: home:scarabeus_iv\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_hygiene_projects(&cfg, &["home:scarabeus_iv".to_string()]).unwrap(),
+            vec!["home:scarabeus_iv".to_string()]
+        );
+        // Config hygiene_projects next.
+        assert_eq!(
+            resolve_hygiene_projects(&cfg, &[]).unwrap(),
+            vec!["devel:languages:python".to_string()]
+        );
+        // Then home_project.
+        let cfg = load_config_text("home_project: home:scarabeus_iv\n").unwrap();
+        assert_eq!(
+            resolve_hygiene_projects(&cfg, &[]).unwrap(),
+            vec!["home:scarabeus_iv".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_projects_errors_with_no_source() {
+        use crate::config::load_config_text;
+        let cfg = load_config_text("").unwrap();
+        // No CLI, no config, no OSC_USERNAME in the test env (the
+        // suite does not set it): an error, not a guessed project.
+        // (If the ambient env carries OSC_USERNAME this errors
+        // differently; the suite runs without it.)
+        if std::env::var("OSC_USERNAME").is_err() {
+            assert!(resolve_hygiene_projects(&cfg, &[]).is_err());
+        }
     }
 }
