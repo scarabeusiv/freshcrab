@@ -51,6 +51,15 @@ jobs:
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           workspaces: . -> target
+      # The generator tests only exist behind `--features gen`, and no
+      # other job enables it: run them here, and lint the bin, so the
+      # generator stays covered in CI.
+      - name: Test and lint the generator
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          cargo test --locked --features gen --bin freshcrab-gen
+          cargo clippy --all-targets --locked --features gen -- -D warnings
       # Regenerate into a scratch directory and fail if the committed
       # assets differ: a clap change must regenerate man/ and
       # completions/ in the same PR. Regenerate locally with
