@@ -334,8 +334,12 @@ fn main() -> ExitCode {
     // step and is the remaining work, so in live mode the DryRunExecutor
     // refuses and the entries escalate instead of filing.
     let executor = DryRunExecutor;
+    // The worker drives OBS through the gateway (geectl behind it);
+    // the Factory collector keeps the raw ObsClient (its public
+    // reads are geectl calls, not freshcrab OBS logic).
+    let gateway = freshcrab::obs_gateway::GeectlObsGateway::new(&obs);
     let worker = Worker::new(
-        &obs,
+        &gateway,
         &executor,
         credentials.as_ref(),
         &config.home_project,
