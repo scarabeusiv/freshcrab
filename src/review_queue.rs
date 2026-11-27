@@ -2189,8 +2189,10 @@ fn is_tarball_marker(marker: &str) -> bool {
         Some((_, new)) => new,
         None => marker,
     };
-    // A new archive is still an archive.
-    let name = name.strip_suffix(" (new)").unwrap_or(name).to_lowercase();
+    // A new archive is still an archive. No lowercasing: OBS's
+    // regex is case-sensitive, so an uppercase extension is a
+    // plain filediff there too.
+    let name = name.strip_suffix(" (new)").unwrap_or(name);
     name.ends_with(".tar")
         || name.ends_with(".tgz")
         || name.ends_with(".tar.gz")
