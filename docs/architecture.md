@@ -4,8 +4,9 @@ freshcrab is the automatic updater and validator for openSUSE
 Tumbleweed/Factory — the updater crab, paired with rpmcrab (the linter
 crab). It runs queues over updates and submissions: it watches upstream
 releases, files updates, triages submissions through a ruleset, and
-sweeps projects for hygiene. All forge access goes through geectl's
-library — freshcrab implements no forge logic of its own.
+sweeps projects for hygiene. Forge access goes through geectl's
+library for the forges it covers — freshcrab implements no forge
+logic of its own.
 
 This document describes the target state — the system as designed,
 not the current implementation.
@@ -14,7 +15,7 @@ not the current implementation.
 
 ```mermaid
 flowchart TD
-    subgraph Forges["Forges — all access through geectl"]
+    subgraph Forges["Forges — via geectl or direct"]
         OBS[OBS]
         Gitea[Gitea]
         GHGL[GitHub / GitLab]
@@ -166,10 +167,10 @@ flowchart TD
   action unit. If the observer dies or cannot read budget state,
   the queues stop new mutations (fail-closed), never run
   unbounded. See Open questions.
-- Clients that exist: the forge clients — OBS, Gitea, and later
-  GitHub and GitLab — all reached through geectl's library; and the
-  collectors (Repology, Anitya, PyPI, Distrowatch) that the updater
-  polls. Credentials for all of them live outside the repo
+- Clients that exist: the forge clients — OBS and Gitea through
+  geectl's library, later GitHub and GitLab as separate forges — and
+  the collectors (Repology, Anitya, PyPI, Distrowatch) that the
+  updater polls. Credentials for all of them live outside the repo
   (environment variables / mounted secrets). Which of these the
   observer budgets is open. See Open questions.
 - Budgets already enforced, per component (not observer-enforced):
@@ -247,23 +248,27 @@ flowchart TD
 
 ## Forge access rule
 
-All forge interaction goes through geectl's library. freshcrab implements
-no forge logic of its own: it has no forge client, no request/response
-handling, no endpoint construction, no forge URL building. The Factory
-reads (`src/factory.rs`: the spec via `cat`, the package list via
-`list_packages`), the devel lookup, the open-SR check, and SR filing
-all run through geectl. The reviewer queue's reads and acts run through
-geectl's unified pull-request surface.
+Forge interaction for the forges geectl covers goes through geectl's
+library. freshcrab implements no forge logic of its own: it has no
+forge client, no request/response handling, no endpoint construction,
+no forge URL building. The Factory reads (`src/factory.rs`: the spec
+via `cat`, the package list via `list_packages`), the devel lookup,
+the open-SR check, and SR filing all run through geectl. The reviewer
+queue's reads and acts run through geectl's unified pull-request
+surface.
 
-Any new forge need goes to geectl first and freshcrab picks it up from a
-geectl release; local implementation stays out. Reviewers enforce
-this: a freshcrab PR adding forge logic is refused.
+Any new forge need for a geectl-covered forge goes to geectl first
+and freshcrab picks it up from a geectl release; local implementation
+stays out. GitHub and GitLab are separate forges: they plug in
+directly, not through geectl — freshcrab still implements no forge
+logic of its own. Reviewers enforce this: a
+freshcrab PR adding forge logic for a geectl-covered forge is refused.
 
 ## Pluggability
 
-Forges and queues are pluggable: a new forge arrives via geectl, and
-a new queue is added, without changing the planner or the observer.
-A lab plugs in its own forges and queues.
+Forges and queues are pluggable: a lab adds a forge — via geectl or
+as a separate forge — or a queue, without changing the planner or the
+observer. GitHub and GitLab are separate, not reached through geectl.
 
 ## Updater queue
 
