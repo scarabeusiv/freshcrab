@@ -331,7 +331,10 @@ fn main() -> ExitCode {
     // the sr_ids it matches freshcrab's own filings against are
     // current. The review queue reads through geectl's pull-request
     // surface with geectl's own credentials (GEECTL_*), not the
-    // update pipeline's OSC_* pair.
+    // update pipeline's OSC_* pair. A discovery failure is logged
+    // loudly and the run continues: the review queue is sidecar
+    // state, and a corrupt review queue or a malformed geectl
+    // config must not break the update pipeline or its stdout JSON.
     let sr_ids = own_sr_ids(queue.entries());
     match discover(&config, &sr_ids, &geectl_http, &review_queue_path, &dry_run) {
         Ok(report) => {
@@ -357,8 +360,7 @@ fn main() -> ExitCode {
             }
         }
         Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
+            eprintln!("review queue discovery failed: {e}");
         }
     }
 

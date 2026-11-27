@@ -483,7 +483,9 @@ pub fn own_sr_ids(entries: &[QueueEntry]) -> Vec<u64> {
 /// it there; the backends are independent — one instance can be an
 /// OBS instance, a Gitea instance, or (when both credential sets
 /// resolve) both, and each arm fails closed on its own when it hits
-/// the wrong service.
+/// the wrong service. A backend whose credential set is
+/// misconfigured carries its error here so the skipped arm is
+/// named in the report, never silently dropped.
 #[derive(Debug, Clone)]
 pub struct Instance {
     /// The geectl config alias, or `default` for the effective
@@ -493,20 +495,14 @@ pub struct Instance {
     pub url: String,
     pub obs_credentials: Option<Credentials>,
     pub gitea_credentials: Option<Credentials>,
-}
-
-impl Instance {
-    /// The backends this instance is scannable on.
-    pub fn backends(&self) -> Vec<PullRequestBackend> {
-        let mut backends = Vec::new();
-        if self.obs_credentials.is_some() {
-            backends.push(PullRequestBackend::Obs);
-        }
-        if self.gitea_credentials.is_some() {
-            backends.push(PullRequestBackend::Gitea);
-        }
-        backends
-    }
+    /// A real credential misconfiguration for the OBS arm (a
+    /// half-configured pair, both credential types set, an
+    /// unreadable file). None when the arm has no credentials, or
+    /// when the resolver refused only because the default
+    /// instance's credentials are never forwarded here.
+    pub obs_error: Option<String>,
+    /// The same, for the Gitea arm.
+    pub gitea_error: Option<String>,
 }
 
 /// The outcome of enumerating instances: the scannable ones plus
@@ -550,6 +546,18 @@ pub fn enumerate_instances() -> Result<InstanceScan, GeectlError> {
 /// when nothing is configured, `Ok` with real credentials when the
 /// instance is scannable on that backend, `Err` when the credential
 /// set is misconfigured.
+/// True when a credential error is a real misconfiguration worth
+/// surfacing. Geectl refuses to forward the default instance's
+/// credentials to another URL ("never forwarded to another
+/// instance") — that is expected safety behaviour for the other
+/// backend on every URL, not a misconfiguration, so it stays
+/// silent. Any other credential error (a half-configured pair,
+/// both credential types set, an unreadable token file) names
+/// something to fix.
+fn is_credential_misconfiguration(message: &str) -> bool {
+    !message.contains("never forwarded to another instance")
+}
+
 pub fn enumerate_instances_with(
     file_config: &geectl_config::Config,
     obs_default: &str,
@@ -582,19 +590,29 @@ pub fn enumerate_instances_with(
     let mut scan = InstanceScan::default();
     for (alias, url) in unique {
         let mut reasons: Vec<String> = Vec::new();
+        let mut obs_error: Option<String> = None;
         let obs_credentials = match resolve_obs(&url) {
             Ok(Credentials::None) => None,
             Ok(creds) => Some(creds),
             Err(e) => {
-                reasons.push(format!("OBS credentials unusable: {e}"));
+                let message = e.to_string();
+                reasons.push(format!("OBS credentials unusable: {message}"));
+                if is_credential_misconfiguration(&message) {
+                    obs_error = Some(message);
+                }
                 None
             }
         };
+        let mut gitea_error: Option<String> = None;
         let gitea_credentials = match resolve_gitea(&url) {
             Ok(Credentials::None) => None,
             Ok(creds) => Some(creds),
             Err(e) => {
-                reasons.push(format!("Gitea token unusable: {e}"));
+                let message = e.to_string();
+                reasons.push(format!("Gitea token unusable: {message}"));
+                if is_credential_misconfiguration(&message) {
+                    gitea_error = Some(message);
+                }
                 None
             }
         };
@@ -612,6 +630,8 @@ pub fn enumerate_instances_with(
                 url,
                 obs_credentials,
                 gitea_credentials,
+                obs_error,
+                gitea_error,
             });
         }
     }
@@ -679,11 +699,17 @@ fn target_package(repository: &str) -> Option<&str> {
 }
 
 /// True when the target is a maintenance request: the OBS target
-/// project carries `:Update` or `:Maintenance`. Maintenance
-/// requests follow other rules and are never queue items.
+/// project carries `:Update` or `:Maintenance` as a full segment
+/// (`openSUSE:Leap:15.6:Update`, `openSUSE:Maintenance:1234`).
+/// A segment that merely starts with those words
+/// (`home:alice:UpdateTools`) is not a maintenance request.
+/// Maintenance requests follow other rules and are never queue
+/// items.
 fn is_maintenance_target(repository: &str) -> bool {
     let project = repository.split('/').next().unwrap_or(repository);
-    project.contains(":Update") || project.contains(":Maintenance")
+    project
+        .split(':')
+        .any(|segment| segment == "Update" || segment == "Maintenance")
 }
 
 /// True when the target is a Leap pool pull request: the Gitea
@@ -770,6 +796,12 @@ pub fn discover_on(
     };
     report.searched = summaries.len();
     let mut seen: HashSet<String> = HashSet::new();
+    // Refs the search returned but that are out of scope: they are
+    // not upserted, but they are still live refs, so the re-check
+    // below still asks the server about them — a ref that later
+    // merges or declines is marked terminal instead of staying open
+    // forever because it stopped being in scope.
+    let mut out_of_scope_seen: HashSet<String> = HashSet::new();
     for summary in &summaries {
         // Resolve the endpoints. The OBS summary carries them; the
         // Gitea global search does not, so read the PR.
@@ -816,6 +848,7 @@ pub fn discover_on(
             config,
             own_sr_ids,
         ) {
+            out_of_scope_seen.insert(item.reference.to_string());
             continue;
         }
         report.in_scope += 1;
@@ -838,23 +871,32 @@ pub fn discover_on(
             report.updated_records += 1;
         }
     }
-    // Re-check the records this search did not return: a record
-    // whose ref left the server (merged, declined, superseded,
-    // deleted) is marked terminal from the server state, never
-    // deleted locally. A failed re-check leaves the record as it
-    // is — a failed read never marks anything terminal.
-    let recheck: Vec<(String, String)> = queue
+    // Re-check the records this search did not return, plus the
+    // records it returned out of scope: a record whose ref left the
+    // server (merged, declined, superseded, deleted) is marked
+    // terminal from the server state, never deleted locally. A
+    // failed re-check leaves the record as it is — a failed read
+    // never marks anything terminal. An out-of-scope ref that is
+    // still open is left untouched (its title and binding are not
+    // refreshed); only its terminal state is tracked.
+    let recheck: Vec<(String, String, bool)> = queue
         .entries()
         .iter()
         .filter(|r| {
             r.instance == instance_alias
                 && r.backend == backend.as_str()
                 && r.status != "terminal"
-                && !seen.contains(&r.reference)
+                && (!seen.contains(&r.reference) || out_of_scope_seen.contains(&r.reference))
         })
-        .map(|r| (r.reference.clone(), r.title.clone()))
+        .map(|r| {
+            (
+                r.reference.clone(),
+                r.title.clone(),
+                out_of_scope_seen.contains(&r.reference),
+            )
+        })
         .collect();
-    for (reference, _title) in recheck {
+    for (reference, _title, out_of_scope) in recheck {
         let parsed: PullRequestRef = match reference.parse() {
             Ok(parsed) => parsed,
             Err(e) => {
@@ -867,6 +909,12 @@ pub fn discover_on(
         match source.show(&parsed) {
             Ok(pr) => {
                 if pr.status == PullRequestStatus::Open {
+                    if out_of_scope {
+                        // Still open but out of scope: leave the
+                        // record untouched — only its terminal state
+                        // is tracked, never its title or binding.
+                        continue;
+                    }
                     // Still open but the search did not return it
                     // (a race, or the search limit): refresh it in
                     // place instead of marking it terminal.
@@ -930,7 +978,9 @@ pub fn discover_on(
 /// (DryRun-guarded). Report-only: no posts, no review-state
 /// changes, no filings. A failed search on one instance is recorded
 /// on that instance and the run continues with the rest; a failure
-/// to enumerate instances or to open/save the queue fails the run.
+/// to enumerate instances or to open/save the queue is returned to
+/// the caller (main logs it and continues — the review queue is
+/// sidecar state and must not break the update pipeline).
 pub fn discover(
     config: &Config,
     own_sr_ids: &[u64],
@@ -946,12 +996,35 @@ pub fn discover(
         ..DiscoveryReport::default()
     };
     for instance in &scan.instances {
-        for backend in instance.backends() {
+        for backend in [PullRequestBackend::Obs, PullRequestBackend::Gitea] {
+            let (credentials, credential_error) = match backend {
+                PullRequestBackend::Obs => {
+                    (instance.obs_credentials.clone(), instance.obs_error.clone())
+                }
+                PullRequestBackend::Gitea => (
+                    instance.gitea_credentials.clone(),
+                    instance.gitea_error.clone(),
+                ),
+            };
+            let Some(creds) = credentials else {
+                // No credentials for this arm. A real
+                // misconfiguration is named in the report so the
+                // skipped arm is never silent; the expected
+                // "never forwarded" refusal carries no error and
+                // stays silent.
+                if let Some(error) = credential_error {
+                    report.instances.push(InstanceReport {
+                        alias: instance.alias.clone(),
+                        url: instance.url.clone(),
+                        backend: backend.as_str().to_string(),
+                        error: Some(error),
+                        ..InstanceReport::default()
+                    });
+                }
+                continue;
+            };
             let instance_report = match backend {
                 PullRequestBackend::Obs => {
-                    let Some(creds) = instance.obs_credentials.clone() else {
-                        continue;
-                    };
                     match ObsClient::with_base_and_credentials(http, &instance.url, creds) {
                         Ok(obs) => {
                             let client = PullRequestClient::new(Some(&obs), None);
@@ -975,9 +1048,6 @@ pub fn discover(
                     }
                 }
                 PullRequestBackend::Gitea => {
-                    let Some(creds) = instance.gitea_credentials.clone() else {
-                        continue;
-                    };
                     match GiteaClient::with_base(http, &instance.url, creds) {
                         Ok(gitea) => {
                             let client = PullRequestClient::new(None, Some(&gitea));
@@ -1322,6 +1392,10 @@ mod tests {
         assert!(is_maintenance_target("openSUSE:Maintenance:1234/foo"));
         assert!(is_maintenance_target("openSUSE:Leap:15.6:Update/foo"));
         assert!(!is_maintenance_target("devel:foo/foo"));
+        // A segment that merely starts with Update/Maintenance is
+        // not a maintenance request.
+        assert!(!is_maintenance_target("home:alice:UpdateTools/foo"));
+        assert!(!is_maintenance_target("home:alice:MaintenanceHelper/foo"));
         assert!(is_pool_target(&Some("pool/foo".to_string())));
         assert!(!is_pool_target(&Some("factory".to_string())));
         assert!(!is_pool_target(&None));
@@ -1366,24 +1440,36 @@ mod tests {
     #[test]
     fn enumerate_defaults_only_when_no_aliases() {
         let file_config = geectl_config::Config::default();
+        // The fakes model the real resolvers: credentials resolve
+        // only for their own default URL, never for the other
+        // backend's URL (the real resolvers never forward plain
+        // credentials to a non-default, non-alias URL).
         let scan = enumerate_instances_with(
             &file_config,
             "https://api.opensuse.org",
             "https://src.opensuse.org",
-            &|_| {
-                Ok(Credentials::Basic {
-                    username: "u".to_string(),
-                    password: "p".to_string(),
-                })
+            &|url| {
+                if url == "https://api.opensuse.org" {
+                    Ok(Credentials::Basic {
+                        username: "u".to_string(),
+                        password: "p".to_string(),
+                    })
+                } else {
+                    Ok(Credentials::None)
+                }
             },
-            &|_| {
-                Ok(Credentials::Bearer {
-                    token: "t".to_string(),
-                })
+            &|url| {
+                if url == "https://src.opensuse.org" {
+                    Ok(Credentials::Bearer {
+                        token: "t".to_string(),
+                    })
+                } else {
+                    Ok(Credentials::None)
+                }
             },
         );
-        // The OBS default resolves OBS creds; the Gitea default
-        // resolves the token. Each URL is one instance.
+        // Each default is one instance carrying only its own
+        // backend's credentials.
         assert_eq!(scan.instances.len(), 2);
         assert!(scan.unscannable.is_empty());
         let obs = scan
@@ -1392,13 +1478,15 @@ mod tests {
             .find(|i| i.url == "https://api.opensuse.org")
             .unwrap();
         assert!(obs.obs_credentials.is_some());
-        assert!(obs.gitea_credentials.is_some());
+        assert!(obs.gitea_credentials.is_none());
+        assert!(obs.gitea_error.is_none());
         let gitea = scan
             .instances
             .iter()
             .find(|i| i.url == "https://src.opensuse.org")
             .unwrap();
-        assert!(gitea.obs_credentials.is_some());
+        assert!(gitea.obs_credentials.is_none());
+        assert!(gitea.obs_error.is_none());
         assert!(gitea.gitea_credentials.is_some());
     }
 
@@ -1415,11 +1503,24 @@ mod tests {
             &file_config,
             "https://api.opensuse.org",
             "https://src.opensuse.org",
-            &|_| Ok(Credentials::None),
-            &|_| {
-                Ok(Credentials::Bearer {
-                    token: "t".to_string(),
-                })
+            &|url| {
+                if url == "https://api.opensuse.org" {
+                    Ok(Credentials::Basic {
+                        username: "u".to_string(),
+                        password: "p".to_string(),
+                    })
+                } else {
+                    Ok(Credentials::None)
+                }
+            },
+            &|url| {
+                if url == "https://src.opensuse.org" {
+                    Ok(Credentials::Bearer {
+                        token: "t".to_string(),
+                    })
+                } else {
+                    Ok(Credentials::None)
+                }
             },
         );
         // The alias URL and the OBS default are the same instance:
@@ -1461,12 +1562,113 @@ mod tests {
             &file_config,
             "https://api.opensuse.org",
             "https://src.opensuse.org",
-            &|_| Err(err(ErrorKind::ConfigError, "half-configured OBS pair")),
+            &|url| {
+                if url == "https://api.opensuse.org" {
+                    Err(err(ErrorKind::ConfigError, "half-configured OBS pair"))
+                } else {
+                    Ok(Credentials::None)
+                }
+            },
             &|_| Ok(Credentials::None),
         );
         assert!(scan.instances.is_empty());
         assert_eq!(scan.unscannable.len(), 2);
-        assert!(scan.unscannable[0].1.contains("half-configured"));
+        let obs = scan
+            .unscannable
+            .iter()
+            .find(|(alias, _)| alias == "default")
+            .unwrap();
+        assert!(obs.1.contains("half-configured"));
+    }
+
+    #[test]
+    fn enumerate_records_a_misconfigured_arm_on_a_scannable_instance() {
+        let file_config = geectl_config::Config {
+            instances: vec![("both".to_string(), "https://both.example.org".to_string())],
+            ..geectl_config::Config::default()
+        };
+        // The instance resolves OBS credentials but its Gitea token
+        // is misconfigured: it stays scannable on OBS, and the
+        // skipped Gitea arm is named on the instance instead of
+        // being silently dropped.
+        let scan = enumerate_instances_with(
+            &file_config,
+            "https://api.opensuse.org",
+            "https://src.opensuse.org",
+            &|url| {
+                if url == "https://both.example.org" {
+                    Ok(Credentials::Basic {
+                        username: "u".to_string(),
+                        password: "p".to_string(),
+                    })
+                } else {
+                    Ok(Credentials::None)
+                }
+            },
+            &|url| {
+                if url == "https://both.example.org" {
+                    Err(err(
+                        ErrorKind::ConfigError,
+                        "Gitea token file is unreadable",
+                    ))
+                } else {
+                    Ok(Credentials::None)
+                }
+            },
+        );
+        let instance = scan.instances.iter().find(|i| i.alias == "both").unwrap();
+        assert!(instance.obs_credentials.is_some());
+        assert!(instance.gitea_credentials.is_none());
+        assert!(instance.gitea_error.is_some());
+        assert!(instance
+            .gitea_error
+            .as_ref()
+            .unwrap()
+            .contains("unreadable"));
+    }
+
+    #[test]
+    fn enumerate_does_not_surface_the_never_forwarded_refusal() {
+        let file_config = geectl_config::Config::default();
+        // The Gitea resolver refuses the OBS default URL because
+        // the default instance's token is never forwarded there.
+        // That is expected safety behaviour, not a misconfiguration,
+        // so it carries no error on the instance.
+        let scan = enumerate_instances_with(
+            &file_config,
+            "https://api.opensuse.org",
+            "https://src.opensuse.org",
+            &|url| {
+                if url == "https://api.opensuse.org" {
+                    Ok(Credentials::Basic {
+                        username: "u".to_string(),
+                        password: "p".to_string(),
+                    })
+                } else {
+                    Ok(Credentials::None)
+                }
+            },
+            &|url| {
+                if url == "https://src.opensuse.org" {
+                    Ok(Credentials::Bearer {
+                        token: "t".to_string(),
+                    })
+                } else {
+                    Err(err(
+                        ErrorKind::ConfigError,
+                        "no credentials configured for https://api.opensuse.org; the credentials configured for the default instance are never forwarded to another instance",
+                    ))
+                }
+            },
+        );
+        let obs = scan
+            .instances
+            .iter()
+            .find(|i| i.url == "https://api.opensuse.org")
+            .unwrap();
+        assert!(obs.obs_credentials.is_some());
+        assert!(obs.gitea_credentials.is_none());
+        assert!(obs.gitea_error.is_none());
     }
 
     fn open_queue(path: &str) -> ReviewQueue {
@@ -1760,6 +1962,95 @@ mod tests {
         let record = queue.find("default", "obs:58").unwrap();
         assert_eq!(record.status, "open");
         assert_eq!(record.title, "bump foo");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn discover_on_recheck_marks_an_out_of_scope_ref_terminal_when_it_merges() {
+        let path = tmp_path("recheck-out-of-scope");
+        let mut queue = open_queue(&path);
+        let config = test_config();
+        queue.upsert(ReviewRecord::new(
+            "obs:60", "default", "obs", "bump foo", "someone", None,
+        ));
+        // The search still returns the ref, but it now targets an
+        // excluded package, so it is out of scope. Its show says
+        // merged: the re-check still marks it terminal instead of
+        // leaving it open forever.
+        let source = FakeSource::new(vec![summary(
+            PullRequestRef::Obs(60),
+            "bump gcc",
+            "devel:gcc/gcc",
+        )])
+        .with_show(
+            "obs:60",
+            Ok(fake_pr(
+                PullRequestRef::Obs(60),
+                PullRequestStatus::Merged,
+                "devel:gcc/gcc",
+                None,
+            )),
+        );
+        let report = discover_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &config,
+            &[],
+            &mut queue,
+            &dry(),
+        );
+        assert_eq!(report.terminal_marked, 1);
+        assert_eq!(queue.find("default", "obs:60").unwrap().status, "terminal");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn discover_on_leaves_a_still_open_out_of_scope_ref_untouched() {
+        let path = tmp_path("recheck-out-of-scope-open");
+        let mut queue = open_queue(&path);
+        let config = test_config();
+        queue.upsert(ReviewRecord::new(
+            "obs:61",
+            "default",
+            "obs",
+            "old title",
+            "someone",
+            None,
+        ));
+        // The search returns the ref out of scope and its show says
+        // still open: the record is left untouched — its title and
+        // binding are not refreshed, and it is not counted updated.
+        let source = FakeSource::new(vec![summary(
+            PullRequestRef::Obs(61),
+            "bump gcc",
+            "devel:gcc/gcc",
+        )])
+        .with_show(
+            "obs:61",
+            Ok(fake_pr(
+                PullRequestRef::Obs(61),
+                PullRequestStatus::Open,
+                "devel:gcc/gcc",
+                None,
+            )),
+        );
+        let report = discover_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &config,
+            &[],
+            &mut queue,
+            &dry(),
+        );
+        assert_eq!(report.terminal_marked, 0);
+        assert_eq!(report.updated_records, 0);
+        let record = queue.find("default", "obs:61").unwrap();
+        assert_eq!(record.status, "open");
+        assert_eq!(record.title, "old title");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }
