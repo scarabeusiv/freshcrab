@@ -17,6 +17,8 @@
 //! loudly at startup. All plan output goes to stderr, so stdout stays
 //! machine-readable JSON.
 
+use clap::Parser;
+use freshcrab::cli::Cli;
 use freshcrab::config::load_config;
 use freshcrab::dispatcher::Dispatcher;
 use freshcrab::dry_run::resolve as resolve_dry_run;
@@ -29,88 +31,18 @@ use geectl::auth::Credentials;
 use geectl::error::{ErrorKind, GeectlError};
 use std::process::ExitCode;
 
-fn print_usage() {
-    eprintln!("Usage: freshcrab [--config <path>] [--packages <pkg>...] [--queue <path>] [--dry-run | --live]");
-    eprintln!("  --config <path>     path to config.yaml (default: config.yaml)");
-    eprintln!("  --packages <pkg>... check only these packages (overrides the config list)");
-    eprintln!("  --queue <path>      path to the queue state file (default: queue.json)");
-    eprintln!("  --dry-run           force dry-run mode (default)");
-    eprintln!("  --live              force live mode (writes the queue; overrides config and env)");
-    eprintln!(
-        "The watcher runs in report-only mode by default: it prints the queue as JSON and files nothing."
-    );
-    eprintln!("Report-only gates the dispatcher only: the watcher still enqueues, and in live");
-    eprintln!("mode the queue state file is still written (dry-run prevents all writes).");
-    eprintln!("With report_only: false in the config, the dispatcher runs after the watcher and");
-    eprintln!("files submit requests to the devel projects (dry-run by default: it logs the plan");
-    eprintln!("and the exact SR payload and files nothing).");
-    eprintln!("Dry-run plan output goes to stderr; stdout is the JSON report.");
-}
-
 fn main() -> ExitCode {
-    let mut config_path = "config.yaml".to_string();
-    let mut packages: Option<Vec<String>> = None;
-    let mut queue_path = "queue.json".to_string();
-    let mut cli_dry_run: Option<bool> = None;
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--config" => match args.next() {
-                Some(path) => config_path = path,
-                None => {
-                    eprintln!("--config needs a path");
-                    print_usage();
-                    return ExitCode::from(2);
-                }
-            },
-            "--queue" => match args.next() {
-                Some(path) => queue_path = path,
-                None => {
-                    eprintln!("--queue needs a path");
-                    print_usage();
-                    return ExitCode::from(2);
-                }
-            },
-            "--dry-run" => {
-                if cli_dry_run == Some(false) {
-                    eprintln!("--dry-run and --live conflict; pass only one");
-                    print_usage();
-                    return ExitCode::from(2);
-                }
-                cli_dry_run = Some(true);
-            }
-            "--live" => {
-                if cli_dry_run == Some(true) {
-                    eprintln!("--dry-run and --live conflict; pass only one");
-                    print_usage();
-                    return ExitCode::from(2);
-                }
-                cli_dry_run = Some(false);
-            }
-            "--packages" => {
-                let mut list = Vec::new();
-                for pkg in args.by_ref() {
-                    if pkg.starts_with("--") {
-                        eprintln!("--packages must come last");
-                        print_usage();
-                        return ExitCode::from(2);
-                    }
-                    list.push(pkg);
-                }
-                packages = Some(list);
-            }
-            "--help" | "-h" => {
-                print_usage();
-                return ExitCode::from(0);
-            }
-            other => {
-                eprintln!("unknown argument: {other}");
-                print_usage();
-                return ExitCode::from(2);
-            }
-        }
-    }
+    let cli = Cli::parse();
+    let config_path = cli.config;
+    let packages = cli.packages;
+    let queue_path = cli.queue;
+    let cli_dry_run = if cli.dry_run {
+        Some(true)
+    } else if cli.live {
+        Some(false)
+    } else {
+        None
+    };
 
     let config = match load_config(&config_path) {
         Ok(config) => config,

@@ -256,6 +256,7 @@ name = "freshcrab"
 version = "0.1.1"
 dependencies = [
  "base64",
+ "clap",
  "fs2",
  "geectl",
  "serde",

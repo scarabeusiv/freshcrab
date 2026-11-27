@@ -34,6 +34,8 @@ base64 = "0.23"
 # (0.2.3); Dependabot's weekly cargo updates propose each new geectl
 # release as its own PR — bump by changing the version in a reviewed PR.
 geectl = "0.2"
+# CLI parsing (derive): the flags, --help and --version.
+clap = { version = "4", features = ["derive"] }
 
 [lints.rust]
 unsafe_code = "forbid"
