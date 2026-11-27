@@ -87,6 +87,24 @@ impl freshcrab::review_queue::PullRequestSource for FakeSource {
             format!("fake source has no show answer for {key}"),
         ))
     }
+
+    fn diff(&self, reference: &PullRequestRef) -> Result<String, GeectlError> {
+        Err(GeectlError::new(
+            ErrorKind::NotFound,
+            format!("fake source has no diff answer for {reference}"),
+        ))
+    }
+
+    fn build_results(
+        &self,
+        project: &str,
+        package: &str,
+    ) -> Result<geectl::obs::BuildResults, GeectlError> {
+        Err(GeectlError::new(
+            ErrorKind::NotFound,
+            format!("fake source has no build answer for {project}/{package}"),
+        ))
+    }
 }
 
 fn summary(reference: PullRequestRef, target_repository: &str) -> PullRequestSummary {

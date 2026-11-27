@@ -54,12 +54,10 @@ use geectl::auth::{same_api_url, Credentials, EnvGiteaAuth, EnvObsAuth};
 use geectl::config as geectl_config;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::gitea::GiteaClient;
-use geectl::obs::{
-    BuildResult, BuildResults, CveId, ObsClient, PackageBuildStatus, ResultsQuery, OBS_API_BASE,
-};
+use geectl::obs::{BuildResults, CveId, ObsClient, ResultsQuery, OBS_API_BASE};
 use geectl::pull_request::{
     OpinionState, PullRequest, PullRequestBackend, PullRequestClient, PullRequestRef,
-    PullRequestSearch, PullRequestStatus, PullRequestSummary, ReviewOpinion,
+    PullRequestSearch, PullRequestStatus, PullRequestSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -413,7 +411,7 @@ impl Default for DiffSignal {
 /// tell a maintainer from any other submitter. `first_time_submitter`
 /// is `None` (unknown): it needs the author's submission history,
 /// which step 2 does not read.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorSignal {
     #[serde(default)]
     pub author: String,
@@ -425,23 +423,12 @@ pub struct AuthorSignal {
     pub first_time_submitter: Option<bool>,
 }
 
-impl Default for AuthorSignal {
-    fn default() -> Self {
-        AuthorSignal {
-            author: String::new(),
-            is_own_filing: false,
-            is_package_maintainer: None,
-            first_time_submitter: None,
-        }
-    }
-}
-
 /// The package-risk signal: the target package. `is_excluded` is
 /// true for the config's exclusions (hand-maintained or special
 /// packages). `is_core` is `None` (unknown): no core-package list
 /// lives in the config. `is_security` is true when the submission
 /// names CVE ids.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageSignal {
     #[serde(default)]
     pub package: String,
@@ -453,18 +440,6 @@ pub struct PackageSignal {
     pub is_security: bool,
     #[serde(default)]
     pub cve_ids: Vec<String>,
-}
-
-impl Default for PackageSignal {
-    fn default() -> Self {
-        PackageSignal {
-            package: String::new(),
-            is_excluded: false,
-            is_core: None,
-            is_security: false,
-            cve_ids: Vec::new(),
-        }
-    }
 }
 
 /// The server-state signal: the submission's state on the server.
@@ -1521,7 +1496,10 @@ pub fn read_signals(
     };
     // CVE ids named by the title and description as well as the diff.
     let mut cve_ids = diff.cve_ids.clone();
-    for found in cve_ids_in(&pr.title).into_iter().chain(cve_ids_in(&pr.description)) {
+    for found in cve_ids_in(&pr.title)
+        .into_iter()
+        .chain(cve_ids_in(&pr.description))
+    {
         if !cve_ids.contains(&found) {
             cve_ids.push(found);
         }
@@ -1530,9 +1508,7 @@ pub fn read_signals(
 
     let build = match record.backend.as_str() {
         "obs" => build_signal(source, &pr),
-        _ => BuildSignal::unknown(Some(
-            "Gitea pull requests are not built".to_string(),
-        )),
+        _ => BuildSignal::unknown(Some("Gitea pull requests are not built".to_string())),
     };
     if let Some(reason) = &build.reason {
         read_errors.push(format!("build: {reason}"));
@@ -1635,11 +1611,7 @@ fn build_signal(source: &dyn PullRequestSource, pr: &PullRequest) -> BuildSignal
     };
     let (status, cells, reason) = match build_status_for(source, source_project, source_package) {
         Ok((status, cells)) => (status, cells, None),
-        Err(e) => (
-            "unknown".to_string(),
-            Vec::new(),
-            Some(e.to_string()),
-        ),
+        Err(e) => ("unknown".to_string(), Vec::new(), Some(e.to_string())),
     };
     let target_status = match split_project_package(&pr.target.repository) {
         Some((target_project, target_package)) => {
@@ -1873,10 +1845,8 @@ fn parse_diff(text: &str) -> DiffSignal {
     for (path, added, content) in &changed {
         if path.ends_with(".spec") {
             spec_changed = true;
-            if *added {
-                if new_version.is_none() {
-                    new_version = version_line(content);
-                }
+            if *added && new_version.is_none() {
+                new_version = version_line(content);
             }
         } else if path.ends_with(".changes") {
             changelog_changed = true;
@@ -1946,9 +1916,7 @@ fn is_version_line(content: &str) -> bool {
         return true;
     }
     let lower = trimmed.to_lowercase();
-    if (lower.starts_with("%define") || lower.starts_with("%global"))
-        && lower.contains("version")
-    {
+    if (lower.starts_with("%define") || lower.starts_with("%global")) && lower.contains("version") {
         return true;
     }
     if is_changelog_header(trimmed) || trimmed.starts_with("- ") {
@@ -2012,10 +1980,9 @@ fn refresh_with_scan(
     for instance in &scan.instances {
         for backend in [PullRequestBackend::Obs, PullRequestBackend::Gitea] {
             let (credentials, credential_error) = match backend {
-                PullRequestBackend::Obs => (
-                    instance.obs_credentials.clone(),
-                    instance.obs_error.clone(),
-                ),
+                PullRequestBackend::Obs => {
+                    (instance.obs_credentials.clone(), instance.obs_error.clone())
+                }
                 PullRequestBackend::Gitea => (
                     instance.gitea_credentials.clone(),
                     instance.gitea_error.clone(),
@@ -2116,9 +2083,7 @@ fn refresh_on(
         .entries()
         .iter()
         .filter(|r| {
-            r.instance == instance_alias
-                && r.backend == backend.as_str()
-                && r.status != "terminal"
+            r.instance == instance_alias && r.backend == backend.as_str() && r.status != "terminal"
         })
         .cloned()
         .collect();
@@ -2151,7 +2116,8 @@ mod tests {
     use super::*;
     use crate::queue::{QueueEntry, UpdateKind};
     use crate::target::Target;
-    use geectl::pull_request::PullRequestEndpoint;
+    use geectl::obs::{BuildResult, PackageBuildStatus};
+    use geectl::pull_request::{PullRequestEndpoint, ReviewOpinion};
     use std::env;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3552,13 +3518,9 @@ mod tests {
 
     #[test]
     fn review_state_approved_and_asked_and_none() {
-        let approved = obs_pr_with_reviews(vec![review_opinion(
-            "alice",
-            OpinionState::Approved,
-        )]);
+        let approved = obs_pr_with_reviews(vec![review_opinion("alice", OpinionState::Approved)]);
         assert_eq!(review_state(&approved).state, "approved");
-        let asked =
-            obs_pr_with_reviews(vec![review_opinion("alice", OpinionState::Asked)]);
+        let asked = obs_pr_with_reviews(vec![review_opinion("alice", OpinionState::Asked)]);
         assert_eq!(review_state(&asked).state, "asked_pending");
         let none = obs_pr_with_reviews(vec![]);
         assert_eq!(review_state(&none).state, "none");
@@ -3605,7 +3567,8 @@ mod tests {
 
     #[test]
     fn cve_ids_scan_validates_and_dedups() {
-        let found = cve_ids_in("Fix CVE-2026-12345 and cve-2026-12345, not CVE-123 or CVE-2026-12.");
+        let found =
+            cve_ids_in("Fix CVE-2026-12345 and cve-2026-12345, not CVE-123 or CVE-2026-12.");
         assert_eq!(found, vec!["CVE-2026-12345"]);
     }
 
@@ -3672,11 +3635,7 @@ mod tests {
             ("openSUSE_Leap_15.6", "x86_64", "failed"),
             ("openSUSE_Tumbleweed", "ppc64le", "failed"),
         ]);
-        let source = FakeSource::new(vec![]).with_build(
-            "home:alice",
-            "foo",
-            Ok(matrix),
-        );
+        let source = FakeSource::new(vec![]).with_build("home:alice", "foo", Ok(matrix));
         let (status, cells) = build_status_for(&source, "home:alice", "foo").unwrap();
         assert_eq!(status, "all_green");
         // The Leap 15.6 failure and the ppc64le failure are outside
@@ -3758,10 +3717,8 @@ mod tests {
 
     #[test]
     fn read_signals_show_failure_is_unknown() {
-        let source = FakeSource::new(vec![]).with_show(
-            "obs:125",
-            Err(err(ErrorKind::ServerError, "boom")),
-        );
+        let source =
+            FakeSource::new(vec![]).with_show("obs:125", Err(err(ErrorKind::ServerError, "boom")));
         let record = signal_record("obs:125", "obs");
         let snapshot = read_signals(&source, &record, &test_config(), &[]);
         assert_eq!(snapshot.build.status, "unknown");
@@ -3795,7 +3752,7 @@ mod tests {
         let snapshot = read_signals(&source, &record, &test_config(), &[]);
         assert_eq!(snapshot.build.status, "unknown");
         assert!(snapshot.build.reason.is_some());
-        assert_eq!(snapshot.diff.version_bump_only, true);
+        assert!(snapshot.diff.version_bump_only);
     }
 
     #[test]
@@ -3820,10 +3777,7 @@ mod tests {
 
     #[test]
     fn refresh_on_skips_terminal_records() {
-        let source = FakeSource::new(vec![]).with_show(
-            "obs:123",
-            Ok(obs_pr_with_reviews(vec![])),
-        );
+        let source = FakeSource::new(vec![]).with_show("obs:123", Ok(obs_pr_with_reviews(vec![])));
         let path = tmp_path("refresh-skip");
         let live_run = live();
         let mut queue = ReviewQueue::open(&path).unwrap();
