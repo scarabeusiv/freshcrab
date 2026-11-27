@@ -1,11 +1,5 @@
 # Architecture
 
-Tracking: [reviewer queue](https://github.com/scarabeusiv/freshcrab/issues/21),
-[cleanups](https://github.com/scarabeusiv/freshcrab/issues/22),
-[submitter, Leap maintenance filing](https://github.com/scarabeusiv/freshcrab/issues/15),
-[Leap maintenance](https://github.com/scarabeusiv/freshcrab/issues/7),
-[multi-forge](https://github.com/scarabeusiv/freshcrab/issues/26).
-
 freshcrab is the automatic updater and validator for openSUSE
 Tumbleweed/Factory — the updater crab, paired with rpmcrab (the linter
 crab). It runs queues over updates and submissions: it watches upstream
@@ -78,10 +72,10 @@ flowchart TD
 - State: one entry per package behind in the queue store (pending /
   in_progress / done / blocked / escalated). Security-first
   ordering: CVE-driven entries before routine ones.
-- Factory is implemented. Leap and CVE validation are scaffolded
-  (per-target policy, CVE validator interface); the Leap watcher
+- Factory and Leap are targets. Leap and CVE validation use
+  per-target policy and a CVE validator interface; the Leap watcher
   logic, the CVE data-source integration, and Leap SR filing are
-  remaining work. Detail: `docs/leap-and-cve.md`.
+  part of it. Detail: `docs/leap-and-cve.md`.
 
 ### Reviewer queue
 
@@ -149,8 +143,7 @@ flowchart TD
   wall time. The budget unit is token cost (money), scoped per lab,
   per month, with day/week pacing. The budget values are per-lab
   config; the pacing mechanism is open. The initial setup is
-  'unlimited' by default; budget enforcement is left open and
-  figured in later phases for someone that needs it. See Open
+  'unlimited' by default; budget enforcement is open. See Open
   questions.
 - Clients that exist: the forge clients — OBS, Gitea, and later
   GitHub and GitLab — all reached through geectl's library; and the
@@ -177,8 +170,8 @@ flowchart TD
   patching). Discovery runs across ALL configured instances — every
   OBS and every Gitea instance in the config, not just the default.
   Bugs are a source of queue items too: bugwarden integration grabs
-  bugs (from Bugzilla) into the queue. Jira is a possible future
-  source, not decided. The bugwarden integration shape and the Jira
+  bugs (from Bugzilla) into the queue. Jira is a possible source,
+  not decided. The bugwarden integration shape and the Jira
   scope are open. See Open questions. Priorities are
   adjustable at runtime: a human can tell the daemon to prioritise
   CVEs, or cleanups, as they see fit. The daemon runs until the token
@@ -207,16 +200,16 @@ flowchart TD
 
 ### Piece map
 
-| Piece | Queue | Status |
-|---|---|---|
-| Version watching (watcher, collectors, confirmation) | Updater | Implemented (Factory); Leap/CVE scaffolded |
-| queue.json, dispatcher, worker (branch, bump, clean, build, validate) | Updater | Implemented (Factory); live executor is the agent/CI step |
-| SR filing to devel | Submitter | Filing moves to the submitter queue; insertion position open |
-| [#15](https://github.com/scarabeusiv/freshcrab/issues/15) Leap maintenance-request filing | Submitter | In flight, geectl-only |
-| [#21](https://github.com/scarabeusiv/freshcrab/issues/21) review queue | Reviewer | Step 1 (state file + discovery); step 2 (signal readers) in flight |
-| [#22](https://github.com/scarabeusiv/freshcrab/issues/22) hygiene sweeps | Cleanup (planner-run) | In flight, report-only |
-| [#24](https://github.com/scarabeusiv/freshcrab/issues/24) crates.io publish | — | Misfit: release tooling, not a queue item |
-| [#26](https://github.com/scarabeusiv/freshcrab/issues/26) multi-forge (GitHub/GitLab) | Observer (forge assignment) | Scope open |
+| Piece | Queue |
+|---|---|
+| Version watching (watcher, collectors, confirmation) | Updater |
+| One queue store, dispatcher, worker (branch, bump, clean, build, validate) | Updater |
+| SR filing to devel | Submitter |
+| [#15](https://github.com/scarabeusiv/freshcrab/issues/15) Leap maintenance-request filing | Submitter |
+| [#21](https://github.com/scarabeusiv/freshcrab/issues/21) review queue | Reviewer |
+| [#22](https://github.com/scarabeusiv/freshcrab/issues/22) hygiene sweeps | Cleanup (planner-run) |
+| [#24](https://github.com/scarabeusiv/freshcrab/issues/24) crates.io publish | — |
+| [#26](https://github.com/scarabeusiv/freshcrab/issues/26) multi-forge (GitHub/GitLab) | Observer (forge assignment) |
 
 ### Misfits
 
@@ -263,13 +256,13 @@ this: a freshcrab PR adding forge logic is refused.
    │ Distrowatch │           ▼
    │  (signal)   │  ┌──────────────────┐
    └─────────────┘  │      Queue       │
-   ┌─────────────┐  │  state file +    │
+   ┌─────────────┐  │  single store +  │
    │  Upstream   │  │  deduplication   │  ┌──────────────────┐
    │  (confirm)  │  └────────┬────────┘  │    Dispatcher    │
    └─────────────┘           │           │  picks entries,   │
                              ▼           │  drives a worker  │
                     ┌──────────────────┐ └────────┬─────────┘
-                    │  queue.json      │          │
+                    │  one queue store │          │
                     │  (pending / in   │          ▼
                     │   progress / done)│  ┌──────────────────┐
                     └──────────────────┘  │      Worker      │
@@ -294,12 +287,12 @@ this: a freshcrab PR adding forge logic is refused.
    comparison, and emits a queue entry when the upstream version is
    newer. Report-only by default: it queues and reports, and files
    nothing.
-2. **Queue** (`src/queue.rs`). The queue state file (`queue.json`)
-   holds one entry per package behind, with a status (pending /
-   in_progress / done / blocked / escalated). Before an entry is added,
-   the deduplication checks run: skip when the devel project already
-   has the new version, when an open submit request already targets
-   the package, or when a task for the package is already in flight.
+2. **Queue** (`src/queue.rs`). The one queue store holds one entry
+   per package behind, with a status (pending / in_progress / done /
+   blocked / escalated). Before an entry is added, the deduplication
+   checks run: skip when the devel project already has the new
+   version, when an open submit request already targets the package,
+   or when a task for the package is already in progress.
 3. **Dispatcher** (`src/dispatcher.rs`). Picks pending entries
    (security first, respecting the concurrency limit and the daily SR
    cap) and drives one worker per package. Applies the outcome to the
@@ -313,17 +306,15 @@ this: a freshcrab PR adding forge logic is refused.
    `home:{OBS username}`), builds the update plan (one `.changes`
    entry, the SR description) enforcing the changelog rules (a security
    entry must name its CVE), builds the SR payload
-   (geectl's `SrPayload` — validated, well-formed OBS request XML), executes
-   the update steps through the executor, and files the SR to the devel
-   project via geectl. The executor is the `UpdateExecutor` trait:
-   only the `DryRunExecutor` is shipped (dry-run: logs the
-   would-do steps and returns `Planned`; live: refuses, so an SR is filed
-   only on a plan that was executed). The live executor — the agent/CI step
-   that actually performs the branch, bump, spec-cleaner, OBS build,
-   rpmcrab and audit steps, following `worker/brief.md` — is the
-   remaining work. Escalates to a human on build
-   failure, unfixable findings, a spec logic change, or a conflicting
-   SR.
+   (geectl's `SrPayload` — validated, well-formed OBS request XML),
+   executes the update through the executor, and files the SR to the
+   devel project via geectl. The executor is the `UpdateExecutor`
+   trait: the dry-run executor logs the plan and returns `Planned`;
+   the live executor performs the branch, bump, spec-cleaner, OBS
+   build, rpmcrab and audit, following `worker/brief.md`, and an SR
+   is filed only on a plan that was executed. Escalates to a human on
+   build failure, unfixable findings, a spec logic change, or a
+   conflicting SR.
 
 ### Collectors (priority order)
 
@@ -367,11 +358,11 @@ in pure Rust in `src/version.rs` — version-segment ordering:
 - separators (`.`, `-`, `_`, `+`, `%`, `{`, `}`) are skipped,
 - epoch dominates version, version dominates release.
 
-### Gate rules (for the worker phase)
+### Gate rules
 
 - Branch from the devel project; Factory takes submissions from devel only.
 - One `.changes` entry per package per SR, describing the net change.
-- spec-cleaner in full mode as the final step; if its output is wrong,
+- spec-cleaner in full mode last; if its output is wrong,
   fix spec-cleaner and apply its diff whole.
 - rpmcrab over the built RPMs: target 0 errors / 0 warnings. Findings
   are fixed at the cause. Info-severity findings stay informational.
@@ -395,17 +386,15 @@ the operation proceeds. The effective mode resolves as CLI flag
 (`--dry-run` / `--live`) > env var (`FRESHCRAB_DRY_RUN`) > config
 (`dry_run`, default `true`) and is logged loudly at startup.
 
-## Leap and CVE validation (planned, scaffolded)
+## Leap and CVE validation
 
-Leap and CVE validation are the remaining work — see
-`docs/leap-and-cve.md` for the full design. The scaffold provides named,
-tested seams:
+Leap and CVE validation — see `docs/leap-and-cve.md` for the full
+design — provide named, tested seams:
 
 - **Targets** (`src/target.rs`): a `Target` is `Factory` or
-  `Leap { version }`, with the OBS project and an
-  implemented/planned gate. Config has a `targets:`
-  list (default `[factory]`); a Leap target parses but the pipeline
-  refuses to run it. Queue entries carry their target.
+  `Leap { version }`, with the OBS project and a gate. Config has a
+  `targets:` list (default `[factory]`). Queue entries carry their
+  target.
 - **CVE validation** (`src/cve.rs`): the rule is that a security
   fix's changelog (`.changes`) entry must carry the CVE reference,
   and validation compares the changelog against the CVE list. The
@@ -469,9 +458,9 @@ src/
   target.rs            distribution targets (Factory / Leap) + the
                        per-target update-policy hook
   cve.rs               CVE validation: the changelog-carries-the-CVE rule
-                       + the validator interface (planned)
+                       + the validator interface
   watcher.rs           collectors + confirmation + Factory compare
-  queue.rs             queue state file, deduplication, security-first
+  queue.rs             one queue store, deduplication, security-first
                        ordering (kind: routine / security); filed SR ids
                        and the daily-cap count
   geectl (dependency)  OBS client for the Factory reads, the dedup
@@ -486,7 +475,7 @@ src/
                        the executor trait + DryRunExecutor
 worker/
   brief.md             agent brief for the update worker (the live
-                       executor step)
+                       executor)
 tests/
   test_version.rs      version comparison contract
   test_watcher.rs      watcher with canned fixtures (no live network)
@@ -499,7 +488,7 @@ tests/
   fixtures/            canned Repology / Anitya / PyPI / Distrowatch / spec
 docs/
   architecture.md      this file
-  leap-and-cve.md      Leap + CVE validation design (planned, scaffolded)
+  leap-and-cve.md      Leap + CVE validation design
   review-queue.md      reviewer queue design
   runbook.md           run the container, configure the package set, pause, read the queue
   assets/logo.svg      project icon

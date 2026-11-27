@@ -1,7 +1,5 @@
 # Reviewer queue
 
-Tracking: [#21](https://github.com/scarabeusiv/freshcrab/issues/21).
-
 freshcrab triages submissions: OBS submit requests and Gitea pull
 requests, read and acted on through geectl's unified pull-request
 surface. A ruleset auto-comments or rejects the clear cases,
@@ -18,9 +16,8 @@ system overview is in `docs/architecture.md`.
   watched packages. The two are the same queue: a submission is
   identified by its handle, not by who filed it.
 - The queue triages only; it never files. Filing is the submitter
-  queue's job; currently it is the worker's last step (SR filing)
-  and, for Gitea, the working-copy layer (see the Submitter queue
-  section in `docs/architecture.md`).
+  queue's job; for Gitea, filing goes through the working-copy layer
+  (see the Submitter queue section in `docs/architecture.md`).
 - Excluded explicitly: Leap `pool/` pull requests and maintenance
   (`:Update`) requests — they follow other rules.
 - Machinery dependency: the geectl pull-request surface
@@ -320,47 +317,29 @@ reviewers decline.
   dismissed as not a queue item) so a re-run does not re-escalate the
   same submission.
 
-## Rollout staging
+## Reviewer capabilities and geectl dependencies
 
-- Stage 1, report-only: discover and classify; no posts, no
-  review-state changes. Proves discovery, dedup, and signals.
-- Stage 2, comment-only: post triage comments on auto-actionable and
-  mid-confidence items; no review-state changes.
-- Stage 3, reject: request-changes for ruleset-covered cases only.
-  OBS decline is human-only; the queue comments in the ruleset cases
-  instead of declining. Auto-reject does not go live unproven: it
-  starts only after stage 2 has run with its comments verified against
-  the ruleset.
-- Stage 4, trivial-fix accept: accept plus follow-up fix, only for
-  ruleset-covered trivial findings. It starts only after stage 3 has
-  run with its actions verified against the ruleset.
-- Each stage starts only on an explicit go-ahead, the same gate as the
-  dry-run / live switch. The kill switch pauses every stage.
-
-## Reviewer implementation order
-
-One PR per step. Each step needs the geectl surface it uses to be in a
-geectl release, with the freshcrab geectl pin bumped. Plusky's review
-is required on the implementing PRs.
+Each capability needs the geectl surface it uses to be in a geectl
+release, with the freshcrab geectl pin bumped.
 
 1. Review-record state file and discovery: search both arms, scoped,
-   dedup, one record per ref — report-only. Depends on geectl
-   pull-request step 3 (read surface).
+   dedup, one record per ref — report-only. Needs the geectl
+   pull-request read surface.
 2. Signal readers: build status, review state, diff scope, author,
-   package risk — report-only. Depends on geectl pull-request step 3;
-   build status is already in geectl.
+   package risk — report-only. Needs the geectl pull-request read
+   surface; build status is already in geectl.
 3. Ruleset file and evaluator: fail-closed, first-match-wins, version
    recorded on every record — report-only.
 4. Human handoff: escalation record and run report.
-5. Comment action: post triage comments — comment-only stage. Depends
-   on geectl pull-request step 4 (review-level act).
-6. Request-changes action — reject stage. Depends on geectl
-   pull-request step 4 (review-level act).
+5. Comment action: post triage comments. Needs the geectl
+   pull-request review-level act.
+6. Request-changes action — reject. Needs the geectl pull-request
+   review-level act.
 7. Trivial-fix accept path: accept plus follow-up fix (Gitea push to
    the PR branch or follow-up PR; OBS direct commit to the accepted
-   package, or refile where the submission is freshcrab's own) —
-   last stage. Depends on geectl pull-request steps 4 and 5; the
-   Gitea push depends on the working-copy layer.
+   package, or refile where the submission is freshcrab's own).
+   Needs the geectl pull-request review-level act and PR-level act;
+   the Gitea push needs the working-copy layer.
 
 ## Non-goals
 
