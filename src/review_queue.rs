@@ -50,6 +50,23 @@
 //! `request-changes` or `accept-trivial`: both need a diff-text
 //! finding, so steps 6-7 stay live-inert until then.
 //!
+//! Step 4 (this module): the human handoff. A human-tier verdict
+//! escalates the record in place: `escalation_reason` /
+//! `escalated_at` / `escalation_question` are persisted on the
+//! record (like the update queue's escalation), with the
+//! fingerprint of the snapshot that produced them, so triage never
+//! depends on a captured run log. An escalated item stays parked:
+//! classification skips it while the fingerprint is unchanged,
+//! and re-classifies it only when its server state changes (a
+//! different fingerprint clears the escalation and re-opens the
+//! record). A human decision (`approved` | `declined` |
+//! `dismissed`) is recorded on the item and moves it to
+//! `terminal`, so a re-run never re-escalates the same
+//! submission. The run report lists the human-tier items with
+//! ref, tier, signal snapshot, ruleset version, and the exact
+//! question for the human; the human acts through the geectl
+//! `pull-request` CLI or the web UI.
+//!
 //! Discovery runs across ALL configured instances: every OBS
 //! instance and every Gitea instance in the geectl config, not just
 //! the default. Instances come from geectl's config file
@@ -160,6 +177,12 @@ pub struct ReviewAction {
 /// The review-record statuses (see the design's Queue state).
 pub const REVIEW_STATUSES: &[&str] = &["open", "triaged", "actioned", "escalated", "terminal"];
 
+/// The human decisions recordable on a review item (step 4):
+/// `approved` (the human approved the submission), `declined`
+/// (the human declined it), `dismissed` (dismissed as not a
+/// queue item).
+pub const HUMAN_DECISIONS: &[&str] = &["approved", "declined", "dismissed"];
+
 /// One triaged submission.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewRecord {
@@ -203,6 +226,37 @@ pub struct ReviewRecord {
     /// `action_history` (steps 5-7).
     #[serde(default)]
     pub action: Option<String>,
+    /// Why this record was escalated to a human, if it was (step
+    /// 4). Persisted on the record, like the update queue's
+    /// `escalation_reason`, so triage never depends on a captured
+    /// run log. Records without an escalation carry None.
+    #[serde(default)]
+    pub escalation_reason: Option<String>,
+    /// When the record was escalated (epoch seconds, like
+    /// `updated_at`). None when never escalated.
+    #[serde(default)]
+    pub escalated_at: Option<String>,
+    /// The exact question for the human (step 4), from the
+    /// matching rule. None when never escalated, or when the rule
+    /// carries no question.
+    #[serde(default)]
+    pub escalation_question: Option<String>,
+    /// The fingerprint of the snapshot (and ruleset version) the
+    /// escalation was raised on (step 4). Classification skips an
+    /// escalated record while this still matches the current
+    /// snapshot, and re-opens it when the snapshot changes.
+    #[serde(default)]
+    pub escalation_fingerprint: Option<String>,
+    /// The human decision on this item, if a human acted (step
+    /// 4): `approved` | `declined` | `dismissed` (dismissed as
+    /// not a queue item). A decision moves the record to
+    /// `terminal`, so a re-run never re-escalates it.
+    #[serde(default)]
+    pub human_decision: Option<String>,
+    /// When the human decision was recorded (epoch seconds, like
+    /// `updated_at`). None when no human has acted.
+    #[serde(default)]
+    pub human_decision_at: Option<String>,
     #[serde(default)]
     pub binding: Option<ReviewBinding>,
     /// The grace periods for the trivial-fix tiers (decided
@@ -241,6 +295,12 @@ impl ReviewRecord {
             ruleset_version: None,
             matched_rule: None,
             action: None,
+            escalation_reason: None,
+            escalated_at: None,
+            escalation_question: None,
+            escalation_fingerprint: None,
+            human_decision: None,
+            human_decision_at: None,
             binding,
             grace_periods: GracePeriods::default(),
             last_checked: now.clone(),
@@ -813,7 +873,8 @@ impl ReviewQueue {
     /// `reference`): the tier, the decided action, the matching
     /// rule, and the ruleset version that produced them. An `open`
     /// record becomes `triaged`; any other status is kept (an
-    /// escalated record is never classified — step 4 owns it).
+    /// escalated record is re-classified only after step 4
+    /// re-opens it on a server-state change).
     /// Returns false when no such record exists.
     pub fn set_classification(
         &mut self,
@@ -843,6 +904,104 @@ impl ReviewQueue {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Escalate the record for (`instance`, `reference`) to a
+    /// human (step 4): status `escalated`, with the reason, the
+    /// exact question, and the fingerprint of the snapshot the
+    /// escalation was raised on. Returns false when no such
+    /// record exists.
+    pub fn escalate(
+        &mut self,
+        instance: &str,
+        reference: &str,
+        reason: &str,
+        question: Option<&str>,
+        fingerprint: &str,
+    ) -> bool {
+        let now = now_iso();
+        match self
+            .records
+            .iter_mut()
+            .find(|r| r.instance == instance && r.reference == reference)
+        {
+            Some(existing) => {
+                existing.status = "escalated".to_string();
+                existing.escalation_reason = Some(reason.to_string());
+                existing.escalated_at = Some(now.clone());
+                existing.escalation_question = question.map(str::to_string);
+                existing.escalation_fingerprint = Some(fingerprint.to_string());
+                existing.last_checked = now.clone();
+                existing.updated_at = now;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Clear the escalation on the record for (`instance`,
+    /// `reference`) and re-open it (step 4): the server state
+    /// changed, so the old escalation no longer describes the
+    /// item. The human decision, if one was recorded, is kept.
+    /// Returns false when no such record exists.
+    pub fn clear_escalation(&mut self, instance: &str, reference: &str) -> bool {
+        let now = now_iso();
+        match self
+            .records
+            .iter_mut()
+            .find(|r| r.instance == instance && r.reference == reference)
+        {
+            Some(existing) => {
+                if existing.status == "escalated" {
+                    existing.status = "open".to_string();
+                }
+                existing.escalation_reason = None;
+                existing.escalated_at = None;
+                existing.escalation_question = None;
+                existing.escalation_fingerprint = None;
+                existing.last_checked = now.clone();
+                existing.updated_at = now;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record a human decision on the record for (`instance`,
+    /// `reference`) (step 4): `approved` | `declined` |
+    /// `dismissed` (dismissed as not a queue item). A decision
+    /// moves the record to `terminal`, so a re-run never
+    /// re-escalates the same submission. Returns Ok(false) when
+    /// no such record exists, and an error for any other
+    /// decision string.
+    pub fn record_human_decision(
+        &mut self,
+        instance: &str,
+        reference: &str,
+        decision: &str,
+    ) -> Result<bool, ReviewQueueError> {
+        if !HUMAN_DECISIONS.contains(&decision) {
+            return Err(ReviewQueueError(format!(
+                "invalid human decision {decision:?} (expected one of {})",
+                HUMAN_DECISIONS.join(", ")
+            )));
+        }
+        let now = now_iso();
+        match self
+            .records
+            .iter_mut()
+            .find(|r| r.instance == instance && r.reference == reference)
+        {
+            Some(existing) => {
+                existing.human_decision = Some(decision.to_string());
+                existing.human_decision_at = Some(now.clone());
+                existing.status = "terminal".to_string();
+                existing.last_checked = now.clone();
+                existing.updated_at = now;
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -2938,8 +3097,9 @@ pub struct ClassifyReport {
     pub human: usize,
     /// Terminal records: classified never; the ref left the server.
     pub skipped_terminal: usize,
-    /// Escalated records: step 4 owns them; classification leaves
-    /// them parked.
+    /// Escalated records whose server state is unchanged:
+    /// classification leaves them parked (step 4 re-opens them
+    /// only when the state changes).
     pub skipped_escalated: usize,
     /// Records with no signal snapshot yet (an unscannable
     /// instance, or a record discovery just wrote): nothing to
@@ -2957,11 +3117,15 @@ pub struct ClassifyReport {
 /// the queue (DryRun-guarded). Report-only: it records the
 /// verdict; it posts nothing. A ruleset that fails to load
 /// refuses the run: the error is returned and nothing is
-/// classified. Terminal and escalated records are skipped, as
-/// are records with no snapshot yet and records whose snapshot
-/// says the ref is no longer open. A snapshot that cannot be
-/// parsed is classified from an unknown snapshot, so the
-/// `failed-read` rule escalates it instead of dropping it.
+/// classified. Terminal records are skipped. An escalated record
+/// is skipped while its server state is unchanged (step 4 parks
+/// it); when the state changes, the escalation is cleared and
+/// the record is re-classified, and a human verdict escalates it
+/// again with the new fingerprint. Records with no snapshot yet
+/// and records whose snapshot says the ref is no longer open are
+/// skipped. A snapshot that cannot be parsed is classified from
+/// an unknown snapshot, so the `failed-read` rule escalates it
+/// instead of dropping it.
 pub fn classify_records(
     ruleset_path: &str,
     queue_path: &str,
@@ -2977,8 +3141,34 @@ pub fn classify_records(
             continue;
         }
         if record.status == "escalated" {
-            report.skipped_escalated += 1;
-            continue;
+            // Parked (step 4): re-classify only when the server
+            // state changed. The fingerprint is over the current
+            // snapshot and the ruleset version that produced the
+            // escalation, so a new ruleset re-opens the record
+            // too. No snapshot cannot prove a change, so the
+            // record stays parked; an unparsable snapshot cannot
+            // prove the state is unchanged, so it re-opens.
+            let parked = match &record.signal_snapshot {
+                None => true,
+                Some(stored) => match serde_json::from_value::<SignalSnapshot>(stored.clone()) {
+                    Ok(snapshot) => {
+                        let fingerprint = classification_fingerprint(
+                            record.ruleset_version.as_deref().unwrap_or(""),
+                            &snapshot,
+                            &record.binding,
+                        );
+                        record.escalation_fingerprint.as_deref() == Some(fingerprint.as_str())
+                    }
+                    Err(_) => false,
+                },
+            };
+            if parked {
+                report.skipped_escalated += 1;
+                continue;
+            }
+            // The server state changed: clear the escalation and
+            // fall through to classify the new state.
+            queue.clear_escalation(&record.instance, &record.reference);
         }
         let Some(stored) = &record.signal_snapshot else {
             report.skipped_no_snapshot += 1;
@@ -3010,9 +3200,88 @@ pub fn classify_records(
         ) {
             report.classified += 1;
         }
+        if verdict.tier == "human" {
+            // Escalate in place (step 4): the reason, the
+            // question, and the fingerprint of the snapshot this
+            // verdict was raised on, so the next run can tell a
+            // changed item from an unchanged one.
+            let fingerprint =
+                classification_fingerprint(&ruleset.version, &snapshot, &record.binding);
+            queue.escalate(
+                &record.instance,
+                &record.reference,
+                &verdict.reason,
+                verdict.question.as_deref(),
+                &fingerprint,
+            );
+        }
     }
     queue.save(dry_run)?;
     Ok(report)
+}
+
+/// The fingerprint of the snapshot a verdict was raised on: the
+/// ruleset version, the snapshot with its read time blanked (the
+/// read time changes on every run and is not server state), and
+/// the binding. Two runs over unchanged server state produce the
+/// same fingerprint; any server change — or a new ruleset
+/// version — produces a different one. Step 4 parks escalated
+/// records on it; steps 5-6 use it to tell a changed item (act
+/// again) from an unchanged one (skip).
+pub fn classification_fingerprint(
+    ruleset_version: &str,
+    snapshot: &SignalSnapshot,
+    binding: &Option<ReviewBinding>,
+) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut snapshot = snapshot.clone();
+    snapshot.read_at = String::new();
+    // The snapshot and binding are freshcrab's own serialization,
+    // so this cannot fail in practice; a failure hashes the empty
+    // string instead of refusing the run.
+    let text = serde_json::to_string(&(ruleset_version, snapshot, binding)).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// One human-tier item in the run report (step 4): the ref, the
+/// tier, the signal snapshot, the ruleset version, and the exact
+/// question for the human.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HumanHandoffItem {
+    pub instance: String,
+    pub reference: String,
+    pub tier: String,
+    pub ruleset_version: Option<String>,
+    pub signal_snapshot: Option<serde_json::Value>,
+    pub question: String,
+}
+
+/// The human-tier items in the queue file at `queue_path` (step
+/// 4): every escalated record, with its snapshot and question.
+/// The report is the handoff; the human acts through the geectl
+/// `pull-request` CLI or the web UI.
+pub fn human_handoff_report(queue_path: &str) -> Result<Vec<HumanHandoffItem>, ReviewQueueError> {
+    let queue = ReviewQueue::open(queue_path)?;
+    Ok(queue
+        .entries()
+        .iter()
+        .filter(|r| r.status == "escalated")
+        .map(|r| HumanHandoffItem {
+            instance: r.instance.clone(),
+            reference: r.reference.clone(),
+            tier: r.tier.clone(),
+            ruleset_version: r.ruleset_version.clone(),
+            signal_snapshot: r.signal_snapshot.clone(),
+            question: r
+                .escalation_question
+                .clone()
+                .or_else(|| r.escalation_reason.clone())
+                .unwrap_or_else(|| "No ruleset rule covers this item.".to_string()),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -5512,5 +5781,251 @@ mod tests {
         let _ = fs::remove_file(&ruleset_path);
         let _ = fs::remove_file(&queue_path);
         let _ = fs::remove_file(format!("{queue_path}.lock"));
+    }
+
+    // Step 4: human handoff.
+
+    #[test]
+    fn escalate_and_clear_escalation() {
+        let path = tmp_path("escalate");
+        let live_run = live();
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        queue.upsert(ReviewRecord::new(
+            "obs:123", "default", "obs", "bump foo", "someone", None,
+        ));
+        let fingerprint = "0123456789abcdef".to_string();
+        assert!(queue.escalate(
+            "default",
+            "obs:123",
+            "A signal read failed.",
+            Some("What does the server say?"),
+            &fingerprint,
+        ));
+        let record = queue.find("default", "obs:123").unwrap();
+        assert_eq!(record.status, "escalated");
+        assert_eq!(
+            record.escalation_reason.as_deref(),
+            Some("A signal read failed.")
+        );
+        assert_eq!(
+            record.escalation_question.as_deref(),
+            Some("What does the server say?")
+        );
+        assert_eq!(
+            record.escalation_fingerprint.as_deref(),
+            Some("0123456789abcdef")
+        );
+        assert!(record.escalated_at.is_some());
+        assert!(!queue.escalate("default", "obs:999", "r", None, "f"));
+        assert!(queue.clear_escalation("default", "obs:123"));
+        let record = queue.find("default", "obs:123").unwrap();
+        assert_eq!(record.status, "open");
+        assert_eq!(record.escalation_reason, None);
+        assert_eq!(record.escalated_at, None);
+        assert_eq!(record.escalation_question, None);
+        assert_eq!(record.escalation_fingerprint, None);
+        assert!(!queue.clear_escalation("default", "obs:999"));
+        queue.save(&live_run).unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn record_human_decision_moves_to_terminal() {
+        let path = tmp_path("decide");
+        let live_run = live();
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        queue.upsert(ReviewRecord::new(
+            "obs:123", "default", "obs", "bump foo", "someone", None,
+        ));
+        queue.escalate("default", "obs:123", "No rule covers this.", None, "fp");
+        assert!(queue
+            .record_human_decision("default", "obs:123", "dismissed")
+            .unwrap());
+        let record = queue.find("default", "obs:123").unwrap();
+        assert_eq!(record.status, "terminal");
+        assert_eq!(record.human_decision.as_deref(), Some("dismissed"));
+        assert!(record.human_decision_at.is_some());
+        // The escalation stays recorded: the decision, not a
+        // re-run, closed the item.
+        assert_eq!(
+            record.escalation_reason.as_deref(),
+            Some("No rule covers this.")
+        );
+        assert!(!queue
+            .record_human_decision("default", "obs:999", "approved")
+            .unwrap());
+        assert!(queue
+            .record_human_decision("default", "obs:123", "maybe")
+            .is_err());
+        queue.save(&live_run).unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn classification_fingerprint_ignores_read_time() {
+        let mut first = base_snapshot();
+        first.read_at = "111".to_string();
+        let mut second = base_snapshot();
+        second.read_at = "222".to_string();
+        assert_eq!(
+            classification_fingerprint("1", &first, &None),
+            classification_fingerprint("1", &second, &None)
+        );
+        // A server change changes the fingerprint.
+        second.build.status = "any_failed".to_string();
+        assert_ne!(
+            classification_fingerprint("1", &first, &None),
+            classification_fingerprint("1", &second, &None)
+        );
+        // So does a new ruleset version.
+        assert_ne!(
+            classification_fingerprint("1", &first, &None),
+            classification_fingerprint("2", &first, &None)
+        );
+    }
+
+    /// A queue file with one clean record (obs:123) and one
+    /// failed-read record (obs:124), snapshots recorded, for the
+    /// step-4 classify tests.
+    fn handoff_queue(path: &str) {
+        let live_run = live();
+        let mut queue = ReviewQueue::open(path).unwrap();
+        queue.upsert(ReviewRecord::new(
+            "obs:123", "default", "obs", "bump foo", "someone", None,
+        ));
+        queue.set_signal_snapshot(
+            "default",
+            "obs:123",
+            serde_json::to_value(base_snapshot()).unwrap(),
+        );
+        queue.upsert(ReviewRecord::new(
+            "obs:124", "default", "obs", "bump bar", "someone", None,
+        ));
+        let mut failed = base_snapshot();
+        failed.read_errors = vec!["build: connection refused".to_string()];
+        queue.set_signal_snapshot("default", "obs:124", serde_json::to_value(failed).unwrap());
+        queue.save(&live_run).unwrap();
+    }
+
+    #[test]
+    fn classify_records_escalates_human_verdicts_and_parks_them() {
+        let path = tmp_path("handoff-park");
+        let live_run = live();
+        handoff_queue(&path);
+
+        let report = classify_records("review_ruleset.json", &path, &live_run).unwrap();
+        assert_eq!(report.classified, 2);
+        assert_eq!(report.human, 1);
+        let escalated_at = {
+            let queue = ReviewQueue::open(&path).unwrap();
+            let record = queue.find("default", "obs:124").unwrap();
+            assert_eq!(record.status, "escalated");
+            assert_eq!(record.tier, "human");
+            assert_eq!(record.matched_rule.as_deref(), Some("failed-read"));
+            assert!(record.escalation_reason.is_some());
+            assert!(record.escalation_question.is_some());
+            assert!(record.escalation_fingerprint.is_some());
+            assert!(record.escalated_at.is_some());
+            record.escalated_at.clone().unwrap()
+        };
+
+        // A second run over unchanged state parks the escalated
+        // record: it is skipped, not re-escalated, and the
+        // escalation timestamp does not move. The clean record
+        // re-classifies as before.
+        let report = classify_records("review_ruleset.json", &path, &live_run).unwrap();
+        assert_eq!(report.skipped_escalated, 1);
+        assert_eq!(report.classified, 1);
+        assert_eq!(report.auto, 1);
+        let queue = ReviewQueue::open(&path).unwrap();
+        assert_eq!(
+            queue
+                .find("default", "obs:124")
+                .unwrap()
+                .escalated_at
+                .as_deref(),
+            Some(escalated_at.as_str())
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn classify_records_reopens_escalated_on_state_change() {
+        let path = tmp_path("handoff-reopen");
+        let live_run = live();
+        handoff_queue(&path);
+        classify_records("review_ruleset.json", &path, &live_run).unwrap();
+        {
+            let queue = ReviewQueue::open(&path).unwrap();
+            assert_eq!(
+                queue.find("default", "obs:124").unwrap().status,
+                "escalated"
+            );
+        }
+        // The read now succeeds: the snapshot changes, so the
+        // record re-opens and re-classifies as a clean bump.
+        {
+            let mut queue = ReviewQueue::open(&path).unwrap();
+            queue.set_signal_snapshot(
+                "default",
+                "obs:124",
+                serde_json::to_value(base_snapshot()).unwrap(),
+            );
+            queue.save(&live_run).unwrap();
+        }
+        let report = classify_records("review_ruleset.json", &path, &live_run).unwrap();
+        assert_eq!(report.skipped_escalated, 0);
+        // Both records classify: the re-opened one and the clean
+        // one, which re-classifies as before.
+        assert_eq!(report.classified, 2);
+        assert_eq!(report.auto, 2);
+        let queue = ReviewQueue::open(&path).unwrap();
+        let record = queue.find("default", "obs:124").unwrap();
+        assert_eq!(record.status, "triaged");
+        assert_eq!(record.tier, "auto");
+        assert_eq!(record.escalation_reason, None);
+        assert_eq!(record.escalated_at, None);
+        assert_eq!(record.escalation_fingerprint, None);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn human_handoff_report_lists_escalated_only() {
+        let path = tmp_path("handoff-report");
+        let live_run = live();
+        handoff_queue(&path);
+        classify_records("review_ruleset.json", &path, &live_run).unwrap();
+
+        let items = human_handoff_report(&path).unwrap();
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.reference, "obs:124");
+        assert_eq!(item.instance, "default");
+        assert_eq!(item.tier, "human");
+        assert_eq!(item.ruleset_version.as_deref(), Some("1"));
+        assert!(item.signal_snapshot.is_some());
+        assert!(item.question.contains("signal read failed"));
+
+        // A recorded decision closes the item: the report empties
+        // and a re-run never re-escalates it.
+        {
+            let mut queue = ReviewQueue::open(&path).unwrap();
+            assert!(queue
+                .record_human_decision("default", "obs:124", "approved")
+                .unwrap());
+            queue.save(&live_run).unwrap();
+        }
+        assert!(human_handoff_report(&path).unwrap().is_empty());
+        let report = classify_records("review_ruleset.json", &path, &live_run).unwrap();
+        assert_eq!(report.skipped_terminal, 1);
+        // The clean record still classifies; the decided one stays
+        // terminal and is never re-escalated.
+        assert_eq!(report.classified, 1);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
     }
 }

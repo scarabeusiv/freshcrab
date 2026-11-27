@@ -23,7 +23,9 @@ use freshcrab::dry_run::resolve as resolve_dry_run;
 use freshcrab::factory::FactoryClient;
 use freshcrab::http::{map_obs_credentials_error, UreqClient};
 use freshcrab::queue::{DedupChecks, Queue, QueueEntry};
-use freshcrab::review_queue::{classify_records, discover, own_sr_ids, refresh_signals};
+use freshcrab::review_queue::{
+    classify_records, discover, human_handoff_report, own_sr_ids, refresh_signals, ReviewQueue,
+};
 use freshcrab::watcher::Watcher;
 use freshcrab::worker::{DryRunExecutor, Worker};
 use geectl::auth::Credentials;
@@ -40,6 +42,9 @@ fn print_usage() {
     );
     eprintln!(
         "  --review-ruleset <path> path to the review ruleset file (default: review_ruleset.json)"
+    );
+    eprintln!(
+        "  --review-decide <instance> <ref> <decision> record a human decision (approved | declined | dismissed) on a review item and exit"
     );
     eprintln!("  --dry-run           force dry-run mode (default)");
     eprintln!("  --live              force live mode (writes the queue; overrides config and env)");
@@ -60,6 +65,7 @@ fn main() -> ExitCode {
     let mut queue_path = "queue.json".to_string();
     let mut review_queue_path = "review_queue.json".to_string();
     let mut review_ruleset_path = "review_ruleset.json".to_string();
+    let mut review_decide: Option<(String, String, String)> = None;
     let mut cli_dry_run: Option<bool> = None;
 
     let mut args = std::env::args().skip(1);
@@ -97,6 +103,21 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            "--review-decide" => {
+                let instance = args.next();
+                let reference = args.next();
+                let decision = args.next();
+                match (instance, reference, decision) {
+                    (Some(instance), Some(reference), Some(decision)) => {
+                        review_decide = Some((instance, reference, decision));
+                    }
+                    _ => {
+                        eprintln!("--review-decide needs <instance> <ref> <decision>");
+                        print_usage();
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--dry-run" => {
                 if cli_dry_run == Some(false) {
                     eprintln!("--dry-run and --live conflict; pass only one");
@@ -165,6 +186,44 @@ fn main() -> ExitCode {
         }
     };
     dry_run.log_mode();
+
+    // A human decision on a review item (--review-decide): record
+    // it on the queue record and exit. This is an operator action
+    // on local state, not a pipeline stage, so it runs before the
+    // kill switch: a paused pipeline must not block recording what
+    // a human decided.
+    if let Some((instance, reference, decision)) = &review_decide {
+        match ReviewQueue::open(&review_queue_path) {
+            Ok(mut queue) => match queue.record_human_decision(instance, reference, decision) {
+                Ok(true) => {
+                    if let Err(e) = queue.save(&dry_run) {
+                        eprintln!("{e}");
+                        return ExitCode::from(1);
+                    }
+                    if dry_run.enabled() {
+                        eprintln!(
+                            "would record human decision {decision} on {reference} ({instance})"
+                        );
+                    } else {
+                        eprintln!("recorded human decision {decision} on {reference} ({instance})");
+                    }
+                    return ExitCode::from(0);
+                }
+                Ok(false) => {
+                    eprintln!("no review record for {reference} on {instance}");
+                    return ExitCode::from(1);
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            },
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
 
     if config.kill_switch {
         // The human message goes to stderr; stdout stays valid JSON
@@ -446,6 +505,35 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("review queue classification failed: {e}");
+        }
+    }
+
+    // The human handoff (step 4): each run lists the human-tier
+    // items with ref, tier, signal snapshot, ruleset version, and
+    // the exact question for the human. The report is the handoff;
+    // the human acts through the geectl `pull-request` CLI or the
+    // web UI. A failure to read the handoff is logged loudly and
+    // the run continues.
+    match human_handoff_report(&review_queue_path) {
+        Ok(items) => {
+            for item in &items {
+                let snapshot = item.signal_snapshot.as_ref().map_or_else(
+                    || "no snapshot".to_string(),
+                    |snapshot| snapshot.to_string(),
+                );
+                eprintln!(
+                    "review queue: human tier: {} {} tier={} ruleset={} question: {} snapshot: {}",
+                    item.instance,
+                    item.reference,
+                    item.tier,
+                    item.ruleset_version.as_deref().unwrap_or("none"),
+                    item.question,
+                    snapshot
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("review queue handoff report failed: {e}");
         }
     }
 
