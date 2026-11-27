@@ -119,7 +119,10 @@ library — freshcrab implements no forge logic of its own.
   a first-class concern. Cost is token spend, not API call count or
   wall time. The budget unit is token cost (money), scoped per lab,
   per month, with day/week pacing. The budget values are per-lab
-  config; the pacing mechanism is open. See Open questions.
+  config; the pacing mechanism is open. The initial setup is
+  'unlimited' by default; budget enforcement is left open and
+  figured in later phases for someone that needs it. See Open
+  questions.
 - Clients that exist: the forge clients — OBS, Gitea, and later
   GitHub and GitLab — all reached through geectl's library; and the
   collectors (Repology, Anitya, PyPI, Distrowatch) that the updater
@@ -138,14 +141,21 @@ library — freshcrab implements no forge logic of its own.
   queue — not the union of the per-queue state files. An item is
   identified by its handle, not by who filed it; one record per ref
   (`obs:<id>` / `gitea:<owner>/<repo>#<number>`); re-discovery
-  updates the record in place, never duplicates it. Discovery runs
-  across ALL configured instances — every OBS and every Gitea
-  instance in the config, not just the default. Priorities are
+  updates the record in place, never duplicates it. No cross-forge
+  dedup: the same logical change on two forges is two items, one per
+  forge — there might be a reason it exists in two places (an OBS
+  submission copied to an internal SUSE instance for security
+  patching). Discovery runs across ALL configured instances — every
+  OBS and every Gitea instance in the config, not just the default. Priorities are
   adjustable at runtime: a human can tell the daemon to prioritise
   CVEs, or cleanups, as they see fit. The daemon runs until the token
   budget is exhausted, so the order items are processed in — what
-  goes first within the budget — is a human decision. How a human
-  tells the daemon is open. See Open questions.
+  goes first within the budget — is a human decision. Items are
+  locked on assignment to one executor. Locks carry timestamps and
+  the daemon tracks them — if an item runs long, the daemon returns
+  it to the queue. Each worker is limited on duration; the duration
+  limit and the reclaim timeout are open. How a human tells the
+  daemon is open. See Open questions.
 - Forge assignment: an item executes on the forge that owns it (its
   handle's forge). Capability differences are per forge: OBS decline
   is human-only; Gitea labels are Gitea-only library operations,
@@ -498,61 +508,56 @@ by the design above.
 9. Reprioritisation mechanism: how does a human tell the daemon to
     prioritise CVEs or cleanups — a command, an API, a config file?
     Decision: reprioritisation mechanism.
-10. Cross-forge dedup: the same logical change can exist on two
-    forges (an OBS SR and a Gitea PR for one change). Does
-    coherence dedup them into one item? How is "same change"
-    determined — same srcmd5, same branch? Decision: cross-forge
-    dedup rule.
-11. Item locking: when the observer assigns an item, is it locked to
-    one executor until done? What prevents two queues, or two runs,
-    from acting on the same item? Decision: assignment locking.
+10. Lock durations: what is the per-worker duration limit, and after
+    how long does the daemon reclaim a long-running item back into
+    the queue? Decision: lock durations.
 
 ### Forge assignment
 
-12. Assignment rule: does the observer route an item to a forge, or
+11. Assignment rule: does the observer route an item to a forge, or
     does the item's own forge (its handle) decide? Does assignment
     account for per-forge capabilities (OBS decline is human-only,
     Gitea labels are Gitea-only)? Decision: assignment rule.
-13. Forge down or unconfigured: does the item stay queued, get
+12. Forge down or unconfigured: does the item stay queued, get
     reassigned, or escalate to a human? Decision: forge-failure
     behaviour.
-14. Adding a forge mid-run: is a newly configured forge picked up on
+13. Adding a forge mid-run: is a newly configured forge picked up on
     the next run, or does the planner need a restart? Are existing
     items re-evaluated against the new forge? Decision: forge
     onboarding.
 
 ### Queue interaction
 
-15. Updater to reviewer: does an updater-filed SR enter the reviewer
+14. Updater to reviewer: does an updater-filed SR enter the reviewer
     queue by direct handoff, or only via re-discovery (sr_id
     match)? Decision: handoff mechanism.
-16. Reviewer to submitter: does a reviewer-accepted item (trivial-fix
+15. Reviewer to submitter: does a reviewer-accepted item (trivial-fix
     accept) feed the submitter queue for the follow-up, or does the
     reviewer act directly? Decision: reviewer-to-submitter handoff.
-17. Filing insertion position: filing items are inserted with
+16. Filing insertion position: filing items are inserted with
     priority, not tail-appended — where exactly: at the head, or at
     a high-priority position? Decision: filing insertion position.
 
 ### State, guards, config
 
-18. Planner state: does the planner keep spawn and cleanup state?
+17. Planner state: does the planner keep spawn and cleanup state?
     Decision: planner state.
-19. Kill switch scope: does the kill switch pause the planner (all
+18. Kill switch scope: does the kill switch pause the planner (all
     queues) or one queue? Decision: kill-switch scope.
-20. Dry-run scope: is dry-run global, or can one queue be live while
+19. Dry-run scope: is dry-run global, or can one queue be live while
     another is dry-run? Decision: dry-run granularity.
-21. Config placement: where do the planner schedule and the observer
+20. Config placement: where do the planner schedule and the observer
     budgets live — `config.yaml`, the ruleset, or a separate file?
     Decision: config placement.
 
 ### Cleanups
 
-22. Cleanup trigger: what triggers a cleanup — a planner schedule, a
+21. Cleanup trigger: what triggers a cleanup — a planner schedule, a
     threshold, manual? Is
     [#22](https://github.com/scarabeusiv/freshcrab/issues/22) hygiene
     invoked by the planner, or run
     manually? Decision: cleanup trigger.
-23. Cleanup safety: what guards an acting cleanup (dry-run, kill
+22. Cleanup safety: what guards an acting cleanup (dry-run, kill
     switch, human approval), and when does
     [#22](https://github.com/scarabeusiv/freshcrab/issues/22) move from
     report-only
@@ -560,19 +565,19 @@ by the design above.
 
 ### Failure modes
 
-24. Queue death: if one queue dies, does the planner restart it, mark
+23. Queue death: if one queue dies, does the planner restart it, mark
     it, or continue with the others? Does a dead queue block the
     run? Decision: queue-failure handling.
-25. Partial act: an item is half-acted (comment posted, state not
+24. Partial act: an item is half-acted (comment posted, state not
     saved) — what resumes it? Decision: partial-act recovery.
 
 ### Scope
 
-26. Planner boundary ("whatever"): is release tooling (
+25. Planner boundary ("whatever"): is release tooling (
     [#24](https://github.com/scarabeusiv/freshcrab/issues/24) crates.io
     publish) planner-owned, or outside the architecture? Decision:
     planner boundary.
-27. GitHub and GitLab (
+26. GitHub and GitLab (
     [#26](https://github.com/scarabeusiv/freshcrab/issues/26)): are
     they forges under the observer (with
     tokens and budgets), or out of scope? Decision: forge scope.
