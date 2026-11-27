@@ -987,23 +987,25 @@ pub fn discover(
     path: &str,
     dry_run: &DryRun,
 ) -> Result<DiscoveryReport, ReviewQueueError> {
+    let mut queue = ReviewQueue::open(path)?;
     let scan = enumerate_instances()
         .map_err(|e| ReviewQueueError(format!("cannot enumerate geectl instances: {e}")))?;
-    discover_with_scan(config, own_sr_ids, http, path, dry_run, scan)
+    discover_with_scan(config, own_sr_ids, http, &mut queue, dry_run, scan)
 }
 
 /// Run discovery over an already-enumerated scan, so tests drive
 /// the per-arm report construction (including skipped arms) without
-/// touching the real geectl config or environment.
+/// touching the real geectl config or environment. The queue is
+/// opened by the caller, before enumeration, so the lock is held
+/// and the error precedence match `discover`'s original order.
 fn discover_with_scan(
     config: &Config,
     own_sr_ids: &[u64],
     http: &dyn geectl::http::HttpClient,
-    path: &str,
+    queue: &mut ReviewQueue,
     dry_run: &DryRun,
     scan: InstanceScan,
 ) -> Result<DiscoveryReport, ReviewQueueError> {
-    let mut queue = ReviewQueue::open(path)?;
     let mut report = DiscoveryReport {
         unscannable: scan.unscannable,
         ..DiscoveryReport::default()
@@ -1048,7 +1050,7 @@ fn discover_with_scan(
                                 &instance.alias,
                                 config,
                                 own_sr_ids,
-                                &mut queue,
+                                queue,
                                 dry_run,
                             )
                         }
@@ -1071,7 +1073,7 @@ fn discover_with_scan(
                                 &instance.alias,
                                 config,
                                 own_sr_ids,
-                                &mut queue,
+                                queue,
                                 dry_run,
                             )
                         }
@@ -2033,6 +2035,7 @@ mod tests {
         let path = tmp_path("discover-skipped");
         let config = test_config();
         let http = FailingHttp;
+        let mut queue = open_queue(&path);
         // One instance whose OBS arm is misconfigured (credentials
         // unusable) and whose Gitea arm has nothing at all: the OBS
         // arm is reported skipped, the Gitea arm stays silent, and
@@ -2048,7 +2051,7 @@ mod tests {
             }],
             unscannable: Vec::new(),
         };
-        let report = discover_with_scan(&config, &[], &http, &path, &dry(), scan).unwrap();
+        let report = discover_with_scan(&config, &[], &http, &mut queue, &dry(), scan).unwrap();
         assert_eq!(report.instances.len(), 1);
         let arm = &report.instances[0];
         assert_eq!(arm.alias, "staging");
