@@ -7,8 +7,16 @@
 //! watch scope, deduplicated, one record per ref. Report-only:
 //! discovery reads and records; it posts nothing, changes no
 //! review state, files nothing, and merges nothing. The ruleset
-//! (step 3), the signal readers (step 2), the human handoff (step 4)
-//! and the actions (steps 5-7) are not built here.
+//! (step 3), the human handoff (step 4) and the actions (steps 5-7)
+//! are not built here.
+//!
+//! Step 2 (this module): the signal readers — build status, review
+//! state, diff scope, author trust, package risk, server state —
+//! read for every non-terminal record on every run and recorded on
+//! the record as its signal snapshot. Report-only, like discovery:
+//! the readers read and record; they post nothing, change no
+//! review state, file nothing, and merge nothing. The tier stays
+//! empty until the ruleset (step 3) classifies the snapshot.
 //!
 //! Discovery runs across ALL configured instances: every OBS
 //! instance and every Gitea instance in the geectl config, not just
@@ -46,10 +54,12 @@ use geectl::auth::{same_api_url, Credentials, EnvGiteaAuth, EnvObsAuth};
 use geectl::config as geectl_config;
 use geectl::error::{ErrorKind, GeectlError};
 use geectl::gitea::GiteaClient;
-use geectl::obs::{ObsClient, OBS_API_BASE};
+use geectl::obs::{
+    BuildResult, BuildResults, CveId, ObsClient, PackageBuildStatus, ResultsQuery, OBS_API_BASE,
+};
 use geectl::pull_request::{
-    PullRequest, PullRequestBackend, PullRequestClient, PullRequestRef, PullRequestSearch,
-    PullRequestStatus, PullRequestSummary,
+    OpinionState, PullRequest, PullRequestBackend, PullRequestClient, PullRequestRef,
+    PullRequestSearch, PullRequestStatus, PullRequestSummary, ReviewOpinion,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -194,6 +204,293 @@ impl ReviewRecord {
             created_at: now.clone(),
             updated_at: now,
         }
+    }
+}
+
+/// The signal snapshot (step 2): the confidence signals read for one
+/// review record, stored as JSON on the record. Report-only: the
+/// snapshot describes the submission; it changes no review state and
+/// files nothing. A failed read is never green: the failing signal
+/// reads `unknown` and the failure is named in `read_errors`, so the
+/// item goes to the human tier (step 3) instead of being silently
+/// skipped. Unknown fields default on load, like the record itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalSnapshot {
+    /// When the signals were read (epoch seconds, like `updated_at`).
+    #[serde(default)]
+    pub read_at: String,
+    #[serde(default)]
+    pub build: BuildSignal,
+    #[serde(default)]
+    pub review: ReviewSignal,
+    #[serde(default)]
+    pub diff: DiffSignal,
+    #[serde(default)]
+    pub author: AuthorSignal,
+    #[serde(default)]
+    pub package: PackageSignal,
+    #[serde(default)]
+    pub server: ServerSignal,
+    /// Signal reads that failed, in the form `signal: error`.
+    #[serde(default)]
+    pub read_errors: Vec<String>,
+}
+
+impl SignalSnapshot {
+    /// A snapshot where every signal is unknown: used when the
+    /// record cannot be read at all (its ref does not parse, or the
+    /// `show` fails). The failures are named, never silent.
+    pub fn unknown(read_errors: Vec<String>) -> Self {
+        SignalSnapshot {
+            read_at: now_iso(),
+            build: BuildSignal::unknown(None),
+            review: ReviewSignal::unknown(None),
+            diff: DiffSignal::unknown(None),
+            author: AuthorSignal {
+                author: String::new(),
+                is_own_filing: false,
+                is_package_maintainer: None,
+                first_time_submitter: None,
+            },
+            package: PackageSignal {
+                package: String::new(),
+                is_excluded: false,
+                is_core: None,
+                is_security: false,
+                cve_ids: Vec::new(),
+            },
+            server: ServerSignal::unknown(),
+            read_errors,
+        }
+    }
+}
+
+/// The build-status signal: the build of the request's current
+/// sources, on Tumbleweed and Leap 16, x86_64 and aarch64. `status`
+/// is `all_green` | `any_failed` | `building` | `unknown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildSignal {
+    #[serde(default = "default_unknown")]
+    pub status: String,
+    /// The per-cell build codes behind `status`, one per
+    /// (repository, arch) cell the signal read.
+    #[serde(default)]
+    pub cells: Vec<BuildCell>,
+    /// The target (devel) package's build status, same vocabulary
+    /// as `status`: a failure the devel project already has is not
+    /// the submitter's.
+    #[serde(default = "default_unknown")]
+    pub target_status: String,
+    /// Why the status is `unknown`, when it is.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl BuildSignal {
+    pub fn unknown(reason: Option<String>) -> Self {
+        BuildSignal {
+            status: "unknown".to_string(),
+            cells: Vec::new(),
+            target_status: "unknown".to_string(),
+            reason,
+        }
+    }
+}
+
+impl Default for BuildSignal {
+    fn default() -> Self {
+        Self::unknown(None)
+    }
+}
+
+fn default_unknown() -> String {
+    "unknown".to_string()
+}
+
+/// One (repository, arch) cell of the build-status signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildCell {
+    pub repository: String,
+    pub arch: String,
+    pub code: String,
+}
+
+/// The review-state signal: the reviews on the submission.
+/// `state` is `approved` | `changes_requested` | `asked_pending` |
+/// `none` | `unknown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSignal {
+    #[serde(default = "default_unknown")]
+    pub state: String,
+    /// One entry per review, in server order.
+    #[serde(default)]
+    pub reviews: Vec<ReviewEntry>,
+    /// Why the state is `unknown`, when it is.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl ReviewSignal {
+    pub fn unknown(reason: Option<String>) -> Self {
+        ReviewSignal {
+            state: "unknown".to_string(),
+            reviews: Vec::new(),
+            reason,
+        }
+    }
+}
+
+impl Default for ReviewSignal {
+    fn default() -> Self {
+        Self::unknown(None)
+    }
+}
+
+/// One review on the submission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewEntry {
+    pub reviewer: String,
+    pub state: String,
+}
+
+/// The diff-scope signal: what the submission changes, parsed from
+/// the unified diff. `version_bump_only` is true only when the diff
+/// touches nothing but the spec (version/release lines) and the
+/// changelog (a new entry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffSignal {
+    /// The files the diff touches, in diff order.
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub spec_changed: bool,
+    #[serde(default)]
+    pub version_bump_only: bool,
+    #[serde(default)]
+    pub patches_changed: bool,
+    /// Files the diff adds.
+    #[serde(default)]
+    pub new_files: Vec<String>,
+    #[serde(default)]
+    pub changelog_changed: bool,
+    /// The new version, when the diff bumps the spec's `Version:`.
+    #[serde(default)]
+    pub new_version: Option<String>,
+    /// The CVE ids the added changelog lines name.
+    #[serde(default)]
+    pub cve_ids: Vec<String>,
+    /// Why the diff is empty, when it is (the diff could not be read).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl DiffSignal {
+    pub fn unknown(reason: Option<String>) -> Self {
+        DiffSignal {
+            files: Vec::new(),
+            spec_changed: false,
+            version_bump_only: false,
+            patches_changed: false,
+            new_files: Vec::new(),
+            changelog_changed: false,
+            new_version: None,
+            cve_ids: Vec::new(),
+            reason,
+        }
+    }
+}
+
+impl Default for DiffSignal {
+    fn default() -> Self {
+        Self::unknown(None)
+    }
+}
+
+/// The author-trust signal: the submission author. `is_own_filing`
+/// is true for freshcrab's own filings (matched by `sr_id`).
+/// `is_package_maintainer` is `None` (unknown): geectl 0.2.3 has no
+/// read surface for a package's maintainers, so the signal cannot
+/// tell a maintainer from any other submitter. `first_time_submitter`
+/// is `None` (unknown): it needs the author's submission history,
+/// which step 2 does not read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorSignal {
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub is_own_filing: bool,
+    #[serde(default)]
+    pub is_package_maintainer: Option<bool>,
+    #[serde(default)]
+    pub first_time_submitter: Option<bool>,
+}
+
+impl Default for AuthorSignal {
+    fn default() -> Self {
+        AuthorSignal {
+            author: String::new(),
+            is_own_filing: false,
+            is_package_maintainer: None,
+            first_time_submitter: None,
+        }
+    }
+}
+
+/// The package-risk signal: the target package. `is_excluded` is
+/// true for the config's exclusions (hand-maintained or special
+/// packages). `is_core` is `None` (unknown): no core-package list
+/// lives in the config. `is_security` is true when the submission
+/// names CVE ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageSignal {
+    #[serde(default)]
+    pub package: String,
+    #[serde(default)]
+    pub is_excluded: bool,
+    #[serde(default)]
+    pub is_core: Option<bool>,
+    #[serde(default)]
+    pub is_security: bool,
+    #[serde(default)]
+    pub cve_ids: Vec<String>,
+}
+
+impl Default for PackageSignal {
+    fn default() -> Self {
+        PackageSignal {
+            package: String::new(),
+            is_excluded: false,
+            is_core: None,
+            is_security: false,
+            cve_ids: Vec::new(),
+        }
+    }
+}
+
+/// The server-state signal: the submission's state on the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerSignal {
+    #[serde(default = "default_unknown")]
+    pub status: String,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub mergeable: Option<bool>,
+}
+
+impl ServerSignal {
+    pub fn unknown() -> Self {
+        ServerSignal {
+            status: "unknown".to_string(),
+            draft: false,
+            mergeable: None,
+        }
+    }
+}
+
+impl Default for ServerSignal {
+    fn default() -> Self {
+        Self::unknown()
     }
 }
 
@@ -458,6 +755,32 @@ impl ReviewQueue {
         }
     }
 
+    /// Record a fresh signal snapshot on the record for
+    /// (`instance`, `reference`): only the snapshot and the check
+    /// timestamps change; the status, tier, binding, and action
+    /// history are kept. Returns false when no such record exists.
+    pub fn set_signal_snapshot(
+        &mut self,
+        instance: &str,
+        reference: &str,
+        snapshot: serde_json::Value,
+    ) -> bool {
+        let now = now_iso();
+        match self
+            .records
+            .iter_mut()
+            .find(|r| r.instance == instance && r.reference == reference)
+        {
+            Some(existing) => {
+                existing.signal_snapshot = Some(snapshot);
+                existing.last_checked = now.clone();
+                existing.updated_at = now;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The records, in file order.
     pub fn entries(&self) -> &[ReviewRecord] {
         &self.records
@@ -643,11 +966,18 @@ pub fn enumerate_instances_with(
     scan
 }
 
-/// The pull-request reads discovery needs, as a trait so tests
-/// inject a fake. Production passes `PullRequestClient`.
+/// The pull-request reads discovery and the signal readers need, as
+/// a trait so tests inject a fake. Production passes
+/// `PullRequestClient`.
 pub trait PullRequestSource {
     fn search(&self, query: &PullRequestSearch) -> Result<Vec<PullRequestSummary>, GeectlError>;
     fn show(&self, reference: &PullRequestRef) -> Result<PullRequest, GeectlError>;
+    /// The unified diff of the pull request (plain text, not XML).
+    fn diff(&self, reference: &PullRequestRef) -> Result<String, GeectlError>;
+    /// The build-results matrix for `package` in `project`
+    /// (all repositories and architectures). The caller filters to
+    /// the repositories and architectures the signal needs.
+    fn build_results(&self, project: &str, package: &str) -> Result<BuildResults, GeectlError>;
 }
 
 impl<'a> PullRequestSource for PullRequestClient<'a> {
@@ -657,6 +987,26 @@ impl<'a> PullRequestSource for PullRequestClient<'a> {
 
     fn show(&self, reference: &PullRequestRef) -> Result<PullRequest, GeectlError> {
         PullRequestClient::show(self, reference)
+    }
+
+    fn diff(&self, reference: &PullRequestRef) -> Result<String, GeectlError> {
+        PullRequestClient::diff(self, reference, false)
+    }
+
+    fn build_results(&self, project: &str, package: &str) -> Result<BuildResults, GeectlError> {
+        let obs = self.obs().ok_or_else(|| {
+            GeectlError::new(
+                ErrorKind::InvalidInput,
+                "build results need the OBS arm: this client has no OBS backend",
+            )
+        })?;
+        obs.results(
+            project,
+            &ResultsQuery {
+                package: Some(package.to_string()),
+                ..ResultsQuery::default()
+            },
+        )
     }
 }
 
@@ -1101,6 +1451,701 @@ fn discover_with_scan(
     Ok(report)
 }
 
+/// The outcome of a signal-refresh run across all instances.
+#[derive(Debug, Default)]
+pub struct SignalReport {
+    pub instances: Vec<SignalInstanceReport>,
+    pub unscannable: Vec<(String, String)>,
+    /// Records whose snapshot was refreshed (including ones whose
+    /// reads failed and were recorded as unknown).
+    pub refreshed: usize,
+    /// Records whose snapshot carries a failed read.
+    pub failed: usize,
+}
+
+/// The outcome of refreshing one instance on one backend.
+#[derive(Debug, Default)]
+pub struct SignalInstanceReport {
+    pub alias: String,
+    pub url: String,
+    pub backend: String,
+    pub refreshed: usize,
+    pub failed: usize,
+    /// The refresh itself failed (no records refreshed on this arm).
+    pub error: Option<String>,
+    /// The arm was skipped before any refresh ran (a misconfigured
+    /// credential set).
+    pub skipped: bool,
+}
+
+/// Read the signal snapshot for one record through `source`.
+/// Never fails the run: every failed read is recorded as `unknown`
+/// with the failure named in `read_errors`, so the item goes to the
+/// human tier (step 3) instead of being silently skipped. The
+/// snapshot is the record's state at read time; a re-run re-reads
+/// it.
+pub fn read_signals(
+    source: &dyn PullRequestSource,
+    record: &ReviewRecord,
+    config: &Config,
+    own_sr_ids: &[u64],
+) -> SignalSnapshot {
+    let reference: PullRequestRef = match record.reference.parse() {
+        Ok(reference) => reference,
+        Err(e) => {
+            return SignalSnapshot::unknown(vec![format!(
+                "show: cannot parse stored review ref {:?}: {e}",
+                record.reference
+            )]);
+        }
+    };
+    let pr = match source.show(&reference) {
+        Ok(pr) => pr,
+        Err(e) => {
+            return SignalSnapshot::unknown(vec![format!("show: {e}")]);
+        }
+    };
+    let mut read_errors: Vec<String> = Vec::new();
+
+    let review = review_state(&pr);
+    if let Some(reason) = &review.reason {
+        read_errors.push(format!("review: {reason}"));
+    }
+
+    let diff = match source.diff(&reference) {
+        Ok(text) => parse_diff(&text),
+        Err(e) => {
+            read_errors.push(format!("diff: {e}"));
+            DiffSignal::unknown(Some(e.to_string()))
+        }
+    };
+    // CVE ids named by the title and description as well as the diff.
+    let mut cve_ids = diff.cve_ids.clone();
+    for found in cve_ids_in(&pr.title).into_iter().chain(cve_ids_in(&pr.description)) {
+        if !cve_ids.contains(&found) {
+            cve_ids.push(found);
+        }
+    }
+    cve_ids.sort();
+
+    let build = match record.backend.as_str() {
+        "obs" => build_signal(source, &pr),
+        _ => BuildSignal::unknown(Some(
+            "Gitea pull requests are not built".to_string(),
+        )),
+    };
+    if let Some(reason) = &build.reason {
+        read_errors.push(format!("build: {reason}"));
+    }
+
+    let is_own = match &reference {
+        PullRequestRef::Obs(id) => own_sr_ids.contains(id),
+        _ => false,
+    };
+    let author = AuthorSignal {
+        author: pr.author.clone(),
+        is_own_filing: is_own,
+        is_package_maintainer: None,
+        first_time_submitter: None,
+    };
+
+    let package_name = target_package(&pr.target.repository).unwrap_or("");
+    let package = PackageSignal {
+        package: package_name.to_string(),
+        is_excluded: config.exclusions.iter().any(|e| e == package_name),
+        is_core: None,
+        is_security: !cve_ids.is_empty(),
+        cve_ids,
+    };
+
+    let server = ServerSignal {
+        status: pr.status.as_str().to_string(),
+        draft: pr.draft,
+        mergeable: pr.mergeable,
+    };
+
+    SignalSnapshot {
+        read_at: now_iso(),
+        build,
+        review,
+        diff,
+        author,
+        package,
+        server,
+        read_errors,
+    }
+}
+
+/// The review-state signal from a read pull request. A review that
+/// requests changes dominates: one `changes_requested` is the state
+/// even beside approvals. `asked_pending` is an outstanding ask.
+/// `reviews_error` (the Gitea arm's reviews failed to fetch) is
+/// `unknown`, never `none`.
+fn review_state(pr: &PullRequest) -> ReviewSignal {
+    if let Some(error) = &pr.reviews_error {
+        return ReviewSignal::unknown(Some(error.clone()));
+    }
+    let reviews: Vec<ReviewEntry> = pr
+        .reviews
+        .iter()
+        .map(|r| ReviewEntry {
+            reviewer: r.reviewer.clone(),
+            state: r.state.as_str().to_string(),
+        })
+        .collect();
+    let state = if reviews
+        .iter()
+        .any(|r| r.state == OpinionState::ChangesRequested.as_str())
+    {
+        "changes_requested"
+    } else if reviews
+        .iter()
+        .any(|r| r.state == OpinionState::Approved.as_str())
+    {
+        "approved"
+    } else if reviews
+        .iter()
+        .any(|r| r.state == OpinionState::Asked.as_str())
+    {
+        "asked_pending"
+    } else {
+        "none"
+    };
+    ReviewSignal {
+        state: state.to_string(),
+        reviews,
+        reason: None,
+    }
+}
+
+/// The build-status signal for an OBS pull request: the build of
+/// the request's current sources (the source package in its source
+/// project), on Tumbleweed and Leap 16, x86_64 and aarch64, plus
+/// the target (devel) package's build in the target project. A
+/// failure the devel project already has is not the submitter's.
+/// A read failure is `unknown`, never green.
+fn build_signal(source: &dyn PullRequestSource, pr: &PullRequest) -> BuildSignal {
+    let (source_project, source_package) = match split_project_package(&pr.source.repository) {
+        Some((project, package)) => (project, package),
+        None => {
+            return BuildSignal::unknown(Some(
+                "source names no project/package to build".to_string(),
+            ));
+        }
+    };
+    let (status, cells, reason) = match build_status_for(source, source_project, source_package) {
+        Ok((status, cells)) => (status, cells, None),
+        Err(e) => (
+            "unknown".to_string(),
+            Vec::new(),
+            Some(e.to_string()),
+        ),
+    };
+    let target_status = match split_project_package(&pr.target.repository) {
+        Some((target_project, target_package)) => {
+            match build_status_for(source, target_project, target_package) {
+                Ok((target_status, _)) => target_status,
+                Err(_) => "unknown".to_string(),
+            }
+        }
+        None => "unknown".to_string(),
+    };
+    BuildSignal {
+        status,
+        cells,
+        target_status,
+        reason,
+    }
+}
+
+/// The build status of one package in one project, restricted to
+/// the Tumbleweed and Leap 16 repositories and the x86_64 and
+/// aarch64 architectures. Returns the aggregate status and the
+/// per-cell codes behind it. The build is the package's current
+/// status in the project: geectl 0.2.3's read surface does not tie
+/// a build to the request's exact source revision, so an older
+/// green build cannot be told from a current one here — that needs
+/// the build-test flow, not this read.
+fn build_status_for(
+    source: &dyn PullRequestSource,
+    project: &str,
+    package: &str,
+) -> Result<(String, Vec<BuildCell>), GeectlError> {
+    let matrix = source.build_results(project, package)?;
+    let mut cells: Vec<BuildCell> = Vec::new();
+    for cell in &matrix.results {
+        if !is_signal_repo(&cell.repository) {
+            continue;
+        }
+        if cell.arch != "x86_64" && cell.arch != "aarch64" {
+            continue;
+        }
+        for status in &cell.statuses {
+            if status.package == package {
+                cells.push(BuildCell {
+                    repository: cell.repository.clone(),
+                    arch: cell.arch.clone(),
+                    code: status.code.clone(),
+                });
+            }
+        }
+    }
+    Ok((classify_build(&cells), cells))
+}
+
+/// The aggregate build status over the cells the signal read:
+/// any failure dominates, then any in-progress build, then all
+/// green; no evidence at all is `unknown`.
+fn classify_build(cells: &[BuildCell]) -> String {
+    let mut any_green = false;
+    let mut any_building = false;
+    for cell in cells {
+        match build_code_kind(&cell.code) {
+            BuildCodeKind::Failed => return "any_failed".to_string(),
+            BuildCodeKind::Building => any_building = true,
+            BuildCodeKind::Green => any_green = true,
+            BuildCodeKind::NoEvidence => {}
+        }
+    }
+    if any_building {
+        return "building".to_string();
+    }
+    if any_green {
+        return "all_green".to_string();
+    }
+    "unknown".to_string()
+}
+
+enum BuildCodeKind {
+    Green,
+    Failed,
+    Building,
+    NoEvidence,
+}
+
+/// The kind of one OBS package build code. `disabled`, `excluded`,
+/// and `locked` carry no evidence either way: the package is not
+/// built in that cell, which is neither green nor failed.
+fn build_code_kind(code: &str) -> BuildCodeKind {
+    match code {
+        "succeeded" => BuildCodeKind::Green,
+        "failed" | "unresolvable" | "broken" => BuildCodeKind::Failed,
+        "building" | "scheduled" | "dispatching" | "signing" | "finishing" | "blocked" => {
+            BuildCodeKind::Building
+        }
+        _ => BuildCodeKind::NoEvidence,
+    }
+}
+
+/// True for a repository the build signal reads: Tumbleweed or
+/// Leap 16, matched by name. A home or devel project that builds
+/// against other repositories contributes no cells, so the signal
+/// reads `unknown` there.
+fn is_signal_repo(name: &str) -> bool {
+    is_tumbleweed_repo(name) || is_leap16_repo(name)
+}
+
+fn is_tumbleweed_repo(name: &str) -> bool {
+    name.to_lowercase().contains("tumbleweed")
+}
+
+fn is_leap16_repo(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("leap_16") || lower.contains("leap-16") || lower.contains("leap16")
+}
+
+/// Split a `project/package` repository into its project and
+/// package. None when there is no `/` or the package is empty.
+fn split_project_package(repository: &str) -> Option<(&str, &str)> {
+    repository
+        .rsplit_once('/')
+        .filter(|(_, package)| !package.is_empty())
+}
+
+/// The CVE ids named in `text`, normalized and deduplicated.
+/// Uses geectl's `CveId::parse` as the validator, so the format
+/// is geectl's, not a copy of it here.
+fn cve_ids_in(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &text[i..];
+        let lower = rest.to_lowercase();
+        let Some(pos) = lower.find("cve-") else {
+            break;
+        };
+        let start = i + pos;
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'-') {
+            end += 1;
+        }
+        let candidate = &text[start..end];
+        if let Ok(parsed) = CveId::parse(candidate) {
+            let id = parsed.to_string();
+            if !found.contains(&id) {
+                found.push(id);
+            }
+        }
+        i = end.max(start + 1);
+    }
+    found
+}
+
+/// Parse a unified diff into the diff-scope signal. The diff is
+/// caller-consumed text (geectl returns it unparsed); the parsing
+/// here is freshcrab's own read of the text, not an OBS or Gitea
+/// API call. `version_bump_only` is a heuristic: every file is a
+/// spec or a changelog, every changed spec line is a version or
+/// release line (or a changelog entry line), and the changelog only
+/// gains lines.
+fn parse_diff(text: &str) -> DiffSignal {
+    let mut files: Vec<String> = Vec::new();
+    let mut new_files: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    let mut spec_changed = false;
+    let mut patches_changed = false;
+    let mut changelog_changed = false;
+    let mut new_version: Option<String> = None;
+    let mut cve_ids: Vec<String> = Vec::new();
+    // (file, added, content) for the changed lines, so the
+    // version-bump check runs after the whole diff is read.
+    let mut changed: Vec<(String, bool, String)> = Vec::new();
+
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            let path = rest
+                .rsplit_once(" b/")
+                .map(|(_, path)| path)
+                .unwrap_or(rest);
+            current = Some(path.to_string());
+            if !files.contains(&path.to_string()) {
+                files.push(path.to_string());
+            }
+            continue;
+        }
+        if line == "new file mode" {
+            if let Some(path) = &current {
+                if !new_files.contains(path) {
+                    new_files.push(path.clone());
+                }
+            }
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            if current.is_none() {
+                current = Some(path.to_string());
+                if !files.contains(&path.to_string()) {
+                    files.push(path.to_string());
+                }
+            }
+            continue;
+        }
+        if line == "+++ /dev/null" {
+            continue;
+        }
+        if line.starts_with("--- ") {
+            if line == "--- /dev/null" {
+                if let Some(path) = &current {
+                    if !new_files.contains(path) {
+                        new_files.push(path.clone());
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(path) = &current else {
+            continue;
+        };
+        if let Some(added) = line.strip_prefix('+') {
+            if line.starts_with("+++") {
+                continue;
+            }
+            changed.push((path.clone(), true, added.to_string()));
+        } else if let Some(removed) = line.strip_prefix('-') {
+            if line.starts_with("---") {
+                continue;
+            }
+            changed.push((path.clone(), false, removed.to_string()));
+        }
+    }
+
+    for (path, added, content) in &changed {
+        if path.ends_with(".spec") {
+            spec_changed = true;
+            if *added {
+                if new_version.is_none() {
+                    new_version = version_line(content);
+                }
+            }
+        } else if path.ends_with(".changes") {
+            changelog_changed = true;
+        }
+        if path.ends_with(".patch") || path.ends_with(".diff") {
+            patches_changed = true;
+        }
+        if *added {
+            for found in cve_ids_in(content) {
+                if !cve_ids.contains(&found) {
+                    cve_ids.push(found);
+                }
+            }
+        }
+    }
+    cve_ids.sort();
+
+    // A bump touches the spec (the Version: line) and the changelog
+    // (a new entry); a changelog-only change is not a bump.
+    let version_bump_only = !files.is_empty()
+        && spec_changed
+        && files
+            .iter()
+            .all(|f| f.ends_with(".spec") || f.ends_with(".changes"))
+        && changed.iter().all(|(path, added, content)| {
+            if path.ends_with(".changes") {
+                // A bump only adds changelog entries.
+                *added
+            } else {
+                // .spec: only version, release, and changelog lines.
+                is_version_line(content)
+            }
+        });
+
+    DiffSignal {
+        files,
+        spec_changed,
+        version_bump_only,
+        patches_changed,
+        new_files,
+        changelog_changed,
+        new_version,
+        cve_ids,
+        reason: None,
+    }
+}
+
+/// The `Version:` of an added spec line, when the line sets it.
+fn version_line(content: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    let rest = trimmed.strip_prefix("Version:")?;
+    let version = rest.trim();
+    if version.is_empty() {
+        return None;
+    }
+    Some(version.to_string())
+}
+
+/// True for a changed spec line a version bump may touch: a
+/// `Version:` or `Release:` tag, a version macro definition, or a
+/// changelog entry line (`* date ...` header or `- ...` bullet).
+/// Anything else (a dependency, a patch line, a build flag) makes
+/// the change more than a bump.
+fn is_version_line(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("Version:") || trimmed.starts_with("Release:") {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    if (lower.starts_with("%define") || lower.starts_with("%global"))
+        && lower.contains("version")
+    {
+        return true;
+    }
+    if is_changelog_header(trimmed) || trimmed.starts_with("- ") {
+        return true;
+    }
+    false
+}
+
+/// True for a `%changelog` entry header: `* <weekday> <month>
+/// <day> <year> ...`. The weekday pins it to a changelog header
+/// rather than any other `*` line in the spec.
+fn is_changelog_header(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("* ") else {
+        return false;
+    };
+    let mut words = rest.split_whitespace();
+    matches!(
+        words.next(),
+        Some("Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat" | "Sun")
+    )
+}
+
+/// Refresh the signal snapshots for every non-terminal record, on
+/// every run: read the signals for each record through the
+/// per-instance client, record the snapshot on the record, and
+/// save the review queue (DryRun-guarded). Report-only: no posts,
+/// no review-state changes, no filings. A failed read on one
+/// record is recorded as `unknown` on that record and the run
+/// continues with the rest; a failure to enumerate instances or to
+/// open/save the queue is returned to the caller (main logs it and
+/// continues — the review queue is sidecar state and must not
+/// break the update pipeline).
+pub fn refresh_signals(
+    config: &Config,
+    own_sr_ids: &[u64],
+    http: &dyn geectl::http::HttpClient,
+    path: &str,
+    dry_run: &DryRun,
+) -> Result<SignalReport, ReviewQueueError> {
+    let mut queue = ReviewQueue::open(path)?;
+    let scan = enumerate_instances()
+        .map_err(|e| ReviewQueueError(format!("cannot enumerate geectl instances: {e}")))?;
+    refresh_with_scan(config, own_sr_ids, http, &mut queue, dry_run, scan)
+}
+
+/// Run the refresh over an already-enumerated scan, so tests drive
+/// the per-arm report construction without touching the real geectl
+/// config or environment.
+fn refresh_with_scan(
+    config: &Config,
+    own_sr_ids: &[u64],
+    http: &dyn geectl::http::HttpClient,
+    queue: &mut ReviewQueue,
+    dry_run: &DryRun,
+    scan: InstanceScan,
+) -> Result<SignalReport, ReviewQueueError> {
+    let mut report = SignalReport {
+        unscannable: scan.unscannable,
+        ..SignalReport::default()
+    };
+    for instance in &scan.instances {
+        for backend in [PullRequestBackend::Obs, PullRequestBackend::Gitea] {
+            let (credentials, credential_error) = match backend {
+                PullRequestBackend::Obs => (
+                    instance.obs_credentials.clone(),
+                    instance.obs_error.clone(),
+                ),
+                PullRequestBackend::Gitea => (
+                    instance.gitea_credentials.clone(),
+                    instance.gitea_error.clone(),
+                ),
+            };
+            let Some(creds) = credentials else {
+                if let Some(error) = credential_error {
+                    report.instances.push(SignalInstanceReport {
+                        alias: instance.alias.clone(),
+                        url: instance.url.clone(),
+                        backend: backend.as_str().to_string(),
+                        error: Some(error),
+                        skipped: true,
+                        ..SignalInstanceReport::default()
+                    });
+                }
+                continue;
+            };
+            let instance_report = match backend {
+                PullRequestBackend::Obs => {
+                    match ObsClient::with_base_and_credentials(http, &instance.url, creds) {
+                        Ok(obs) => {
+                            let client = PullRequestClient::new(Some(&obs), None);
+                            refresh_on(
+                                &client,
+                                backend,
+                                &instance.alias,
+                                config,
+                                own_sr_ids,
+                                queue,
+                                dry_run,
+                            )
+                        }
+                        Err(e) => SignalInstanceReport {
+                            alias: instance.alias.clone(),
+                            url: instance.url.clone(),
+                            backend: backend.as_str().to_string(),
+                            error: Some(e.to_string()),
+                            ..SignalInstanceReport::default()
+                        },
+                    }
+                }
+                PullRequestBackend::Gitea => {
+                    match GiteaClient::with_base(http, &instance.url, creds) {
+                        Ok(gitea) => {
+                            let client = PullRequestClient::new(None, Some(&gitea));
+                            refresh_on(
+                                &client,
+                                backend,
+                                &instance.alias,
+                                config,
+                                own_sr_ids,
+                                queue,
+                                dry_run,
+                            )
+                        }
+                        Err(e) => SignalInstanceReport {
+                            alias: instance.alias.clone(),
+                            url: instance.url.clone(),
+                            backend: backend.as_str().to_string(),
+                            error: Some(e.to_string()),
+                            ..SignalInstanceReport::default()
+                        },
+                    }
+                }
+            };
+            let mut instance_report = instance_report;
+            instance_report.url = instance.url.clone();
+            report.refreshed += instance_report.refreshed;
+            report.failed += instance_report.failed;
+            report.instances.push(instance_report);
+        }
+    }
+    queue.save(dry_run)?;
+    Ok(report)
+}
+
+/// Refresh the snapshots for the non-terminal records on one
+/// instance arm. Terminal records are skipped: their refs left the
+/// server, so there is nothing to read. A failed read is recorded
+/// as `unknown` on the record (never green) and counted, and the
+/// refresh continues with the next record.
+fn refresh_on(
+    source: &dyn PullRequestSource,
+    backend: PullRequestBackend,
+    instance_alias: &str,
+    config: &Config,
+    own_sr_ids: &[u64],
+    queue: &mut ReviewQueue,
+    _dry_run: &DryRun,
+) -> SignalInstanceReport {
+    let mut report = SignalInstanceReport {
+        alias: instance_alias.to_string(),
+        backend: backend.as_str().to_string(),
+        ..SignalInstanceReport::default()
+    };
+    let targets: Vec<ReviewRecord> = queue
+        .entries()
+        .iter()
+        .filter(|r| {
+            r.instance == instance_alias
+                && r.backend == backend.as_str()
+                && r.status != "terminal"
+        })
+        .cloned()
+        .collect();
+    for record in &targets {
+        let snapshot = read_signals(source, record, config, own_sr_ids);
+        let failed = !snapshot.read_errors.is_empty();
+        let json = match serde_json::to_value(&snapshot) {
+            Ok(json) => json,
+            Err(e) => {
+                eprintln!(
+                    "warning: cannot serialize signal snapshot for {} on {instance_alias}: {e}; leaving it as is",
+                    record.reference
+                );
+                report.failed += 1;
+                continue;
+            }
+        };
+        if queue.set_signal_snapshot(instance_alias, &record.reference, json) {
+            report.refreshed += 1;
+            if failed {
+                report.failed += 1;
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1196,12 +2241,14 @@ mod tests {
     }
 
     /// A fake pull-request source: canned search results and canned
-    /// show answers (a show error is canned by listing the ref in
-    /// `show_errors` with its kind).
+    /// show, diff, and build answers (an error is canned by listing
+    /// the ref in the matching answers with its kind).
     struct FakeSource {
         search_results: Vec<PullRequestSummary>,
         search_error: Option<GeectlError>,
         show_answers: Vec<(String, Result<PullRequest, GeectlError>)>,
+        diff_answers: Vec<(String, Result<String, GeectlError>)>,
+        build_answers: Vec<(String, Result<BuildResults, GeectlError>)>,
     }
 
     impl FakeSource {
@@ -1210,11 +2257,29 @@ mod tests {
                 search_results,
                 search_error: None,
                 show_answers: Vec::new(),
+                diff_answers: Vec::new(),
+                build_answers: Vec::new(),
             }
         }
 
         fn with_show(mut self, reference: &str, answer: Result<PullRequest, GeectlError>) -> Self {
             self.show_answers.push((reference.to_string(), answer));
+            self
+        }
+
+        fn with_diff(mut self, reference: &str, answer: Result<String, GeectlError>) -> Self {
+            self.diff_answers.push((reference.to_string(), answer));
+            self
+        }
+
+        fn with_build(
+            mut self,
+            project: &str,
+            package: &str,
+            answer: Result<BuildResults, GeectlError>,
+        ) -> Self {
+            self.build_answers
+                .push((format!("{project}/{package}"), answer));
             self
         }
     }
@@ -1243,6 +2308,38 @@ mod tests {
             Err(GeectlError::new(
                 ErrorKind::NotFound,
                 format!("fake source has no show answer for {key}"),
+            ))
+        }
+
+        fn diff(&self, reference: &PullRequestRef) -> Result<String, GeectlError> {
+            let key = reference.to_string();
+            for (stored, answer) in &self.diff_answers {
+                if *stored == key {
+                    return match answer {
+                        Ok(text) => Ok(text.clone()),
+                        Err(e) => Err(GeectlError::new(e.kind(), e.to_string())),
+                    };
+                }
+            }
+            Err(GeectlError::new(
+                ErrorKind::NotFound,
+                format!("fake source has no diff answer for {key}"),
+            ))
+        }
+
+        fn build_results(&self, project: &str, package: &str) -> Result<BuildResults, GeectlError> {
+            let key = format!("{project}/{package}");
+            for (stored, answer) in &self.build_answers {
+                if *stored == key {
+                    return match answer {
+                        Ok(matrix) => Ok(matrix.clone()),
+                        Err(e) => Err(GeectlError::new(e.kind(), e.to_string())),
+                    };
+                }
+            }
+            Err(GeectlError::new(
+                ErrorKind::NotFound,
+                format!("fake source has no build answer for {key}"),
             ))
         }
     }
@@ -2315,6 +3412,493 @@ mod tests {
         let record = queue.find("default", "obs:62").unwrap();
         assert_eq!(record.status, "open");
         assert_eq!(record.title, "old title");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    // ---- Step 2: signal readers ----
+
+    fn build_matrix(cells: Vec<(&str, &str, &str)>) -> BuildResults {
+        BuildResults {
+            state: None,
+            results: cells
+                .into_iter()
+                .map(|(repository, arch, code)| BuildResult {
+                    project: "home:alice".to_string(),
+                    repository: repository.to_string(),
+                    arch: arch.to_string(),
+                    code: "published".to_string(),
+                    state: "published".to_string(),
+                    dirty: false,
+                    details: None,
+                    statuses: vec![PackageBuildStatus {
+                        package: "foo".to_string(),
+                        code: code.to_string(),
+                        details: None,
+                    }],
+                })
+                .collect(),
+        }
+    }
+
+    fn signal_record(reference: &str, backend: &str) -> ReviewRecord {
+        ReviewRecord::new(reference, "default", backend, "bump foo", "someone", None)
+    }
+
+    fn obs_pr_with_reviews(reviews: Vec<ReviewOpinion>) -> PullRequest {
+        let mut pr = fake_pr(
+            PullRequestRef::Obs(123),
+            PullRequestStatus::Open,
+            "devel:foo/foo",
+            None,
+        );
+        pr.reviews = reviews;
+        pr
+    }
+
+    fn review_opinion(reviewer: &str, state: OpinionState) -> ReviewOpinion {
+        ReviewOpinion {
+            reviewer: reviewer.to_string(),
+            state,
+            comment: String::new(),
+            when: None,
+        }
+    }
+
+    const BUMP_DIFF: &str = "diff --git a/foo.spec b/foo.spec\nindex 111..222 100644\n--- a/foo.spec\n+++ b/foo.spec\n@@ -1,4 +1,4 @@\n Name:           foo\n-Version:        1.0\n+Version:        1.1\n Release:        0\n %description\n Some text\ndiff --git a/foo.changes b/foo.changes\nindex 333..444 100644\n--- a/foo.changes\n+++ b/foo.changes\n@@ -1,3 +1,6 @@\n+-------------------------------------------------------------------\n+Tue Nov 24 2026 someone@example.com\n+\n+- Update to 1.1\n+\n -------------------------------------------------------------------\n Tue Nov 17 2026 someone@example.com\n";
+
+    const PATCH_DIFF: &str = "diff --git a/foo.spec b/foo.spec\nindex 111..222 100644\n--- a/foo.spec\n+++ b/foo.spec\n@@ -1,5 +1,6 @@\n Name:           foo\n Version:        1.1\n Release:        0\n+Patch0:         fix-thing.patch\n %description\n Some text\ndiff --git a/fix-thing.patch b/fix-thing.patch\nnew file mode 100644\nindex 000..555\n--- /dev/null\n+++ b/fix-thing.patch\n@@ -0,0 +1,3 @@\n+--- a/foo.c\n++++ b/foo.c\n+@@ -1 +1 @@\n";
+
+    const CVE_DIFF: &str = "diff --git a/foo.changes b/foo.changes\nindex 333..444 100644\n--- a/foo.changes\n+++ b/foo.changes\n@@ -1,3 +1,6 @@\n+-------------------------------------------------------------------\n+Tue Nov 24 2026 someone@example.com\n+\n+- Fix CVE-2026-12345: heap overflow\n+\n -------------------------------------------------------------------\n Tue Nov 17 2026 someone@example.com\n";
+
+    #[test]
+    fn signal_snapshot_serde_roundtrip() {
+        let snapshot = SignalSnapshot {
+            read_at: "123".to_string(),
+            build: BuildSignal {
+                status: "all_green".to_string(),
+                cells: vec![BuildCell {
+                    repository: "openSUSE_Tumbleweed".to_string(),
+                    arch: "x86_64".to_string(),
+                    code: "succeeded".to_string(),
+                }],
+                target_status: "all_green".to_string(),
+                reason: None,
+            },
+            review: ReviewSignal {
+                state: "approved".to_string(),
+                reviews: vec![ReviewEntry {
+                    reviewer: "alice".to_string(),
+                    state: "approved".to_string(),
+                }],
+                reason: None,
+            },
+            diff: DiffSignal {
+                files: vec!["foo.spec".to_string()],
+                spec_changed: true,
+                version_bump_only: true,
+                patches_changed: false,
+                new_files: Vec::new(),
+                changelog_changed: true,
+                new_version: Some("1.1".to_string()),
+                cve_ids: Vec::new(),
+                reason: None,
+            },
+            author: AuthorSignal {
+                author: "someone".to_string(),
+                is_own_filing: false,
+                is_package_maintainer: None,
+                first_time_submitter: None,
+            },
+            package: PackageSignal {
+                package: "foo".to_string(),
+                is_excluded: false,
+                is_core: None,
+                is_security: false,
+                cve_ids: Vec::new(),
+            },
+            server: ServerSignal {
+                status: "open".to_string(),
+                draft: false,
+                mergeable: None,
+            },
+            read_errors: Vec::new(),
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let back: SignalSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snapshot, back);
+    }
+
+    #[test]
+    fn signal_snapshot_loads_without_newer_fields() {
+        let old = r#"{"read_at": "1"}"#;
+        let snapshot: SignalSnapshot = serde_json::from_str(old).unwrap();
+        assert_eq!(snapshot.build.status, "unknown");
+        assert_eq!(snapshot.review.state, "unknown");
+        assert_eq!(snapshot.server.status, "unknown");
+        assert!(snapshot.read_errors.is_empty());
+    }
+
+    #[test]
+    fn review_state_changes_requested_dominates() {
+        let pr = obs_pr_with_reviews(vec![
+            review_opinion("alice", OpinionState::Approved),
+            review_opinion("bob", OpinionState::ChangesRequested),
+        ]);
+        let signal = review_state(&pr);
+        assert_eq!(signal.state, "changes_requested");
+        assert_eq!(signal.reviews.len(), 2);
+    }
+
+    #[test]
+    fn review_state_approved_and_asked_and_none() {
+        let approved = obs_pr_with_reviews(vec![review_opinion(
+            "alice",
+            OpinionState::Approved,
+        )]);
+        assert_eq!(review_state(&approved).state, "approved");
+        let asked =
+            obs_pr_with_reviews(vec![review_opinion("alice", OpinionState::Asked)]);
+        assert_eq!(review_state(&asked).state, "asked_pending");
+        let none = obs_pr_with_reviews(vec![]);
+        assert_eq!(review_state(&none).state, "none");
+    }
+
+    #[test]
+    fn review_state_reviews_error_is_unknown() {
+        let mut pr = obs_pr_with_reviews(vec![]);
+        pr.reviews_error = Some("reviews unavailable".to_string());
+        let signal = review_state(&pr);
+        assert_eq!(signal.state, "unknown");
+        assert!(signal.reason.is_some());
+    }
+
+    #[test]
+    fn parse_diff_version_bump_only() {
+        let diff = parse_diff(BUMP_DIFF);
+        assert_eq!(diff.files, vec!["foo.spec", "foo.changes"]);
+        assert!(diff.spec_changed);
+        assert!(diff.version_bump_only);
+        assert!(!diff.patches_changed);
+        assert!(diff.new_files.is_empty());
+        assert!(diff.changelog_changed);
+        assert_eq!(diff.new_version.as_deref(), Some("1.1"));
+        assert!(diff.cve_ids.is_empty());
+    }
+
+    #[test]
+    fn parse_diff_spec_plus_patch_is_not_a_bump() {
+        let diff = parse_diff(PATCH_DIFF);
+        assert!(diff.spec_changed);
+        assert!(!diff.version_bump_only);
+        assert!(diff.patches_changed);
+        assert_eq!(diff.new_files, vec!["fix-thing.patch"]);
+    }
+
+    #[test]
+    fn parse_diff_changelog_names_cve() {
+        let diff = parse_diff(CVE_DIFF);
+        assert!(diff.changelog_changed);
+        assert_eq!(diff.cve_ids, vec!["CVE-2026-12345"]);
+        assert!(!diff.version_bump_only);
+    }
+
+    #[test]
+    fn cve_ids_scan_validates_and_dedups() {
+        let found = cve_ids_in("Fix CVE-2026-12345 and cve-2026-12345, not CVE-123 or CVE-2026-12.");
+        assert_eq!(found, vec!["CVE-2026-12345"]);
+    }
+
+    #[test]
+    fn build_classify_all_green_any_failed_building_unknown() {
+        assert_eq!(
+            classify_build(&[BuildCell {
+                repository: "openSUSE_Tumbleweed".to_string(),
+                arch: "x86_64".to_string(),
+                code: "succeeded".to_string(),
+            }]),
+            "all_green"
+        );
+        assert_eq!(
+            classify_build(&[
+                BuildCell {
+                    repository: "openSUSE_Tumbleweed".to_string(),
+                    arch: "x86_64".to_string(),
+                    code: "succeeded".to_string(),
+                },
+                BuildCell {
+                    repository: "openSUSE_Tumbleweed".to_string(),
+                    arch: "aarch64".to_string(),
+                    code: "failed".to_string(),
+                },
+            ]),
+            "any_failed"
+        );
+        assert_eq!(
+            classify_build(&[BuildCell {
+                repository: "openSUSE_Tumbleweed".to_string(),
+                arch: "x86_64".to_string(),
+                code: "building".to_string(),
+            }]),
+            "building"
+        );
+        assert_eq!(classify_build(&[]), "unknown");
+        assert_eq!(
+            classify_build(&[BuildCell {
+                repository: "openSUSE_Tumbleweed".to_string(),
+                arch: "x86_64".to_string(),
+                code: "disabled".to_string(),
+            }]),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn signal_repo_matching() {
+        assert!(is_signal_repo("openSUSE_Tumbleweed"));
+        assert!(is_signal_repo("openSUSE_Leap_16.0"));
+        assert!(is_signal_repo("openSUSE_Leap_16.1"));
+        assert!(!is_signal_repo("openSUSE_Leap_15.6"));
+        assert!(!is_signal_repo("SLE_15_SP6"));
+        assert!(!is_signal_repo("openSUSE_Factory"));
+    }
+
+    #[test]
+    fn build_status_for_filters_to_signal_repos_and_arches() {
+        let matrix = build_matrix(vec![
+            ("openSUSE_Tumbleweed", "x86_64", "succeeded"),
+            ("openSUSE_Tumbleweed", "aarch64", "succeeded"),
+            ("openSUSE_Leap_16.0", "x86_64", "succeeded"),
+            ("openSUSE_Leap_15.6", "x86_64", "failed"),
+            ("openSUSE_Tumbleweed", "ppc64le", "failed"),
+        ]);
+        let source = FakeSource::new(vec![]).with_build(
+            "home:alice",
+            "foo",
+            Ok(matrix),
+        );
+        let (status, cells) = build_status_for(&source, "home:alice", "foo").unwrap();
+        assert_eq!(status, "all_green");
+        // The Leap 15.6 failure and the ppc64le failure are outside
+        // the signal's repos/arches, so they do not count.
+        assert_eq!(cells.len(), 3);
+    }
+
+    #[test]
+    fn read_signals_obs_record() {
+        let green = build_matrix(vec![
+            ("openSUSE_Tumbleweed", "x86_64", "succeeded"),
+            ("openSUSE_Tumbleweed", "aarch64", "succeeded"),
+        ]);
+        let source = FakeSource::new(vec![])
+            .with_show(
+                "obs:123",
+                Ok(obs_pr_with_reviews(vec![review_opinion(
+                    "alice",
+                    OpinionState::Approved,
+                )])),
+            )
+            .with_diff("obs:123", Ok(BUMP_DIFF.to_string()))
+            .with_build("home:alice", "foo", Ok(green))
+            .with_build(
+                "devel:foo",
+                "foo",
+                Ok(build_matrix(vec![(
+                    "openSUSE_Tumbleweed",
+                    "x86_64",
+                    "succeeded",
+                )])),
+            );
+        let record = signal_record("obs:123", "obs");
+        let snapshot = read_signals(&source, &record, &test_config(), &[123]);
+        assert!(snapshot.read_errors.is_empty());
+        assert_eq!(snapshot.build.status, "all_green");
+        assert_eq!(snapshot.build.target_status, "all_green");
+        assert_eq!(snapshot.review.state, "approved");
+        assert!(snapshot.diff.version_bump_only);
+        assert_eq!(snapshot.diff.new_version.as_deref(), Some("1.1"));
+        assert!(snapshot.author.is_own_filing);
+        assert_eq!(snapshot.author.is_package_maintainer, None);
+        assert_eq!(snapshot.author.first_time_submitter, None);
+        assert_eq!(snapshot.package.package, "foo");
+        assert!(!snapshot.package.is_excluded);
+        assert!(!snapshot.package.is_security);
+        assert_eq!(snapshot.server.status, "open");
+    }
+
+    #[test]
+    fn read_signals_excluded_package_and_cve() {
+        let source = FakeSource::new(vec![])
+            .with_show(
+                "obs:124",
+                Ok({
+                    let mut pr = fake_pr(
+                        PullRequestRef::Obs(124),
+                        PullRequestStatus::Open,
+                        "devel:gcc/gcc",
+                        None,
+                    );
+                    pr.title = "Fix CVE-2026-99999 in gcc".to_string();
+                    pr
+                }),
+            )
+            .with_diff("obs:124", Ok(CVE_DIFF.to_string()));
+        let record = signal_record("obs:124", "obs");
+        let snapshot = read_signals(&source, &record, &test_config(), &[]);
+        assert!(snapshot.package.is_excluded);
+        assert!(snapshot.package.is_security);
+        assert_eq!(
+            snapshot.package.cve_ids,
+            vec!["CVE-2026-12345", "CVE-2026-99999"]
+        );
+        // No build answers: the build reads unknown, never green.
+        assert_eq!(snapshot.build.status, "unknown");
+        assert!(!snapshot.read_errors.is_empty());
+    }
+
+    #[test]
+    fn read_signals_show_failure_is_unknown() {
+        let source = FakeSource::new(vec![]).with_show(
+            "obs:125",
+            Err(err(ErrorKind::ServerError, "boom")),
+        );
+        let record = signal_record("obs:125", "obs");
+        let snapshot = read_signals(&source, &record, &test_config(), &[]);
+        assert_eq!(snapshot.build.status, "unknown");
+        assert_eq!(snapshot.review.state, "unknown");
+        assert_eq!(snapshot.server.status, "unknown");
+        assert!(!snapshot.read_errors.is_empty());
+    }
+
+    #[test]
+    fn read_signals_gitea_build_is_unknown_not_green() {
+        let source = FakeSource::new(vec![])
+            .with_show(
+                "gitea:alice/foo#7",
+                Ok({
+                    let mut pr = fake_pr(
+                        PullRequestRef::Gitea {
+                            owner: "alice".to_string(),
+                            repo: "foo".to_string(),
+                            number: 7,
+                        },
+                        PullRequestStatus::Open,
+                        "alice/foo",
+                        Some("main"),
+                    );
+                    pr.author = "alice".to_string();
+                    pr
+                }),
+            )
+            .with_diff("gitea:alice/foo#7", Ok(BUMP_DIFF.to_string()));
+        let record = signal_record("gitea:alice/foo#7", "gitea");
+        let snapshot = read_signals(&source, &record, &test_config(), &[]);
+        assert_eq!(snapshot.build.status, "unknown");
+        assert!(snapshot.build.reason.is_some());
+        assert_eq!(snapshot.diff.version_bump_only, true);
+    }
+
+    #[test]
+    fn set_signal_snapshot_updates_only_snapshot() {
+        let path = tmp_path("snapshot");
+        let live_run = live();
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        queue.upsert(ReviewRecord::new(
+            "obs:123", "default", "obs", "bump foo", "someone", None,
+        ));
+        let snapshot = serde_json::to_value(SignalSnapshot::unknown(vec![])).unwrap();
+        assert!(queue.set_signal_snapshot("default", "obs:123", snapshot));
+        let record = queue.find("default", "obs:123").unwrap();
+        assert!(record.signal_snapshot.is_some());
+        assert_eq!(record.status, "open");
+        assert_eq!(record.tier, "");
+        assert!(!queue.set_signal_snapshot("default", "obs:999", serde_json::Value::Null));
+        queue.save(&live_run).unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn refresh_on_skips_terminal_records() {
+        let source = FakeSource::new(vec![]).with_show(
+            "obs:123",
+            Ok(obs_pr_with_reviews(vec![])),
+        );
+        let path = tmp_path("refresh-skip");
+        let live_run = live();
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        queue.upsert(ReviewRecord::new(
+            "obs:123", "default", "obs", "bump foo", "someone", None,
+        ));
+        queue.mark_terminal("default", "obs:123");
+        let report = refresh_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &test_config(),
+            &[],
+            &mut queue,
+            &live_run,
+        );
+        assert_eq!(report.refreshed, 0);
+        let record = queue.find("default", "obs:123").unwrap();
+        assert!(record.signal_snapshot.is_none());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.lock"));
+    }
+
+    #[test]
+    fn refresh_on_records_snapshot_and_failed_reads() {
+        let source = FakeSource::new(vec![])
+            .with_show(
+                "obs:123",
+                Ok(obs_pr_with_reviews(vec![review_opinion(
+                    "alice",
+                    OpinionState::Approved,
+                )])),
+            )
+            .with_diff("obs:123", Ok(BUMP_DIFF.to_string()))
+            .with_build(
+                "home:alice",
+                "foo",
+                Ok(build_matrix(vec![(
+                    "openSUSE_Tumbleweed",
+                    "x86_64",
+                    "succeeded",
+                )])),
+            )
+            .with_build(
+                "devel:foo",
+                "foo",
+                Ok(build_matrix(vec![(
+                    "openSUSE_Tumbleweed",
+                    "x86_64",
+                    "succeeded",
+                )])),
+            );
+        let path = tmp_path("refresh-ok");
+        let live_run = live();
+        let mut queue = ReviewQueue::open(&path).unwrap();
+        queue.upsert(ReviewRecord::new(
+            "obs:123", "default", "obs", "bump foo", "someone", None,
+        ));
+        let report = refresh_on(
+            &source,
+            PullRequestBackend::Obs,
+            "default",
+            &test_config(),
+            &[],
+            &mut queue,
+            &live_run,
+        );
+        assert_eq!(report.refreshed, 1);
+        assert_eq!(report.failed, 0);
+        let record = queue.find("default", "obs:123").unwrap();
+        let snapshot: SignalSnapshot =
+            serde_json::from_value(record.signal_snapshot.clone().unwrap()).unwrap();
+        assert_eq!(snapshot.build.status, "all_green");
+        assert_eq!(snapshot.review.state, "approved");
+        assert!(snapshot.diff.version_bump_only);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{path}.lock"));
     }

@@ -23,7 +23,7 @@ use freshcrab::dry_run::resolve as resolve_dry_run;
 use freshcrab::factory::FactoryClient;
 use freshcrab::http::{map_obs_credentials_error, UreqClient};
 use freshcrab::queue::{DedupChecks, Queue, QueueEntry};
-use freshcrab::review_queue::{discover, own_sr_ids};
+use freshcrab::review_queue::{discover, own_sr_ids, refresh_signals};
 use freshcrab::watcher::Watcher;
 use freshcrab::worker::{DryRunExecutor, Worker};
 use geectl::auth::Credentials;
@@ -368,6 +368,40 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("review queue discovery failed: {e}");
+        }
+    }
+
+    // The review queue reads the signal snapshot for every
+    // non-terminal record on every run (step 2, report-only: it
+    // reads and records, posts nothing). It runs after discovery,
+    // so the records it refreshes are current. A refresh failure
+    // is logged loudly and the run continues, like discovery: the
+    // review queue is sidecar state and must not break the update
+    // pipeline or its stdout JSON.
+    match refresh_signals(&config, &sr_ids, &geectl_http, &review_queue_path, &dry_run) {
+        Ok(report) => {
+            eprintln!(
+                "review queue: signals refreshed for {} records, {} with failed reads",
+                report.refreshed, report.failed
+            );
+            for instance in &report.instances {
+                if let Some(error) = &instance.error {
+                    if instance.skipped {
+                        eprintln!(
+                            "review queue: {} {} skipped: {error}",
+                            instance.alias, instance.backend
+                        );
+                    } else {
+                        eprintln!(
+                            "review queue: {} {} refresh failed: {error}",
+                            instance.alias, instance.backend
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("review queue signal refresh failed: {e}");
         }
     }
 
