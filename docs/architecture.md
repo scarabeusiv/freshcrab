@@ -172,6 +172,39 @@ the operation proceeds. The effective mode resolves as CLI flag
 (`--dry-run` / `--live`) > env var (`FRESHCRAB_DRY_RUN`) > config
 (`dry_run`, default `true`) and is logged loudly at startup.
 
+## Project hygiene (report-only)
+
+`src/hygiene.rs` sweeps a project for obsolete repositories and
+long-broken packages, reporting only — the sweeps take no `--live`
+flag and make no mutations. `freshcrab hygiene` (see the runbook)
+runs both sweeps per project and prints the report as JSON.
+
+- **Obsolete repositories.** A repository whose build path targets
+  a project or repository that is not found. The sweep reads the
+  swept project's meta, then each distinct path target's meta; a
+  target project that answers 404 is not found (gone or not
+  visible to these credentials — the API does not distinguish the
+  two), a target project without
+  the repository has no such repository. Any other read failure fails
+  the sweep loudly instead of reporting a partial list.
+- **Long-broken packages.** A package is long-broken when it fails
+  in every repository that counts for it (Tumbleweed counts only for
+  packages in Factory — a Tumbleweed repository is one whose primary
+  build path targets the Tumbleweed family: `openSUSE:Factory`,
+  `openSUSE:Tumbleweed`, or any `openSUSE:Factory:*` subproject; the
+  check follows the first path transitively through the swept
+  project's own tree only, so a repo building against a subproject
+  repo ultimately builds against that repo's target, while a repo
+  whose first path points at a different project is a direct build
+  target), has no successful build in the last 90 days
+  (via the job history on a failing architecture), and was never
+  integrated (no accepted submit request from the project or a branch
+  of it). A package building in any counting repository is skipped,
+  and a history that does not reach back past the 90-day threshold
+  with no success does not qualify — both fail closed. All reads go
+  through geectl: the build-results matrix, job history, and request
+  search.
+
 ## Leap and CVE validation (planned, scaffolded)
 
 Leap and CVE validation are the remaining work — see
@@ -243,6 +276,8 @@ src/
   collectors/          Repology, Anitya, PyPI, Distrowatch, upstream check
   factory.rs           Factory version via geectl's public reads
                        (`cat` for the spec, `list_packages` for the list)
+  hygiene.rs           project-hygiene sweeps (report-only): obsolete
+                       repositories + long-broken packages
   target.rs            distribution targets (Factory / Leap) + the
                        per-target update-policy hook
   cve.rs               CVE validation: the changelog-carries-the-CVE rule
@@ -273,6 +308,8 @@ tests/
   test_sr.rs           SR filing: dry-run logs the exact payload and
                        files nothing; live POSTs the XML and returns the
                        request id; no credentials fails closed
+  test_hygiene.rs      hygiene sweeps over canned OBS responses
+                       (no live network)
   fixtures/            canned Repology / Anitya / PyPI / Distrowatch / spec
 docs/
   architecture.md      this file

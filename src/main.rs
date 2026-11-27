@@ -31,6 +31,7 @@ use std::process::ExitCode;
 
 fn print_usage() {
     eprintln!("Usage: freshcrab [--config <path>] [--packages <pkg>...] [--queue <path>] [--dry-run | --live]");
+    eprintln!("       freshcrab hygiene [--config <path>] [--project <project>...]");
     eprintln!("  --config <path>     path to config.yaml (default: config.yaml)");
     eprintln!("  --packages <pkg>... check only these packages (overrides the config list)");
     eprintln!("  --queue <path>      path to the queue state file (default: queue.json)");
@@ -48,12 +49,16 @@ fn print_usage() {
 }
 
 fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("hygiene") {
+        return run_hygiene_cli(&argv[1..]);
+    }
     let mut config_path = "config.yaml".to_string();
     let mut packages: Option<Vec<String>> = None;
     let mut queue_path = "queue.json".to_string();
     let mut cli_dry_run: Option<bool> = None;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = argv.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => match args.next() {
@@ -175,17 +180,12 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let obs = match &credentials {
-        Some(creds) => {
-            match geectl::obs::ObsClient::with_credentials(&geectl_http, creds.clone()) {
-                Ok(obs) => obs,
-                Err(e) => {
-                    eprintln!("cannot build the OBS client: {e}");
-                    return ExitCode::from(1);
-                }
-            }
+    let obs = match obs_client(&geectl_http, &credentials) {
+        Ok(obs) => obs,
+        Err(e) => {
+            eprintln!("cannot build the OBS client: {e}");
+            return ExitCode::from(1);
         }
-        None => geectl::obs::ObsClient::new(&geectl_http),
     };
     let http = UreqClient::new();
     let factory = FactoryClient::new(&obs);
@@ -357,6 +357,142 @@ fn main() -> ExitCode {
         Ok(json) => println!("{json}"),
         Err(e) => {
             eprintln!("cannot serialize dispatch report: {e}");
+            return ExitCode::from(1);
+        }
+    }
+    ExitCode::from(0)
+}
+
+/// Build the OBS client on the given HTTP client: authenticated
+/// when credentials are present, anonymous otherwise. One
+/// construction path for the pipeline and the hygiene subcommand.
+fn obs_client<'a>(
+    http: &'a geectl::http::UreqClient,
+    credentials: &Option<Credentials>,
+) -> Result<geectl::obs::ObsClient<'a>, GeectlError> {
+    match credentials {
+        Some(creds) => geectl::obs::ObsClient::with_credentials(http, creds.clone()),
+        None => Ok(geectl::obs::ObsClient::new(http)),
+    }
+}
+
+fn print_hygiene_usage() {
+    eprintln!("Usage: freshcrab hygiene [--config <path>] [--project <project>...]");
+    eprintln!("  --config <path>      path to config.yaml (default: config.yaml)");
+    eprintln!("  --project <project>  sweep this OBS project (repeatable; overrides");
+    eprintln!("                       hygiene_projects in the config)");
+    eprintln!("Runs both project-hygiene sweeps (issue #22) report-only over");
+    eprintln!("the projects and prints the findings as JSON. Report-only is");
+    eprintln!("inherent: the sweeps read only and take no --live flag.");
+}
+
+/// The `freshcrab hygiene` subcommand: run both project-hygiene
+/// sweeps (issue #22) report-only over the resolved projects and
+/// print the findings as JSON on stdout. The kill switch pauses the
+/// run, like the pipeline.
+fn run_hygiene_cli(args: &[String]) -> ExitCode {
+    let mut config_path = "config.yaml".to_string();
+    let mut projects: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => {
+                i += 1;
+                match args.get(i) {
+                    Some(path) => config_path = path.clone(),
+                    None => {
+                        eprintln!("--config needs a path");
+                        print_hygiene_usage();
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--project" => {
+                i += 1;
+                match args.get(i) {
+                    Some(project) => projects.push(project.clone()),
+                    None => {
+                        eprintln!("--project needs a project name");
+                        print_hygiene_usage();
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--help" | "-h" => {
+                print_hygiene_usage();
+                return ExitCode::from(0);
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                print_hygiene_usage();
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+
+    let config = match load_config(&config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let projects = match freshcrab::hygiene::resolve_hygiene_projects_from_env(&config, &projects) {
+        Ok(projects) => projects,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    if config.kill_switch {
+        eprintln!("kill switch is on: hygiene run paused, nothing swept.");
+        return ExitCode::from(0);
+    }
+
+    // The OBS client carries the credentials the sweeps need (the
+    // build results and the request search are authenticated reads);
+    // without them the sweeps fail closed. Built the same way as the
+    // pipeline's client.
+    let geectl_http = match geectl::http::UreqClient::new(geectl::http::Timeout::default()) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("cannot build the OBS HTTP client: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let credentials = match obs_credentials_from_env() {
+        Ok(credentials) => credentials,
+        Err(e) => {
+            eprintln!("invalid OBS credentials (OSC_USERNAME/OSC_PASSWORD): {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let obs = match obs_client(&geectl_http, &credentials) {
+        Ok(obs) => obs,
+        Err(e) => {
+            eprintln!("cannot build the OBS client: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    eprintln!(
+        "hygiene (report-only): sweeping {} project(s): {}",
+        projects.len(),
+        projects.join(", ")
+    );
+    let report =
+        match freshcrab::hygiene::run_hygiene(&obs, &projects, freshcrab::hygiene::now_unix()) {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!("hygiene run failed: {e}");
+                return ExitCode::from(1);
+            }
+        };
+    match serde_json::to_string_pretty(&report) {
+        Ok(json) => println!("{json}"),
+        Err(e) => {
+            eprintln!("cannot serialize hygiene report: {e}");
             return ExitCode::from(1);
         }
     }

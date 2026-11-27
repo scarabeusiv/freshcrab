@@ -45,6 +45,7 @@ const KNOWN_KEYS: &[&str] = &[
     "report_only",
     "dry_run",
     "home_project",
+    "hygiene_projects",
 ];
 
 /// Validated configuration.
@@ -77,6 +78,11 @@ pub struct Config {
     /// branch project to build an SR payload; without it, live filing
     /// escalates and dry-run planning notes the gap.
     pub home_project: String,
+    /// The OBS projects the hygiene sweeps run over (issue #22):
+    /// own devel projects and home projects. Empty (the default)
+    /// means the sweeps run over the home project only; pass
+    /// `--project` to sweep a different project for one run.
+    pub hygiene_projects: Vec<String>,
 }
 
 impl Default for Config {
@@ -91,6 +97,7 @@ impl Default for Config {
             report_only: true,
             dry_run: true,
             home_project: String::new(),
+            hygiene_projects: Vec::new(),
         }
     }
 }
@@ -356,6 +363,7 @@ fn validate(map: HashMap<String, Value>) -> Result<Config, ConfigError> {
         report_only: require_bool(&map, "report_only", true)?,
         dry_run: require_bool(&map, "dry_run", true)?,
         home_project: validate_home_project(require_string(&map, "home_project")?)?,
+        hygiene_projects: validate_hygiene_projects(require_list(&map, "hygiene_projects")?)?,
     })
 }
 
@@ -381,6 +389,21 @@ fn validate_home_project(raw: String) -> Result<String, ConfigError> {
         )));
     }
     Ok(trimmed.to_string())
+}
+
+/// Validate the `hygiene_projects` value at config load: every
+/// entry must be a valid OBS project name (colons allowed:
+/// `devel:languages:python`). An empty list means "the home project
+/// only".
+fn validate_hygiene_projects(projects: Vec<String>) -> Result<Vec<String>, ConfigError> {
+    for project in &projects {
+        if !valid_obs_name(project) {
+            return Err(ConfigError(format!(
+                "invalid hygiene_projects entry {project:?}: expected a valid OBS project name"
+            )));
+        }
+    }
+    Ok(projects)
 }
 
 /// Load and validate the config file at `path`.

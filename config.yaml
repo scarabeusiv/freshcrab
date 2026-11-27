@@ -54,3 +54,11 @@ dry_run: true
 # report_only: false.
 home_project: ""
 
+# Projects the hygiene sweeps (`freshcrab hygiene`) run over when no
+# --project flag is given: devel and home projects alike. Empty means:
+# fall back to home_project (or home:{OSC_USERNAME}). The sweeps are
+# report-only, so listing a project here changes nothing on OBS.
+# hygiene_projects:
+#   - devel:languages:python
+#   - home:scarabeus_iv
+
