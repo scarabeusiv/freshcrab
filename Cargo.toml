@@ -18,6 +18,17 @@ path = "src/lib.rs"
 name = "freshcrab"
 path = "src/main.rs"
 
+[[bin]]
+name = "freshcrab-gen"
+path = "src/bin/freshcrab-gen.rs"
+required-features = ["gen"]
+
+[features]
+gen = ["dep:clap_complete", "dep:clap_mangen"]
+
+[dev-dependencies]
+tempfile = "3"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -36,6 +47,9 @@ base64 = "0.23"
 geectl = "0.2"
 # CLI parsing (derive): the flags, --help and --version.
 clap = { version = "4", features = ["derive"] }
+# Generator-only: man pages and shell completions (feature gen).
+clap_complete = { version = "4", optional = true }
+clap_mangen = { version = "0.3", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"
