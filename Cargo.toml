@@ -29,6 +29,9 @@ ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] 
 fs2 = "0.4"
 # Base64 for the HTTP Basic auth header.
 base64 = "0.23"
+# Regex for the scope predicates (src/scope.rs): the literal
+# Factory/Leap repo patterns and the optional widening patterns.
+regex = "1"
 # The OBS library: the Factory reads, the devel lookup, the open-SR
 # check, and SR filing all come from geectl. Taken from crates.io
 # (0.2.3); Dependabot's weekly cargo updates propose each new geectl
