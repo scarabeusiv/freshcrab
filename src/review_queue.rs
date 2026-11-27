@@ -1660,12 +1660,25 @@ pub fn read_signals(
     };
     // The author maintains the target package when their login is
     // among its maintainers (OBS arm, via geectl's
-    // `ObsClient::maintainers`). Gitea has no such read here.
+    // `ObsClient::maintainers`). Membership can only be proven,
+    // never disproven: the list flattens persons and groups with
+    // no discriminator, so a group-member author who matches no
+    // name reads as unknown, not as a non-maintainer. An empty
+    // list proves there is no maintainer at all. Gitea has no
+    // such read here.
     let is_package_maintainer = match record.backend.as_str() {
         "obs" => match split_project_package(&pr.target.repository) {
             Some((target_project, target_package)) => {
                 match source.maintainers(target_project, target_package) {
-                    Ok(maintainers) => Some(maintainers.iter().any(|m| m.name == pr.author)),
+                    Ok(maintainers) => {
+                        if maintainers.iter().any(|m| m.name == pr.author) {
+                            Some(true)
+                        } else if maintainers.is_empty() {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    }
                     Err(e) => {
                         read_errors.push(format!("maintainers: {e}"));
                         None
@@ -1950,12 +1963,15 @@ fn cve_ids_in(text: &str) -> Vec<String> {
 /// API call. Two formats arrive: git-style (Gitea; `diff --git`,
 /// `a/`/`b/` prefixes) and OBS plain text (sectioned:
 /// `changes files:`, `spec files:`, `other changes:`, with bare
-/// `---`/`+++` lines and `++++++ new ... file:` markers). Files
-/// under `other changes:` are the contents of a changed tarball,
-/// not package files, so they do not count toward the scope.
-/// `version_bump_only` is a heuristic: every file is a spec or a
-/// changelog, every changed spec line is a version or release line
-/// (or a changelog entry line), and the changelog only gains lines.
+/// `---`/`+++` lines and `++++++ new ... file:` markers). Under
+/// `other changes:` a `++++++` marker decides what follows: an
+/// archive (or an `old -> new` tarball change) means tarball
+/// contents to skip, while a plain file (`_patchinfo`, a service
+/// file) is a package file to parse — the section label alone
+/// cannot tell them apart. `version_bump_only` is a heuristic:
+/// every file is a spec or a changelog, every changed spec line
+/// is a version or release line (or a changelog entry line), and
+/// the changelog only gains lines.
 fn parse_diff(text: &str) -> DiffSignal {
     let mut files: Vec<String> = Vec::new();
     let mut new_files: Vec<String> = Vec::new();
@@ -1967,9 +1983,12 @@ fn parse_diff(text: &str) -> DiffSignal {
     // Set by a `++++++ new ... file:` marker or `--- /dev/null`:
     // the next file header is a new file.
     let mut pending_new = false;
-    // True inside an OBS `other changes:` section: tarball
-    // contents, not package files.
-    let mut in_other_changes = false;
+    // True while the hunks after a `++++++` marker are tarball
+    // contents: an archive (or an `old -> new` tarball change)
+    // names tarball contents to skip; a plain file names a package
+    // file to parse. Reset by every section header, so a new
+    // section starts with package files.
+    let mut in_tarball_contents = false;
     // True inside a spec `%changelog` section (per file): only
     // there is a `- ` bullet a changelog entry line.
     let mut in_changelog = false;
@@ -1984,15 +2003,33 @@ fn parse_diff(text: &str) -> DiffSignal {
     let mut changed: Vec<(String, bool, String, bool)> = Vec::new();
 
     for line in text.lines() {
-        // OBS section headers. A bare `other changes:` line can
-        // only be a section header: hunk lines carry a `+`, `-`,
-        // ` `, or `@@` prefix.
+        // OBS section headers reset the tarball-contents state: a
+        // new section starts with package files. A bare `other
+        // changes:` line can only be a section header: hunk lines
+        // carry a `+`, `-`, ` `, or `@@` prefix.
         match line {
-            "changes files:" | "spec files:" | "old:" | "new:" => in_other_changes = false,
-            "other changes:" => in_other_changes = true,
+            "changes files:" | "spec files:" | "old:" | "new:" | "other changes:" => {
+                in_tarball_contents = false;
+            }
             _ => {}
         }
-        if in_other_changes {
+        // A `++++++` marker names what follows: an archive (or an
+        // `old -> new` tarball change) means tarball contents to
+        // skip; a plain file means a package file to parse, and a
+        // ` (new)` suffix (or a `new ... file:` marker) marks it
+        // new.
+        if let Some(marker) = line.strip_prefix("++++++ ") {
+            if is_tarball_marker(marker) {
+                in_tarball_contents = true;
+            } else {
+                in_tarball_contents = false;
+                if marker.ends_with(" (new)") || marker.starts_with("new ") {
+                    pending_new = true;
+                }
+            }
+            continue;
+        }
+        if in_tarball_contents {
             continue;
         }
         if let Some(rest) = line.strip_prefix("diff --git ") {
@@ -2007,10 +2044,6 @@ fn parse_diff(text: &str) -> DiffSignal {
             if !files.contains(&path.to_string()) {
                 files.push(path.to_string());
             }
-            continue;
-        }
-        if line.starts_with("++++++ new ") {
-            pending_new = true;
             continue;
         }
         if line.starts_with("new file mode") {
@@ -2137,6 +2170,38 @@ fn parse_diff(text: &str) -> DiffSignal {
         cve_ids,
         reason: None,
     }
+}
+
+/// True for a `++++++` marker naming tarball contents: an archive
+/// filename, or an `old -> new` tarball change. A plain file
+/// (`_patchinfo`, a spec, a service file) is a package file, not
+/// tarball contents — the `other changes:` section label alone
+/// cannot tell them apart.
+fn is_tarball_marker(marker: &str) -> bool {
+    if marker.contains(" -> ") {
+        return true;
+    }
+    // A new archive is still an archive.
+    let name = marker
+        .strip_suffix(" (new)")
+        .unwrap_or(marker)
+        .to_lowercase();
+    name.ends_with(".tar.gz")
+        || name.ends_with(".tgz")
+        || name.ends_with(".tar.bz2")
+        || name.ends_with(".tbz2")
+        || name.ends_with(".tar.xz")
+        || name.ends_with(".txz")
+        || name.ends_with(".tar.zst")
+        || name.ends_with(".tzst")
+        || name.ends_with(".tar")
+        || name.ends_with(".zip")
+        || name.ends_with(".gz")
+        || name.ends_with(".bz2")
+        || name.ends_with(".xz")
+        || name.ends_with(".zst")
+        || name.ends_with(".7z")
+        || name.ends_with(".rar")
 }
 
 /// The file path from a `---`/`+++` header line: strip a trailing
@@ -3692,7 +3757,7 @@ mod tests {
     // `---`/`+++`, no `diff --git`. The tarball change under
     // `other changes:` is not a package file, so README.md is not
     // in `files` and does not break the scope.
-    const OBS_MODIFY_DIFF: &str = "changes files:\n--------------\n--- shadowsocks-v2ray-plugin.changes\n+++ shadowsocks-v2ray-plugin.changes\n@@ -1,0 +2,19 @@\n+Fri May 29 13:26:53 UTC 2026 - Hillwood Yang <hillwoodroc@gmail.com>\n+\n+- Update version to 5.49.0\n+  * Update v2ray-core to 5.49.0\n+  * Update vendor (boo#1260328 and CVE-2026-33186)\n+\n+-------------------------------------------------------------------\n+Thu Feb 12 12:51:31 UTC 2026 - Hillwood Yang <hillwood@opensuse.org>\n+\n+- Update version to 5.44.1\n\nold:\n----\n  v2ray-plugin-5.37.0.tar.gz\n\nnew:\n----\n  v2ray-plugin-5.49.0.tar.gz\n\nspec files:\n-----------\n--- shadowsocks-v2ray-plugin.spec\n+++ shadowsocks-v2ray-plugin.spec\n@@ -1,7 +1,7 @@\n #\n # spec file for package shadowsocks-v2ray-plugin\n #\n-# Copyright (c) 2025 SUSE LLC and contributors\n+# Copyright (c) 2026 SUSE LLC and contributors\n #\n # All modifications and additions to the file contributed by third parties\n # remain the property of their copyright owners, unless otherwise agreed\n@@ -27,7 +27,7 @@\n %define   import_path     %{provider_prefix}\n \n Name:           shadowsocks-v2ray-plugin\n-Version:        5.37.0\n+Version:        5.49.0\n Release:        0\n Summary:        SIP003 plugin for shadowsocks\n License:        MIT\n@@ -36,7 +36,9 @@\n Source0:        https://github.com/teddysun/v2ray-plugin/archive/v%{version}/%{repo}-%{version}.tar.gz\n Source1:        vendor.tar.gz\n BuildRequires:  fdupes\n+# BuildRequires:  golang-github-v2fly-v2ray-core >= 5.44.1\n BuildRequires:  golang-packaging\n+BuildRequires:  golang(API) >= 1.25\n AutoReqProv:    Off\n BuildRoot:      %{_tmppath}/%{name}-%{version}-build\n %{go_provides}\n\nother changes:\n--------------\n\n++++++ v2ray-plugin-5.37.0.tar.gz -> v2ray-plugin-5.49.0.tar.gz\n--- README.md\n+++ README.md\n@@ -2,7 +2,7 @@\n \n [![CircleCI](https://circleci.com/gh/shadowsocks/v2ray-plugin.svg?style=shield)](https://circleci.com/gh/shadowsocks/v2ray-plugin)\n [![Releases](https://img.shields.io/github/downloads/shadowsocks/v2ray-plugin/total.svg)](https://github.com/repo/releases)\n-[![Language: Go](https://img.shields.io/badge/go-1.20+-blue.svg)](https://github.com/repo/search?l=go)\n+[![Language: Go](https://img.shields.io/badge/go-1.25+-blue.svg)](https://github.com/repo/search?l=go)\n [![Go Report Card](https://goreportcard.com/badge/github.com/repo/report)](https://goreportcard.com/report/github.com/repo/report)\n";
+    const OBS_MODIFY_DIFF: &str = "changes files:\n--------------\n--- shadowsocks-v2ray-plugin.changes\n+++ shadowsocks-v2ray-plugin.changes\n@@ -1,0 +2,19 @@\n+Fri May 29 13:26:53 UTC 2026 - Hillwood Yang <hillwoodroc@gmail.com>\n+\n+- Update version to 5.49.0\n+  * Update v2ray-core to 5.49.0\n+  * Update vendor (boo#1260328 and CVE-2026-33186)\n+\n+-------------------------------------------------------------------\n+Thu Feb 12 12:51:31 UTC 2026 - Hillwood Yang <hillwood@opensuse.org>\n+\n+- Update version to 5.44.1\n\nold:\n----\n  v2ray-plugin-5.37.0.tar.gz\n\nnew:\n----\n  v2ray-plugin-5.49.0.tar.gz\n\nspec files:\n-----------\n--- shadowsocks-v2ray-plugin.spec\n+++ shadowsocks-v2ray-plugin.spec\n@@ -1,7 +1,7 @@\n #\n # spec file for package shadowsocks-v2ray-plugin\n #\n-# Copyright (c) 2025 SUSE LLC and contributors\n+# Copyright (c) 2026 SUSE LLC and contributors\n #\n # All modifications and additions to the file contributed by third parties\n # remain the property of their copyright owners, unless otherwise agreed\n@@ -27,7 +27,7 @@\n %define   import_path     %{provider_prefix}\n \n Name:           shadowsocks-v2ray-plugin\n-Version:        5.37.0\n+Version:        5.49.0\n Release:        0\n Summary:        SIP003 plugin for shadowsocks\n License:        MIT\n@@ -36,7 +36,9 @@\n Source0:        https://github.com/teddysun/v2ray-plugin/archive/v%{version}/%{repo}-%{version}.tar.gz\n Source1:        vendor.tar.gz\n BuildRequires:  fdupes\n+# BuildRequires:  golang-github-v2fly-v2ray-core >= 5.44.1\n BuildRequires:  golang-packaging\n+BuildRequires:  golang(API) >= 1.25\n AutoReqProv:    Off\n BuildRoot:      %{_tmppath}/%{name}-%{version}-build\n %{go_provides}\n\nother changes:\n--------------\n\n++++++ v2ray-plugin-5.37.0.tar.gz -> v2ray-plugin-5.49.0.tar.gz\n--- README.md\n+++ README.md\n@@ -2,7 +2,7 @@\n \n [![CircleCI](https://circleci.com/gh/shadowsocks/v2ray-plugin.svg?style=shield)](https://circleci.com/gh/shadowsocks/v2ray-plugin)\n [![Releases](https://img.shields.io/github/downloads/shadowsocks/v2ray-plugin/total.svg)](https://github.com/repo/releases)\n-[![Language: Go](https://img.shields.io/badge/go-1.20+-blue.svg)](https://github.com/repo/search?l=go)\n+[![Language: Go](https://img.shields.io/badge/go-1.25+-blue.svg)](https://github.com/repo/search?l=go)\n [![Go Report Card](https://goreportcard.com/badge/github.com/repo/report)](https://goreportcard.com/report/github.com/repo/report)\n\n++++++ vendor.tar.gz\n\nnew:\n----\n  _patchinfo\n\nother changes:\n--------------\n\n++++++ _patchinfo (new)\n--- _patchinfo\n+++ _patchinfo\n@@ -0,0 +1,20 @@\n+<patchinfo incident=\"19707\">\n+  <issue tracker=\"bnc\" id=\"1260328\">VUL-0: CVE-2026-33186: shadowsocks-v2ray-plugin: google.golang.org/grpc: authorization bypass due to improper validation of the HTTP/2 :path pseudo-header</issue>\n+  <issue tracker=\"cve\" id=\"2026-33186\"/>\n+  <packager>hillwood</packager>\n+  <rating>critical</rating>\n+  <category>security</category>\n+  <summary>Security update for shadowsocks-v2ray-plugin</summary>\n+  <description>This update for shadowsocks-v2ray-plugin fixes the following issues:\n+\n+- Update version to 5.49.0\n+  * Update v2ray-core to 5.49.0\n+  * Update vendor (boo#1260328 and CVE-2026-33186)\n+\n+- Update version to 5.44.1\n+  * Update v2ray-core to v5.44.1\n+\n+- Update version to 5.41.0\n+  * Update v2ray-core to v5.41.0\n+</description>\n+</patchinfo>\n";
 
     // OBS plain-text diff that is a pure version bump: only the
     // spec `Version:` and a new changelog entry.
@@ -3781,6 +3846,25 @@ mod tests {
     }
 
     #[test]
+    fn signal_snapshot_old_bool_fields_load() {
+        // A snapshot written before the signal bools became
+        // `Option<bool>` carries plain `false`: it loads as
+        // `Some(false)`, and a snapshot without the fields loads
+        // them as unknown.
+        let old = r#"{
+            "read_at": "1",
+            "author": {"author": "someone", "is_own_filing": false},
+            "package": {"package": "foo", "is_excluded": false, "is_security": false}
+        }"#;
+        let snapshot: SignalSnapshot = serde_json::from_str(old).unwrap();
+        assert_eq!(snapshot.author.is_own_filing, Some(false));
+        assert_eq!(snapshot.package.is_excluded, Some(false));
+        assert_eq!(snapshot.package.is_security, Some(false));
+        assert_eq!(snapshot.author.is_package_maintainer, None);
+        assert_eq!(snapshot.package.is_core, None);
+    }
+
+    #[test]
     fn review_state_changes_requested_dominates() {
         let pr = obs_pr_with_reviews(vec![
             review_opinion("alice", OpinionState::Approved),
@@ -3848,15 +3932,19 @@ mod tests {
             vec![
                 "shadowsocks-v2ray-plugin.changes",
                 "shadowsocks-v2ray-plugin.spec",
+                "_patchinfo",
             ]
         );
         assert!(diff.spec_changed);
         assert!(diff.changelog_changed);
-        // The BuildRequires lines make it more than a bump.
+        // The BuildRequires lines and the _patchinfo file make it
+        // more than a bump.
         assert!(!diff.version_bump_only);
         assert_eq!(diff.new_version.as_deref(), Some("5.49.0"));
         assert_eq!(diff.cve_ids, vec!["CVE-2026-33186"]);
-        assert!(diff.new_files.is_empty());
+        // _patchinfo is a real package file under the second
+        // `other changes:` section, not tarball contents.
+        assert_eq!(diff.new_files, vec!["_patchinfo"]);
     }
 
     #[test]
@@ -4107,7 +4195,9 @@ mod tests {
         let record = signal_record("obs:123", "obs");
         let snapshot = read_signals(&maintainer, &record, &test_config(), &[]);
         assert_eq!(snapshot.author.is_package_maintainer, Some(true));
-        // The author is not among the maintainers.
+        // The author matches no name, but the list is non-empty:
+        // a group in the list could hold them, so it is unknown,
+        // not a false claim of non-maintainership.
         let not_maintainer = FakeSource::new(vec![])
             .with_show("obs:123", Ok(obs_pr_with_reviews(vec![])))
             .with_diff("obs:123", Ok(BUMP_DIFF.to_string()))
@@ -4131,6 +4221,31 @@ mod tests {
             )
             .with_maintainers("devel:foo", "foo", Ok(vec![named_role("alice")]));
         let snapshot = read_signals(&not_maintainer, &record, &test_config(), &[]);
+        assert_eq!(snapshot.author.is_package_maintainer, None);
+        // An empty maintainers list proves there is no maintainer.
+        let nobody = FakeSource::new(vec![])
+            .with_show("obs:123", Ok(obs_pr_with_reviews(vec![])))
+            .with_diff("obs:123", Ok(BUMP_DIFF.to_string()))
+            .with_build(
+                "home:alice",
+                "foo",
+                Ok(build_matrix(vec![(
+                    "openSUSE_Tumbleweed",
+                    "x86_64",
+                    "succeeded",
+                )])),
+            )
+            .with_build(
+                "devel:foo",
+                "foo",
+                Ok(build_matrix(vec![(
+                    "openSUSE_Tumbleweed",
+                    "x86_64",
+                    "succeeded",
+                )])),
+            )
+            .with_maintainers("devel:foo", "foo", Ok(vec![]));
+        let snapshot = read_signals(&nobody, &record, &test_config(), &[]);
         assert_eq!(snapshot.author.is_package_maintainer, Some(false));
         // A failed maintainers read is unknown, never a false claim.
         let failed = FakeSource::new(vec![])
