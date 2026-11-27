@@ -254,8 +254,10 @@ tests/
                        request id; no credentials fails closed
   fixtures/            canned Repology / Anitya / PyPI / Distrowatch / spec
 docs/
-  architecture.md      component diagram + data flow + gate rules
+  architecture.md      system design: planner, queues, observer, updater
+                       pipeline, gate rules, open questions
   leap-and-cve.md      Leap + CVE validation design (planned, scaffolded)
+  review-queue.md      reviewer queue design
   runbook.md           run the container, configure the package set, pause, read the queue
 ```
 
