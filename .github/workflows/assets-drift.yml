@@ -43,6 +43,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
         with:
           toolchain: ${{ steps.toolchain.outputs.toolchain }}
+          # The Test and lint step below runs clippy: install it here,
+          # like the test jobs do. Without it the toolchain has no
+          # cargo-clippy and the lint step fails.
+          components: clippy
       # Pinned to the v2.9.3 tag's commit; Dependabot tracks SHA pins and
       # proposes updates. Plain cache (no OS-release scoping): freshcrab
       # is pure Rust with no bindgen or system libraries, so the cache
